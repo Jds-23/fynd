@@ -1844,4 +1844,51 @@ mod tests {
         );
         assert!(over.is_empty());
     }
+
+    #[test]
+    fn test_pool_config_with_post_processors() {
+        let config = PoolConfig::new("most_liquid")
+            .with_post_processors(vec!["a".to_string(), "b".to_string()]);
+
+        assert_eq!(config.post_processors(), ["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn test_pool_config_default_post_processors() {
+        assert!(PoolConfig::new("most_liquid")
+            .post_processors()
+            .is_empty());
+    }
+
+    /// A misspelled name has to stop the build, not the first quote that reaches the pool.
+    #[tokio::test]
+    async fn test_build_unregistered_post_processor() {
+        let config = PoolConfig::new("most_liquid").with_post_processors(vec!["rfq".to_string()]);
+        let result = FyndBuilder::new(
+            Chain::Ethereum,
+            "wss://example.invalid",
+            "https://example.invalid",
+            vec!["uniswap_v2".to_string()],
+            100.0,
+        )
+        .add_pool("pool", &config)
+        .expect("add_pool should accept the config")
+        .build();
+
+        let Err(error) = result else {
+            panic!("a pool listing an unregistered post-processor must not build");
+        };
+        assert!(
+            matches!(error, SolverBuildError::UnknownPostProcessor(_)),
+            "expected UnknownPostProcessor, got: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("pool 'pool'") &&
+                error.to_string().contains("'rfq'"),
+            "expected the error to name the pool and the unregistered post-processor 'rfq', \
+             got: {error}"
+        );
+    }
 }

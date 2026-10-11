@@ -337,3 +337,75 @@ impl Default for WorkerPoolBuilder {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::{Duration, Instant},
+    };
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::{
+        derived::DerivedData,
+        feed::events::{EventError, MarketEvent},
+        post_process::{PostProcessRequest, PostProcessorRegistry, RoutePostProcessor},
+        types::RouteResult,
+    };
+
+    struct Noop;
+
+    #[async_trait]
+    impl MarketEventHandler for Noop {
+        async fn handle_event(&mut self, _event: &MarketEvent) -> Result<(), EventError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl RoutePostProcessor for Noop {
+        async fn process(
+            &self,
+            _request: &PostProcessRequest<'_>,
+            route: RouteResult,
+        ) -> RouteResult {
+            route
+        }
+    }
+
+    /// Each worker builds its own post-processors, so a pool of two calls the factory twice.
+    #[test]
+    fn test_pool_post_processor_factory_once_per_worker() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let registry = PostProcessorRegistry::new()
+            .with_post_processor("count", move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Noop
+            })
+            .expect("the name is free");
+        let factories = registry
+            .resolve("pool", &["count".to_string()])
+            .expect("the name is registered");
+        let (_event_tx, event_rx) = broadcast::channel(10);
+        let (_derived_event_tx, derived_event_rx) = broadcast::channel(10);
+
+        let (pool, _task_handle) = WorkerPoolBuilder::new()
+            .num_workers(2)
+            .post_processor_factories(factories)
+            .build(MarketData::new_shared(), DerivedData::new_shared(), event_rx, derived_event_rx)
+            .expect("most_liquid is a built-in algorithm");
+
+        let started = Instant::now();
+        while calls.load(Ordering::SeqCst) < 2 && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        pool.shutdown();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+}

@@ -167,6 +167,7 @@ mod tests {
             max_routes = 50
             liquidity_scope = "include_exclusive"
             exclude_protocols = ["fallback:", "uniswap_v2"]
+            post_processors = ["rfq", "dedupe"]
         "#;
         let config: WorkerPoolsConfig = toml::from_str(toml).unwrap();
         let pool = &config.pools()["custom"];
@@ -182,6 +183,7 @@ mod tests {
             pool.exclude_protocols(),
             Some(["fallback:".to_string(), "uniswap_v2".to_string()].as_slice())
         );
+        assert_eq!(pool.post_processors(), ["rfq".to_string(), "dedupe".to_string()]);
     }
 
     /// A config written before `exclude_protocols` existed keeps parsing, and excludes nothing.
@@ -194,6 +196,20 @@ mod tests {
         let config: WorkerPoolsConfig = toml::from_str(toml).unwrap();
 
         assert_eq!(config.pools()["basic"].exclude_protocols(), None);
+    }
+
+    /// A config without `post_processors` parses and runs no post-processors.
+    #[test]
+    fn test_pool_config_without_post_processors() {
+        let toml = r#"
+            [pools.basic]
+            algorithm = "most_liquid"
+        "#;
+        let config: WorkerPoolsConfig = toml::from_str(toml).unwrap();
+
+        assert!(config.pools()["basic"]
+            .post_processors()
+            .is_empty());
     }
 }
 

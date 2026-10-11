@@ -1079,6 +1079,7 @@ mod tests {
         },
         fallback::{manager::PammState, FALLBACK_PREFIX},
         graph::petgraph::{PetgraphStableDiGraphManager, StableDiGraph},
+        post_process::test_utils::{direct_swap, swap_through, MockPostProcessor},
         types::{
             ComponentId, OrderSide, Route, RouteExclusionFilter, RouteRejection, RouteResult, Swap,
         },
@@ -2702,5 +2703,153 @@ mod tests {
         let err = crate::AlgorithmError::Timeout { elapsed_ms: 7 };
         let mapped = solve_error_from_algorithm_error("o1", &num_bigint::BigUint::from(5u64), err);
         assert!(matches!(mapped, SolveError::Timeout { elapsed_ms: 7 }), "got {mapped:?}");
+    }
+
+    fn replace_route(result: RouteResult, swaps: Vec<Swap>, net_amount_out: u64) -> RouteResult {
+        let route = Route::new(swaps, result.route().tokens().clone()).expect("non-empty swaps");
+        RouteResult::new(route, BigInt::from(net_amount_out), result.gas_price().clone())
+    }
+
+    fn rfq_route(result: RouteResult) -> RouteResult {
+        replace_route(result, vec![direct_swap("rfq:bebop", 120)], 118)
+    }
+
+    fn worker_with_post_processor(
+        post_processor: MockPostProcessor,
+    ) -> SolverWorker<SplitRouteAlgorithm> {
+        let token_a = token(0x01, "A");
+        let token_b = token(0x02, "B");
+        let (market, _) = setup_market_weighted(vec![
+            ("p1", &token_a, &token_b, MockProtocolSim::new(2.0)),
+            ("p2", &token_a, &token_b, MockProtocolSim::new(2.0)),
+        ]);
+        SolverWorker::new(
+            market,
+            DerivedData::new_shared(),
+            SplitRouteAlgorithm { reported_spot_price: 2.0 },
+            0,
+            "test_pool".to_string(),
+        )
+        .with_post_processors(vec![("rfq".to_string(), Box::new(post_processor))])
+    }
+
+    fn a_to_b_order() -> Order {
+        order(&token(0x01, "A"), &token(0x02, "B"), 100, OrderSide::Sell)
+    }
+
+    #[tokio::test]
+    async fn test_quote_post_processed_route() {
+        let mut worker = worker_with_post_processor(MockPostProcessor::new(rfq_route));
+
+        let quote = worker
+            .quote(&a_to_b_order(), SolveParams::default(), far_deadline())
+            .await
+            .expect("the processed route is valid");
+
+        let route = quote
+            .order()
+            .route()
+            .expect("the quote has a route");
+        assert_eq!(route.swaps().len(), 1);
+        assert_eq!(
+            route.swaps()[0]
+                .protocol_component()
+                .protocol_system,
+            "rfq:bebop"
+        );
+        assert_eq!(quote.order().amount_out(), &BigUint::from(120u64));
+        assert_eq!(quote.order().amount_out_net_gas(), &BigUint::from(118u64));
+    }
+
+    #[tokio::test]
+    async fn test_quote_post_processor_request() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let recorder = Arc::clone(&seen);
+        let recording = MockPostProcessor::with_request(move |request, result| {
+            *recorder.lock().unwrap() =
+                Some((request.label().cloned(), request.exclusions().excludes_pool("p1")));
+            rfq_route(result)
+        });
+        let mut worker = worker_with_post_processor(recording);
+        worker
+            .market_data
+            .register_labeled_state("overlay".to_string(), FxHashMap::default(), u64::MAX)
+            .await;
+        let params = SolveParams::default()
+            .with_state_label("overlay".to_string())
+            .with_route_filter(
+                RouteExclusionFilter::default().with_excluded_pools(["p1".to_string()]),
+            );
+
+        worker
+            .quote(&a_to_b_order(), params, far_deadline())
+            .await
+            .expect("the processed route avoids the excluded pool");
+
+        assert_eq!(*seen.lock().unwrap(), Some((Some("overlay".to_string()), true)));
+    }
+
+    fn disconnected_route(result: RouteResult) -> RouteResult {
+        let (token_c, token_d) = (token(0x03, "C"), token(0x04, "D"));
+        let leg = swap_through(component("p3", &[token_c, token_d]), 80);
+        replace_route(result, vec![direct_swap("rfq:bebop", 90), leg], 80)
+    }
+
+    fn exclusive_route(result: RouteResult) -> RouteResult {
+        let tokens = [token(0x01, "A"), token(0x02, "B")];
+        let mut leg = component("exclusive-leg", &tokens);
+        crate::feed::exclusivity::mark_exclusive(&mut leg);
+        replace_route(result, vec![swap_through(leg, 120)], 118)
+    }
+
+    fn inflated_route(result: RouteResult) -> RouteResult {
+        replace_route(result, vec![direct_swap("rfq:bebop", 120)], 121)
+    }
+
+    #[rstest]
+    #[case::disconnected_swaps(disconnected_route, &[], &[], "invalid route")]
+    #[case::request_excluded_protocol(rfq_route, &[], &["rfq:bebop"], "excluded protocol rfq:bebop")]
+    #[case::pool_excluded_protocol(rfq_route, &["rfq:"], &[], "that this pool leaves out")]
+    #[case::exclusive_component(exclusive_route, &[], &[], "exclusive-leg that this pool leaves")]
+    #[case::net_above_amount_out(
+        inflated_route,
+        &[],
+        &[],
+        "net amount out 121 is above the route amount out 120"
+    )]
+    #[tokio::test]
+    async fn test_quote_rejects_post_processed_route(
+        #[case] rewrite: fn(RouteResult) -> RouteResult,
+        #[case] pool_excluded: &[&str],
+        #[case] request_excluded: &[&str],
+        #[case] expected: &str,
+    ) {
+        let mut worker = worker_with_post_processor(MockPostProcessor::new(rewrite))
+            .with_exclude_protocols(
+                pool_excluded
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            );
+        let params = SolveParams::default().with_route_filter(
+            RouteExclusionFilter::default().with_excluded_protocols(
+                request_excluded
+                    .iter()
+                    .map(ToString::to_string),
+            ),
+        );
+
+        let result = worker
+            .quote(&a_to_b_order(), params, far_deadline())
+            .await;
+
+        let Err(SolveError::AlgorithmError(message)) = result else {
+            panic!("expected an AlgorithmError for the route, got {result:?}");
+        };
+        assert!(
+            message.starts_with("split_route_mock + rfq produced an invalid route") &&
+                message.contains(expected),
+            "expected '{expected}' on the producer, got: {message}"
+        );
     }
 }
