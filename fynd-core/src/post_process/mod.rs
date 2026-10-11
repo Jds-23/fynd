@@ -19,6 +19,8 @@
 
 mod chain;
 pub mod registry;
+#[cfg(test)]
+pub(crate) mod test_utils;
 
 use std::time::Instant;
 

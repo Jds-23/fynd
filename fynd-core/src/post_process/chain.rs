@@ -117,3 +117,204 @@ fn record_post_processor_duration(pool_name: &str, post_processor: &str, duratio
     )
     .record(duration.as_secs_f64());
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{atomic::Ordering, Arc};
+
+    use metrics_util::debugging::DebuggingRecorder;
+    use num_bigint::BigInt;
+    use rustc_hash::FxHashMap;
+
+    use super::*;
+    use crate::{
+        algorithm::test_utils::{order, setup_market_weighted, token},
+        derived::{DerivedData, SharedDerivedDataRef},
+        post_process::test_utils::{route_result, with_net_amount_out, MockPostProcessor},
+        types::{Order, OrderSide, RouteExclusions},
+    };
+
+    const POOL: &str = "test_pool";
+
+    /// What a request borrows.
+    struct Fixture {
+        order: Order,
+        market: MarketData,
+        derived: SharedDerivedDataRef,
+        exclusions: RouteExclusions,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                order: order(&token(0x01, "A"), &token(0x02, "B"), 100, OrderSide::Sell),
+                market: setup_market_weighted(Vec::new()).0,
+                derived: DerivedData::new_shared(),
+                exclusions: RouteExclusions::default(),
+            }
+        }
+
+        fn request(&self) -> PostProcessRequest<'_> {
+            PostProcessRequest::new(
+                &self.order,
+                &self.market,
+                None,
+                &self.derived,
+                &self.exclusions,
+            )
+        }
+    }
+
+    fn chain(post_processors: Vec<(&str, MockPostProcessor)>) -> PostProcessors {
+        let instances = post_processors
+            .into_iter()
+            .map(|(name, post_processor)| {
+                (name.to_string(), Box::new(post_processor) as Box<dyn RoutePostProcessor>)
+            })
+            .collect();
+        PostProcessors::new(POOL.to_string(), instances)
+    }
+
+    fn market_event() -> MarketEvent {
+        MarketEvent::MarketUpdated {
+            added_components: FxHashMap::default(),
+            removed_components: Vec::new(),
+            updated_components: Vec::new(),
+        }
+    }
+
+    /// The second post-processor adds one to what the first set, so only config order gives 101.
+    #[tokio::test]
+    async fn test_run_config_order() {
+        let set = MockPostProcessor::new(|route| with_net_amount_out(route, 100));
+        let add_one = MockPostProcessor::new(|route| {
+            let net_amount_out = route.net_amount_out() + 1;
+            RouteResult::new(route.route().clone(), net_amount_out, route.gas_price().clone())
+        });
+        let chain = chain(vec![("set", set), ("add_one", add_one)]);
+        let fixture = Fixture::new();
+
+        let route = chain
+            .run(&fixture.request(), route_result(7))
+            .await;
+
+        assert_eq!(route.net_amount_out(), &BigInt::from(101));
+    }
+
+    #[tokio::test]
+    async fn test_run_slow_post_processor_keeps_previous_route() {
+        let slow = MockPostProcessor::new(|route| with_net_amount_out(route, 1000))
+            .with_delay(Duration::from_secs(30));
+        let chain = chain(vec![("slow", slow)]);
+        let fixture = Fixture::new();
+        let request = fixture
+            .request()
+            .with_deadline(Instant::now() + Duration::from_millis(50));
+
+        let route = chain
+            .run(&request, route_result(7))
+            .await;
+
+        assert_eq!(route.net_amount_out(), &BigInt::from(7));
+    }
+
+    #[tokio::test]
+    async fn test_run_passed_deadline_skips_post_processors() {
+        let set = MockPostProcessor::new(|route| with_net_amount_out(route, 1000));
+        let chain = chain(vec![("set", set)]);
+        let fixture = Fixture::new();
+        let request = fixture
+            .request()
+            .with_deadline(Instant::now() - Duration::from_millis(1));
+
+        let route = chain
+            .run(&request, route_result(7))
+            .await;
+
+        assert_eq!(route.net_amount_out(), &BigInt::from(7));
+    }
+
+    #[tokio::test]
+    async fn test_run_records_duration_per_post_processor() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let chain = chain(vec![("first", MockPostProcessor::unchanged())]);
+        let fixture = Fixture::new();
+
+        chain
+            .run(&fixture.request(), route_result(7))
+            .await;
+
+        let recorded = crate::tests::metrics::recorded_metrics(&snapshotter);
+        let labels: Vec<_> = recorded
+            .iter()
+            .filter(|(name, _, _)| name == "worker_pool_post_processor_duration_seconds")
+            .map(|(_, labels, _)| labels.clone())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![vec!["pool=test_pool".to_string(), "post_processor=first".to_string()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_event_reaches_every_post_processor() {
+        let first = MockPostProcessor::unchanged();
+        let second = MockPostProcessor::unchanged();
+        let (first_events, second_events) =
+            (Arc::clone(&first.event_count), Arc::clone(&second.event_count));
+        let mut chain = chain(vec![("first", first), ("second", second)]);
+
+        chain
+            .handle_event(&market_event())
+            .await;
+
+        assert_eq!(first_events.load(Ordering::SeqCst), 1);
+        assert_eq!(second_events.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_event_error_does_not_stop_next() {
+        let failing = MockPostProcessor::unchanged().failing_events();
+        let next = MockPostProcessor::unchanged();
+        let next_events = Arc::clone(&next.event_count);
+        let mut chain = chain(vec![("failing", failing), ("next", next)]);
+
+        chain
+            .handle_event(&market_event())
+            .await;
+
+        assert_eq!(next_events.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_reaches_every_post_processor() {
+        let first = MockPostProcessor::unchanged();
+        let second = MockPostProcessor::unchanged();
+        let (first_calls, second_calls) =
+            (Arc::clone(&first.initialize_calls), Arc::clone(&second.initialize_calls));
+        let mut chain = chain(vec![("first", first), ("second", second)]);
+        let fixture = Fixture::new();
+
+        chain.initialize(&fixture.market).await;
+
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_producer_names_algorithm_then_post_processors() {
+        let chain = chain(vec![
+            ("rfq", MockPostProcessor::unchanged()),
+            ("dedupe", MockPostProcessor::unchanged()),
+        ]);
+
+        assert_eq!(chain.producer("most_liquid"), "most_liquid + rfq + dedupe");
+    }
+
+    #[test]
+    fn test_producer_without_post_processors() {
+        assert_eq!(PostProcessors::default().producer("most_liquid"), "most_liquid");
+    }
+}
