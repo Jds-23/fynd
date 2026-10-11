@@ -17,13 +17,17 @@
 //! post_processors = ["rfq"]
 //! ```
 
+mod chain;
 pub mod registry;
 
 use std::time::Instant;
 
 use async_trait::async_trait;
 
-pub use self::registry::{PostProcessorAlreadyRegistered, PostProcessorRegistry};
+pub(crate) use self::chain::PostProcessors;
+pub use self::registry::{
+    PostProcessorAlreadyRegistered, PostProcessorRegistry, UnknownPostProcessorError,
+};
 use crate::{
     derived::SharedDerivedDataRef,
     feed::{

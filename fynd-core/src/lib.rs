@@ -71,6 +71,7 @@ pub use derived::computation::ComputationRequirements;
 pub use feed::{events::MarketEvent, market_data::StateLabel};
 pub use post_process::{
     PostProcessRequest, PostProcessorAlreadyRegistered, PostProcessorRegistry, RoutePostProcessor,
+    UnknownPostProcessorError,
 };
 pub use price_guard::{
     config::PriceGuardConfig,

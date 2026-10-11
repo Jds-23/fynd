@@ -21,6 +21,7 @@ use crate::{
         market_data::MarketData,
     },
     graph::EdgeWeightUpdaterWithDerived,
+    post_process::registry::PostProcessorFactories,
     types::internal::SolveTask,
     worker_pool::{
         registry::{
@@ -51,6 +52,8 @@ pub struct WorkerPoolConfig {
     liquidity_scope: LiquidityScope,
     /// Protocol systems this worker pool's workers never route through.
     exclude_protocols: Vec<String>,
+    /// Factories for the post-processors every worker in this pool builds, in the order they run.
+    post_processor_factories: PostProcessorFactories,
 }
 
 impl WorkerPoolConfig {
@@ -70,6 +73,7 @@ impl Default for WorkerPoolConfig {
             task_queue_capacity: 1000,
             liquidity_scope: LiquidityScope::default(),
             exclude_protocols: Vec::new(),
+            post_processor_factories: PostProcessorFactories::default(),
         }
     }
 }
@@ -122,6 +126,7 @@ impl WorkerPool {
         // Spawn workers
         let liquidity_scope = config.liquidity_scope;
         let exclude_protocols = config.exclude_protocols.clone();
+        let post_processor_factories = config.post_processor_factories.clone();
         let params = SpawnWorkersParams {
             algorithm: algorithm.clone(),
             pool_name: name.clone(),
@@ -135,6 +140,7 @@ impl WorkerPool {
             shutdown_tx: shutdown_tx.clone(),
             liquidity_scope,
             exclude_protocols,
+            post_processor_factories,
         };
         let workers = config.spawner.spawn(params)?;
 
@@ -282,6 +288,13 @@ impl WorkerPoolBuilder {
     /// protocol system exactly, or a whole family when it ends with `:` (`fallback:`).
     pub fn exclude_protocols(mut self, exclude_protocols: Vec<String>) -> Self {
         self.config.exclude_protocols = exclude_protocols;
+        self
+    }
+
+    /// Sets the factories for the post-processors every worker in this pool runs on the route its
+    /// algorithm returned, in order. Each worker calls them once, on its own thread.
+    pub(crate) fn post_processor_factories(mut self, factories: PostProcessorFactories) -> Self {
+        self.config.post_processor_factories = factories;
         self
     }
 

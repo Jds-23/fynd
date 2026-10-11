@@ -15,6 +15,52 @@ pub struct PostProcessorAlreadyRegistered {
     pub name: String,
 }
 
+/// A pool configuration listed a post-processor that no registry holds.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "worker pool '{pool}' lists unknown post-processor '{name}'. Registered: {}",
+    if registered.is_empty() { "none".to_string() } else { registered.join(", ") }
+)]
+pub struct UnknownPostProcessorError {
+    pool: String,
+    name: String,
+    registered: Vec<String>,
+}
+
+impl UnknownPostProcessorError {
+    /// The name that was not found.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The worker pool that listed the name.
+    pub fn pool(&self) -> &str {
+        &self.pool
+    }
+}
+
+/// The factories behind the post-processor names of one pool, in config order.
+#[derive(Clone, Default)]
+pub(crate) struct PostProcessorFactories(Vec<(String, Factory)>);
+
+impl PostProcessorFactories {
+    /// One new instance of each post-processor with its registered name, in config order.
+    pub(crate) fn build(&self) -> Vec<(String, Box<dyn RoutePostProcessor>)> {
+        self.0
+            .iter()
+            .map(|(name, factory)| (name.clone(), factory()))
+            .collect()
+    }
+}
+
+impl std::fmt::Debug for PostProcessorFactories {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(name, _)| name))
+            .finish()
+    }
+}
+
 /// Post-processor factories, keyed by the name a pool configuration lists. Empty by default.
 #[derive(Default, Clone)]
 pub struct PostProcessorRegistry {
@@ -56,6 +102,36 @@ impl PostProcessorRegistry {
     /// The names this registry holds, in no fixed order.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.by_name.keys().map(String::as_str)
+    }
+
+    /// The factories behind `names`, in the same order. `pool` is the pool that listed them.
+    ///
+    /// # Errors
+    ///
+    /// [`UnknownPostProcessorError`] for the first name that is not registered. Raised when the
+    /// solver is built, so a misspelled name fails at start and not at the first quote.
+    pub(crate) fn resolve(
+        &self,
+        pool: &str,
+        names: &[String],
+    ) -> Result<PostProcessorFactories, UnknownPostProcessorError> {
+        let mut factories = Vec::with_capacity(names.len());
+        for name in names {
+            let Some(factory) = self.by_name.get(name) else {
+                let mut registered: Vec<String> = self
+                    .names()
+                    .map(str::to_string)
+                    .collect();
+                registered.sort();
+                return Err(UnknownPostProcessorError {
+                    pool: pool.to_string(),
+                    name: name.clone(),
+                    registered,
+                });
+            };
+            factories.push((name.clone(), factory.clone()));
+        }
+        Ok(PostProcessorFactories(factories))
     }
 }
 

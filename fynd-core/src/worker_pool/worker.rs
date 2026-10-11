@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use num_bigint::BigUint;
+use num_bigint::{BigInt, BigUint};
 use tokio::sync::{broadcast, Notify};
 use tracing::{debug, error, info, warn};
 use tycho_simulation::{tycho_common::models::protocol::ProtocolComponent, tycho_core::Bytes};
@@ -33,6 +33,7 @@ use crate::{
         market_data::{MarketData, MarketDataView, StateLabel},
     },
     graph::{EdgeWeightUpdaterWithDerived, GraphManager},
+    post_process::{PostProcessRequest, PostProcessors, RoutePostProcessor},
     types::{internal::SolveTask, Route, RouteExclusionFilter, RouteExclusions},
     worker_pool_router::LiquidityScope,
     BlockInfo, Order, OrderQuote, QuoteStatus, SingleOrderQuote, SolveError, SolveParams,
@@ -286,6 +287,9 @@ where
     /// Protocol systems this worker never routes through. Empty for every worker pool that does
     /// not set `exclude_protocols`.
     exclude_protocols: Vec<String>,
+    /// Post-processors run on the algorithm's route, in config order. Empty when the pool sets no
+    /// `post_processors`.
+    post_processors: PostProcessors,
 }
 
 impl<A> SolverWorker<A>
@@ -326,6 +330,7 @@ where
             pool_name,
             liquidity_scope: LiquidityScope::default(),
             exclude_protocols: Vec::new(),
+            post_processors: PostProcessors::default(),
         }
     }
 
@@ -338,6 +343,16 @@ where
     /// Sets the protocol systems this worker never routes through.
     pub(crate) fn with_exclude_protocols(mut self, exclude_protocols: Vec<String>) -> Self {
         self.exclude_protocols = exclude_protocols;
+        self
+    }
+
+    /// Sets the post-processors this worker runs on every route, in the order given, each with its
+    /// registered name.
+    pub(crate) fn with_post_processors(
+        mut self,
+        post_processors: Vec<(String, Box<dyn RoutePostProcessor>)>,
+    ) -> Self {
+        self.post_processors = PostProcessors::new(self.pool_name.clone(), post_processors);
         self
     }
 
@@ -377,7 +392,7 @@ where
     ///
     /// Call this on startup or to recreate the graph from the latest market topology. It resets
     /// three things together, from one read: the graph, the fallback pool index, and which pAMMs
-    /// the graph holds and which it left out.
+    /// the graph holds and which it left out. It then calls `initialize` on each post-processor.
     pub async fn initialize_graph(&mut self) {
         let topology = {
             // One read: the index and the topology must describe the same market, or a pAMM whose
@@ -398,6 +413,9 @@ where
 
         self.graph_manager
             .initialize_graph(&topology);
+        self.post_processors
+            .initialize(&self.market_data)
+            .await;
         self.initialized = true;
     }
 
@@ -426,15 +444,58 @@ where
                     // them.
                     warn!("Error handling market event: {:?}", e);
                 }
+                self.post_processors
+                    .handle_event(&event)
+                    .await;
             }
         }
     }
 
+    /// Checks what the algorithm's own route cannot break but a post-processor can: the pool's
+    /// component rules, and `net_amount_out` against the route's amount out for a sell order.
+    /// The router subtracts the two as unsigned numbers, so a net above the amount out would
+    /// underflow there.
+    fn check_processed_route(
+        &self,
+        order: &Order,
+        route: &Route,
+        net_amount_out: &BigInt,
+    ) -> Result<(), String> {
+        for swap in route.swaps() {
+            if should_drop_component(
+                self.liquidity_scope,
+                &self.exclude_protocols,
+                swap.protocol_component(),
+            ) {
+                return Err(format!(
+                    "route uses component {} that this pool leaves out of its graph",
+                    swap.component_id()
+                ));
+            }
+        }
+        if !order.is_sell() {
+            return Ok(());
+        }
+        let Some(output_token) = route.output_token() else {
+            return Ok(());
+        };
+        let amount_out = BigInt::from(route.amount_out(&output_token));
+        if *net_amount_out > amount_out {
+            return Err(format!(
+                "net amount out {net_amount_out} is above the route amount out {amount_out}"
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns a quote for an order, optionally solved against a named state overlay.
+    ///
+    /// `deadline` is when the caller stops waiting. Post-processors do not run past it.
     pub async fn quote(
         &mut self,
         order: &Order,
         params: SolveParams,
+        deadline: Instant,
     ) -> Result<SingleOrderQuote, SolveError> {
         let start_time = Instant::now();
 
@@ -497,7 +558,7 @@ where
 
         let mut request = SolveRequest::new(graph, self.market_data.clone(), order)
             .with_derived(self.derived_data.clone())
-            .with_shared_exclusions(exclusions);
+            .with_shared_exclusions(Arc::clone(&exclusions));
         if let Some(label) = params.state_label().cloned() {
             request = request.with_label(label);
         }
@@ -508,9 +569,24 @@ where
 
         let order_quote = match result {
             Ok(result) => {
+                let result = if self.post_processors.is_empty() {
+                    result
+                } else {
+                    let post_process_request = PostProcessRequest::new(
+                        order,
+                        &self.market_data,
+                        params.state_label(),
+                        &self.derived_data,
+                        &exclusions,
+                    )
+                    .with_deadline(deadline);
+                    self.post_processors
+                        .run(&post_process_request, result)
+                        .await
+                };
                 // Extract scalar values before consuming result with into_route()
-                let amount_out_net_gas = result
-                    .net_amount_out()
+                let net_amount_out = result.net_amount_out().clone();
+                let amount_out_net_gas = net_amount_out
                     .to_biguint()
                     .unwrap_or(BigUint::ZERO);
                 let gas_price = result.gas_price().clone();
@@ -520,16 +596,24 @@ where
                     .validate()
                     .map_err(|err| err.to_string())
                     .and_then(|()| validate_route_filter(&route, order, params.route_filter()))
+                    .and_then(|()| {
+                        if self.post_processors.is_empty() {
+                            return Ok(());
+                        }
+                        self.check_processed_route(order, &route, &net_amount_out)
+                    })
                 {
+                    let producer = self
+                        .post_processors
+                        .producer(self.algorithm.name());
                     error!(
                         order_id = %order.id(),
-                        algorithm = self.algorithm.name(),
+                        producer = %producer,
                         error = %err,
-                        "algorithm produced an invalid route"
+                        "route producer returned an invalid route"
                     );
                     return Err(SolveError::AlgorithmError(format!(
-                        "{} produced an invalid route: {err}",
-                        self.algorithm.name()
+                        "{producer} produced an invalid route: {err}"
                     )));
                 }
 
@@ -903,7 +987,7 @@ where
                             let result = {
                                 let params = task.params().clone();
                                 let order = task.order();
-                                self.quote(order, params).await
+                                self.quote(order, params, task.deadline()).await
                             };
 
                             let outcome = match &result {
@@ -1000,6 +1084,11 @@ mod tests {
         },
         AlgorithmError,
     };
+
+    /// A deadline far enough away that no test reaches it.
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
 
     /// A minimal mock algorithm for testing the worker.
     /// Uses DepthAndPrice as the edge weight type to satisfy trait bounds.
@@ -1114,7 +1203,7 @@ mod tests {
         let ord = order(&token_a, &token_b, 100, OrderSide::Sell);
 
         let result = worker
-            .quote(&ord, SolveParams::default())
+            .quote(&ord, SolveParams::default(), far_deadline())
             .await;
 
         match result {
@@ -1212,7 +1301,7 @@ mod tests {
         );
         let ord = order(&token_a, &token_c, 100, OrderSide::Sell);
         let result = worker
-            .quote(&ord, SolveParams::default().with_route_filter(filter))
+            .quote(&ord, SolveParams::default().with_route_filter(filter), far_deadline())
             .await;
         match (rejection, result) {
             (Some(expected), Err(SolveError::AlgorithmError(msg))) => {
@@ -1345,7 +1434,9 @@ mod tests {
             RouteExclusionFilter::default().with_excluded_protocols(["uniswap_v2".to_string()]),
         );
 
-        let result = worker.quote(&ord, params).await;
+        let result = worker
+            .quote(&ord, params, far_deadline())
+            .await;
 
         match result {
             Err(SolveError::AlgorithmError(msg)) => {
@@ -1374,7 +1465,7 @@ mod tests {
         let ord = order(&token_a, &token_b, 100, OrderSide::Sell);
 
         let quote = worker
-            .quote(&ord, SolveParams::default())
+            .quote(&ord, SolveParams::default(), far_deadline())
             .await
             .expect("split route must quote");
 
@@ -1400,7 +1491,7 @@ mod tests {
         let ord = order(&token_a, &token_b, 100, OrderSide::Sell);
 
         let quote = worker
-            .quote(&ord, SolveParams::default())
+            .quote(&ord, SolveParams::default(), far_deadline())
             .await
             .expect("an unrepresentable price impact must not fail the quote");
 
@@ -1462,7 +1553,7 @@ mod tests {
         let ord = order(&token_a, &token_b, 100, OrderSide::Sell);
 
         let quote = worker
-            .quote(&ord, SolveParams::default())
+            .quote(&ord, SolveParams::default(), far_deadline())
             .await
             .expect("a route the calculation cannot price still quotes");
 
@@ -1530,7 +1621,7 @@ mod tests {
         let ord = order(&token_a, &token_b, 100, OrderSide::Sell);
 
         worker
-            .quote(&ord, SolveParams::default().with_route_filter(filter))
+            .quote(&ord, SolveParams::default().with_route_filter(filter), far_deadline())
             .await
     }
 
