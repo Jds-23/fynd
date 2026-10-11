@@ -63,6 +63,8 @@ See `docs/ARCHITECTURE.md` for the full architecture diagram and detailed compon
 4. **Algorithm trait** (`fynd-core/src/algorithm/`) — Pluggable route-finding; built-in:
    `MostLiquidAlgorithm`, `BellmanFordAlgorithm`, `PathFrankWolfeAlgorithm`, and
    `WaterFillAlgorithm`
+   **Post-processors** (`fynd-core/src/post_process/`) — `RoutePostProcessor`s a pool runs on the
+   algorithm's route before validation
 5. **MarketState** (`fynd-core/src/feed/market_data.rs`) — `Arc<RwLock<>>` of all component/token/gas state; accessed via `MarketData` handle
 6. **TychoFeed** (`fynd-core/src/feed/tycho_feed.rs`) — Background task: Tycho WebSocket → MarketState → broadcast events
 7. **Derived Data** (`fynd-core/src/derived/`) — Pre-computed spot prices, component (pool) depths, token gas prices
@@ -130,7 +132,7 @@ See `docs/ARCHITECTURE.md` for the full architecture diagram and detailed compon
 
 | File | Purpose |
 |---|---|
-| `worker_pools.toml` | Worker pool definitions: algorithm, num_workers, hop limits, timeout, `exclude_protocols` (protocol systems that worker pool never routes through). Optional — binary falls back to embedded defaults if not found |
+| `worker_pools.toml` | Worker pool definitions: algorithm, num_workers, hop limits, timeout, `exclude_protocols` (protocol systems that worker pool never routes through), `post_processors` (names of `RoutePostProcessor`s the worker pool runs on each route). Optional — binary falls back to embedded defaults if not found |
 | `blocklist.toml` | Component IDs to exclude from the Tycho stream. Optional — falls back to tycho-simulation defaults if not found |
 
 ## Testing
