@@ -38,6 +38,9 @@ pub mod feed;
 /// Graph management for algorithms. Provides [`GraphManager`](graph::GraphManager)
 /// trait and the reusable [`PetgraphStableDiGraphManager`](graph::PetgraphStableDiGraphManager).
 pub mod graph;
+/// Post-processors that change the route a pool's algorithm returns: the [`RoutePostProcessor`]
+/// trait and the [`PostProcessorRegistry`] of factories a caller registers.
+pub mod post_process;
 /// External price validation for quotes.
 pub mod price_guard;
 /// Re-execute an already-built route against a (possibly newer) market state.
@@ -66,6 +69,9 @@ pub use algorithm::{
 // Required for implementing the Algorithm trait externally
 pub use derived::computation::ComputationRequirements;
 pub use feed::{events::MarketEvent, market_data::StateLabel};
+pub use post_process::{
+    PostProcessRequest, PostProcessorAlreadyRegistered, PostProcessorRegistry, RoutePostProcessor,
+};
 pub use price_guard::{
     config::PriceGuardConfig,
     provider::{ExternalPrice, PriceProvider, PriceProviderError},
