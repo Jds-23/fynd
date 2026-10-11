@@ -69,3 +69,57 @@ impl std::fmt::Debug for PostProcessorRegistry {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::{
+        feed::events::{EventError, MarketEvent, MarketEventHandler},
+        post_process::PostProcessRequest,
+        types::RouteResult,
+    };
+
+    struct Noop;
+
+    #[async_trait]
+    impl MarketEventHandler for Noop {
+        async fn handle_event(&mut self, _event: &MarketEvent) -> Result<(), EventError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl RoutePostProcessor for Noop {
+        async fn process(
+            &self,
+            _request: &PostProcessRequest<'_>,
+            route: RouteResult,
+        ) -> RouteResult {
+            route
+        }
+    }
+
+    fn registry_with_post_processor(name: &str) -> PostProcessorRegistry {
+        PostProcessorRegistry::new()
+            .with_post_processor(name, || Noop)
+            .expect("the name is free")
+    }
+
+    #[test]
+    fn test_registry_duplicate_name() {
+        let error = registry_with_post_processor("mine")
+            .with_post_processor("mine", || Noop)
+            .expect_err("the name is taken");
+
+        assert_eq!(error, PostProcessorAlreadyRegistered { name: "mine".to_string() });
+    }
+
+    #[test]
+    fn test_registry_debug() {
+        let printed = format!("{:?}", registry_with_post_processor("mine"));
+
+        assert_eq!(printed, r#"PostProcessorRegistry { names: ["mine"] }"#);
+    }
+}
