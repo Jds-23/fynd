@@ -29,7 +29,7 @@ use crate::{
     algorithm::most_liquid::DepthAndPrice,
     feed::market_data::{MarketData, MarketState},
     graph::{petgraph::PetgraphStableDiGraphManager, GraphManager, TopologyGraphManager},
-    types::{quote::OrderSide, Order},
+    types::{quote::OrderSide, ComponentTopology, Order},
 };
 
 /// Sets the last updated block of `market` by reporting a `Ready` block for `test_protocol`, a
@@ -554,6 +554,23 @@ pub fn component_with_directions(
         .static_attributes
         .insert(SWAP_DIRECTIONS_ATTRIBUTE.to_string(), encoded.into());
     component
+}
+
+/// Creates a component topology with the given tokens and swap directions.
+pub fn topology_with_directions(
+    tokens: &[&Address],
+    directions: &[(&Address, &Address)],
+) -> ComponentTopology {
+    ComponentTopology {
+        tokens: tokens
+            .iter()
+            .map(|token| (*token).clone())
+            .collect(),
+        swap_directions: directions
+            .iter()
+            .map(|(token_in, token_out)| ((*token_in).clone(), (*token_out).clone()))
+            .collect(),
+    }
 }
 
 /// Creates an order for testing.
