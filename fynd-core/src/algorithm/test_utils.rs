@@ -533,6 +533,19 @@ pub fn component_with_protocol(
     )
 }
 
+/// Encodes `directions` the way a book feed writes its `swap_directions` attribute: 40 bytes each,
+/// the token sold first.
+pub fn encode_swap_directions<'a>(
+    directions: impl IntoIterator<Item = &'a (Address, Address)>,
+) -> Bytes {
+    let mut encoded = Vec::new();
+    for (token_in, token_out) in directions {
+        encoded.extend_from_slice(token_in);
+        encoded.extend_from_slice(token_out);
+    }
+    encoded.into()
+}
+
 /// Creates a test ProtocolComponent that lists its swap directions in the `swap_directions`
 /// attribute, as an aggregated RFQ venue does.
 pub fn component_with_directions(
@@ -544,15 +557,10 @@ pub fn component_with_directions(
         .iter()
         .map(|(token_in, token_out)| (token_in.address.clone(), token_out.address.clone()))
         .collect();
-    let mut encoded = Vec::new();
-    for (token_in, token_out) in &directions {
-        encoded.extend_from_slice(token_in);
-        encoded.extend_from_slice(token_out);
-    }
     let mut component = component_with_protocol(id, "rfq:test", tokens);
     component
         .static_attributes
-        .insert(SWAP_DIRECTIONS_ATTRIBUTE.to_string(), encoded.into());
+        .insert(SWAP_DIRECTIONS_ATTRIBUTE.to_string(), encode_swap_directions(&directions));
     component
 }
 
