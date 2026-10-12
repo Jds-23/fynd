@@ -908,8 +908,28 @@ mod tests {
 
     use super::*;
     use crate::algorithm::test_utils::{
-        component, component_with_protocol, set_last_updated_block, token, MockProtocolSim,
+        component, component_with_directions, component_with_protocol, set_last_updated_block,
+        token, MockProtocolSim,
     };
+
+    #[test]
+    fn test_upsert_components_reports_new_and_reshaped_ids() {
+        let (a, b, c) = (token(0x01, "A"), token(0x02, "B"), token(0x03, "C"));
+        let tokens = [a.clone(), b.clone(), c.clone()];
+        let venue = |directions: &[(&Token, &Token)]| {
+            component_with_directions("venue", &tokens, directions)
+        };
+        let mut market = MarketState::new();
+        let id = || vec!["venue".to_string()];
+
+        let new = market.upsert_components([venue(&[(&a, &b)])]);
+        let unchanged = market.upsert_components([venue(&[(&a, &b)])]);
+        let reshaped = market.upsert_components([venue(&[(&b, &c)])]);
+
+        assert_eq!(new, UpsertedComponents { new: id(), reshaped: Vec::new() });
+        assert_eq!(unchanged, UpsertedComponents::default());
+        assert_eq!(reshaped, UpsertedComponents { new: Vec::new(), reshaped: id() });
+    }
 
     #[test]
     fn test_resolve_route_filter_with_protocol_prefix() {

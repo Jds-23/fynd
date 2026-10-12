@@ -8,6 +8,7 @@ use num_rational::BigRational;
 use num_traits::{ToPrimitive, Zero};
 use rustc_hash::FxHashMap;
 use tycho_simulation::{
+    book::SWAP_DIRECTIONS_ATTRIBUTE,
     tycho_client::feed::{BlockHeader, SynchronizerState},
     tycho_core::{
         dto::ProtocolStateDelta,
@@ -530,6 +531,29 @@ pub fn component_with_protocol(
         Default::default(),
         NaiveDateTime::default(),
     )
+}
+
+/// Creates a test ProtocolComponent that lists its swap directions in the `swap_directions`
+/// attribute, as an aggregated RFQ venue does.
+pub fn component_with_directions(
+    id: &str,
+    tokens: &[Token],
+    directions: &[(&Token, &Token)],
+) -> ProtocolComponent {
+    let directions: std::collections::BTreeSet<(Address, Address)> = directions
+        .iter()
+        .map(|(token_in, token_out)| (token_in.address.clone(), token_out.address.clone()))
+        .collect();
+    let mut encoded = Vec::new();
+    for (token_in, token_out) in &directions {
+        encoded.extend_from_slice(token_in);
+        encoded.extend_from_slice(token_out);
+    }
+    let mut component = component_with_protocol(id, "rfq:test", tokens);
+    component
+        .static_attributes
+        .insert(SWAP_DIRECTIONS_ATTRIBUTE.to_string(), encoded.into());
+    component
 }
 
 /// Creates an order for testing.
