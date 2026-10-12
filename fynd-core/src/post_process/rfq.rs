@@ -911,7 +911,8 @@ mod tests {
                 id.to_string(),
                 pair.iter()
                     .map(|token| token.address.clone())
-                    .collect(),
+                    .collect::<Vec<_>>()
+                    .into(),
             )]
             .into_iter()
             .collect(),

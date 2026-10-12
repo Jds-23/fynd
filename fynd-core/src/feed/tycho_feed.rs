@@ -657,7 +657,6 @@ mod tests {
     use std::{collections::HashMap, env};
 
     use num_bigint::BigUint;
-    use rustc_hash::FxHashMap;
     use tycho_simulation::{
         protocol::models::{ProtocolComponent, Update},
         tycho_client::feed::{BlockHeader, SynchronizerState},
@@ -942,7 +941,7 @@ mod tests {
             MarketEvent::MarketUpdated {
                 added_components: FxHashMap::from_iter([(
                     component_id.to_string(),
-                    vec![token1.address, token2.address]
+                    vec![token1.address, token2.address].into()
                 )]),
                 removed_components: Vec::new(),
                 updated_components: Vec::new(),
@@ -1050,7 +1049,7 @@ mod tests {
             MarketEvent::MarketUpdated {
                 added_components: FxHashMap::from_iter([(
                     component_id.to_string(),
-                    vec![token1.address, token2.address]
+                    vec![token1.address, token2.address].into()
                 )]),
                 removed_components: Vec::new(),
                 updated_components: Vec::new(),
@@ -1164,7 +1163,7 @@ mod tests {
             MarketEvent::MarketUpdated {
                 added_components: FxHashMap::from_iter([(
                     component_id.to_string(),
-                    vec![token1.address, token2.address]
+                    vec![token1.address, token2.address].into()
                 )]),
                 removed_components: Vec::new(),
                 updated_components: vec![],
@@ -1264,7 +1263,7 @@ mod tests {
             MarketEvent::MarketUpdated {
                 added_components: FxHashMap::from_iter([(
                     old_component_id.to_string(),
-                    vec![old_token1.address.clone(), old_token2.address.clone()]
+                    vec![old_token1.address.clone(), old_token2.address.clone()].into()
                 )]),
                 removed_components: Vec::new(),
                 updated_components: Vec::new(),
@@ -1277,7 +1276,7 @@ mod tests {
             MarketEvent::MarketUpdated {
                 added_components: FxHashMap::from_iter([(
                     new_component_id.to_string(),
-                    vec![new_token1.address, new_token2.address]
+                    vec![new_token1.address, new_token2.address].into()
                 )]),
                 removed_components: vec![old_component_id.to_string()],
                 updated_components: Vec::new(),

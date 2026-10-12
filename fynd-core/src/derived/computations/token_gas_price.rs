@@ -1982,7 +1982,7 @@ mod tests {
                 &ChangedComponents {
                     added: FxHashMap::from_iter([(
                         "eth_usdc".to_string(),
-                        vec![eth.address.clone(), usdc.address.clone()],
+                        vec![eth.address.clone(), usdc.address.clone()].into(),
                     )]),
                     ..ChangedComponents::default()
                 },
@@ -2162,7 +2162,10 @@ mod tests {
         // else in the selection points at it. BBB's component did not change, so BBB is not
         // selected and keeps what it had, even though its market moved too.
         let mut added = FxHashMap::default();
-        added.insert("eth_aaa_v2".to_string(), vec![eth.address.clone(), aaa.address.clone()]);
+        added.insert(
+            "eth_aaa_v2".to_string(),
+            vec![eth.address.clone(), aaa.address.clone()].into(),
+        );
         let output = computation
             .compute(&market, &store, &ChangedComponents { added, ..ChangedComponents::default() })
             .await
@@ -2214,7 +2217,7 @@ mod tests {
         }
 
         let mut added = FxHashMap::default();
-        added.insert("eth_ccc".to_string(), vec![eth.address.clone(), ccc.address.clone()]);
+        added.insert("eth_ccc".to_string(), vec![eth.address.clone(), ccc.address.clone()].into());
         let output = computation
             .compute(&market, &store, &ChangedComponents { added, ..ChangedComponents::default() })
             .await
@@ -2516,7 +2519,7 @@ mod tests {
         }
 
         let mut added = FxHashMap::default();
-        added.insert("eth_ccc".to_string(), vec![eth.address.clone(), ccc.address.clone()]);
+        added.insert("eth_ccc".to_string(), vec![eth.address.clone(), ccc.address.clone()].into());
         let output = computation
             .compute(&market, &store, &ChangedComponents { added, ..ChangedComponents::default() })
             .await
@@ -2558,7 +2561,10 @@ mod tests {
                 "eth_aaa_2".to_string(),
                 Box::new(MockProtocolSim::new(9000.0)) as Box<dyn ProtocolSim>,
             )]);
-            added.insert("eth_aaa_2".to_string(), vec![eth.address.clone(), aaa.address.clone()]);
+            added.insert(
+                "eth_aaa_2".to_string(),
+                vec![eth.address.clone(), aaa.address.clone()].into(),
+            );
         }
 
         let output = computation
@@ -2615,8 +2621,14 @@ mod tests {
                     Box::new(MockProtocolSim::new(5000.0)) as Box<dyn ProtocolSim>,
                 ),
             ]);
-            added.insert("eth_aaa_2".to_string(), vec![eth.address.clone(), aaa.address.clone()]);
-            added.insert("eth_ccc".to_string(), vec![eth.address.clone(), ccc.address.clone()]);
+            added.insert(
+                "eth_aaa_2".to_string(),
+                vec![eth.address.clone(), aaa.address.clone()].into(),
+            );
+            added.insert(
+                "eth_ccc".to_string(),
+                vec![eth.address.clone(), ccc.address.clone()].into(),
+            );
         }
         let cut = computation
             .compute(&market, &store, &ChangedComponents { added, ..ChangedComponents::default() })
@@ -2679,7 +2691,7 @@ mod tests {
                     id.clone(),
                     Box::new(MockProtocolSim::new(5000.0)) as Box<dyn ProtocolSim>,
                 )]);
-                added.insert(id, vec![eth.address.clone(), arrival.address.clone()]);
+                added.insert(id, vec![eth.address.clone(), arrival.address.clone()].into());
             }
         }
 
@@ -3197,7 +3209,7 @@ mod tests {
         TokenGasPriceComputation::persist(&mut *store.write().await, seeded, 1);
         let added = FxHashMap::from_iter([(
             "rfq_x".to_string(),
-            vec![eth.address.clone(), x.address.clone()],
+            vec![eth.address.clone(), x.address.clone()].into(),
         )]);
 
         computation
