@@ -13,7 +13,7 @@ use crate::{
     feed::{
         events::{EventError, MarketEvent, MarketEventHandler},
         market_data::{MarketData, MarketDataView},
-        protocol_registry::RFQ_PREFIX,
+        protocol_registry::is_rfq_protocol,
     },
     post_process::{PostProcessRequest, RoutePostProcessor},
     replay::{simulate_swaps, ReplayError, SimulatedRoute, SimulationEnds},
@@ -25,8 +25,8 @@ use crate::{
 /// It replaces one swap, or all swaps of a segment: the run of swaps between two tokens that every
 /// path of the order passes through. It keeps a replacement only when the net amount out rises.
 /// Only sell orders without an exclusive leg change. It uses only RFQ components that the request
-/// does not exclude and the pool does not drop. The server must index `rfq:` protocols for the
-/// replacer to find components.
+/// does not exclude and the pool does not drop. The server must index `rfq:` or `fallback:rfq:`
+/// protocols for the replacer to find components.
 #[derive(Default)]
 pub(crate) struct RfqSwapReplacer {
     market: Option<MarketData>,
@@ -56,7 +56,7 @@ impl MarketEventHandler for RfqSwapReplacer {
             self.index.remove(id);
             if view
                 .get_component(id)
-                .is_some_and(|component| is_rfq(&component.protocol_system))
+                .is_some_and(|component| is_rfq_protocol(&component.protocol_system))
             {
                 self.index
                     .insert(id.clone(), tokens.clone());
@@ -76,7 +76,7 @@ impl RoutePostProcessor for RfqSwapReplacer {
             for system in state
                 .component_counts_by_protocol()
                 .keys()
-                .filter(|system| is_rfq(system))
+                .filter(|system| is_rfq_protocol(system))
             {
                 for id in state.components_by_protocol(system) {
                     if let Some(component) = state.get_component(id) {
@@ -107,10 +107,6 @@ impl RoutePostProcessor for RfqSwapReplacer {
         };
         Search::new(snapshot, request, route).and_then(Search::run)
     }
-}
-
-fn is_rfq(protocol_system: &str) -> bool {
-    protocol_system.starts_with(RFQ_PREFIX)
 }
 
 /// The RFQ components of the market, by token.
