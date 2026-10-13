@@ -573,6 +573,9 @@ where
         if self.post_processors.is_empty() {
             return (result, Vec::new());
         }
+        let drops_component = |component: &ProtocolComponent| {
+            should_drop_component(self.liquidity_scope, &self.exclude_protocols, component)
+        };
         let request = PostProcessRequest::new(
             order,
             &self.market_data,
@@ -582,7 +585,8 @@ where
                 .checked_sub(POST_PROCESS_DEADLINE_MARGIN)
                 .unwrap_or(deadline),
         )
-        .with_label(params.state_label());
+        .with_label(params.state_label())
+        .with_pool_drops(&drops_component);
         let Some(processed) = self
             .post_processors
             .run(&request, &result)

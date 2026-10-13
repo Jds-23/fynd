@@ -26,6 +26,7 @@ pub(crate) mod test_utils;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use tycho_simulation::tycho_common::models::protocol::ProtocolComponent;
 
 pub(crate) use self::pipeline::{PostProcessors, ProcessedRoute};
 pub use self::registry::{
@@ -78,6 +79,7 @@ pub struct PostProcessRequest<'a> {
     label: Option<&'a StateLabel>,
     derived: &'a SharedDerivedDataRef,
     exclusions: &'a RouteExclusions,
+    pool_drops: Option<&'a (dyn Fn(&ProtocolComponent) -> bool + Sync)>,
     deadline: Instant,
 }
 
@@ -90,7 +92,18 @@ impl<'a> PostProcessRequest<'a> {
         exclusions: &'a RouteExclusions,
         deadline: Instant,
     ) -> Self {
-        Self { order, market, label: None, derived, exclusions, deadline }
+        Self { order, market, label: None, derived, exclusions, pool_drops: None, deadline }
+    }
+
+    /// Sets the rule for dropping components from the pool. See
+    /// [`drops_component`](Self::drops_component).
+    #[must_use]
+    pub fn with_pool_drops(
+        mut self,
+        pool_drops: &'a (dyn Fn(&ProtocolComponent) -> bool + Sync),
+    ) -> Self {
+        self.pool_drops = Some(pool_drops);
+        self
     }
 
     /// Sets the overlay the solve ran against. `None` is the base market state.
@@ -126,6 +139,13 @@ impl<'a> PostProcessRequest<'a> {
     /// the returned route uses one.
     pub fn exclusions(&self) -> &'a RouteExclusions {
         self.exclusions
+    }
+
+    /// Returns whether the pool drops `component`. The worker rejects processed routes that use
+    /// dropped components. Returns `false` when the request has no pool drop rule.
+    pub fn drops_component(&self, component: &ProtocolComponent) -> bool {
+        self.pool_drops
+            .is_some_and(|drops| drops(component))
     }
 
     /// The time after which the worker stops waiting for the post-processor. The worker sets it
