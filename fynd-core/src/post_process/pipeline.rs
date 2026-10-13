@@ -51,9 +51,9 @@ impl PostProcessors {
     /// Runs the post-processors on `route` in config order. Each one gets the route the one
     /// before returned.
     ///
-    /// A post-processor that is still running at the request deadline loses its turn: this keeps
-    /// the route it had before the call. Once the deadline has passed, the remaining
-    /// post-processors do not run.
+    /// At [`PostProcessRequest::deadline`], the worker stops waiting for the post-processor that
+    /// is running and keeps the route it had before that call. The post-processors after it do
+    /// not run.
     pub(crate) async fn run(
         &self,
         request: &PostProcessRequest<'_>,
