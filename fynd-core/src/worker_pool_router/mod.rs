@@ -1179,13 +1179,17 @@ fn to_gas_token_amount(quote: &OrderQuote, amount: &BigUint) -> Option<BigUint> 
     Some(amount * gas_cost_wei / gas_cost_out)
 }
 
-/// Records the win and the settled volume of one quote the router returns, by pool and algorithm.
+/// Records the win and the settled volume of one quote the router returns, by pool, algorithm and
+/// post-processors.
 ///
 /// Counting wins alone hides size: a solver can win few orders and still settle most of the flow,
 /// or the reverse. Output-token base units do not add up across tokens, so the amount is converted
 /// to the gas token first, the same way `record_gas_token_amount` does it. A quote the conversion
 /// cannot price counts under `worker_router_unpriced_won_quotes_total` rather than recording zero
 /// volume, which would read as a solver that won nothing.
+///
+/// The `post_processed_by` label joins the names of the post-processors that replaced the route
+/// with `+`, in config order. It is `none` when no post-processor replaced the route.
 ///
 /// A quote that found no route has no winner to credit. So has a quote the router built itself,
 /// which is why an empty worker pool is skipped rather than counted under a placeholder label.
@@ -1195,10 +1199,15 @@ fn record_win(quote: &OrderQuote) {
     }
     let worker_pool = quote.worker_pool().to_string();
     let algorithm = quote.algorithm().to_string();
+    let post_processed_by = match quote.post_processed_by() {
+        [] => "none".to_string(),
+        names => names.join("+"),
+    };
     counter!(
         "worker_router_best_quote_pool",
         "pool" => worker_pool.clone(),
-        "algorithm" => algorithm.clone()
+        "algorithm" => algorithm.clone(),
+        "post_processed_by" => post_processed_by.clone()
     )
     .increment(1);
 
@@ -1207,13 +1216,19 @@ fn record_win(quote: &OrderQuote) {
         counter!(
             "worker_router_unpriced_won_quotes_total",
             "pool" => worker_pool,
-            "algorithm" => algorithm
+            "algorithm" => algorithm,
+            "post_processed_by" => post_processed_by
         )
         .increment(1);
         return;
     };
-    gauge!("worker_router_won_volume_gas_token", "pool" => worker_pool, "algorithm" => algorithm)
-        .increment(volume / WEI_PER_GAS_TOKEN);
+    gauge!(
+        "worker_router_won_volume_gas_token",
+        "pool" => worker_pool,
+        "algorithm" => algorithm,
+        "post_processed_by" => post_processed_by
+    )
+    .increment(volume / WEI_PER_GAS_TOKEN);
 }
 
 /// Records an output-token `amount` under `metric`, in whole gas tokens.

@@ -810,6 +810,7 @@ where
                 )
                 .with_route(route)
                 .with_gas_price(gas_price);
+                quote.set_post_processed_by(post_processed_by);
                 if let Some(bps) = price_impact_bps {
                     quote = quote.with_price_impact_bps(bps);
                 }

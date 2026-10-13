@@ -1141,6 +1141,12 @@ pub struct OrderQuote {
     /// builds itself, such as the `NoRouteFound` placeholder.
     #[serde(skip)]
     worker_pool: String,
+    /// Names of the post-processors that replaced the route of this solution (internal use only).
+    ///
+    /// Empty when no post-processor replaced the route, or when the replacement failed the worker
+    /// checks.
+    #[serde(skip)]
+    post_processed_by: Vec<String>,
     /// Effective gas price (in wei) at the time the route was computed.
     #[serde_as(as = "Option<DisplayFromStr>")]
     gas_price: Option<BigUint>,
@@ -1200,6 +1206,7 @@ impl OrderQuote {
             block,
             algorithm,
             worker_pool: String::new(),
+            post_processed_by: Vec::new(),
             gas_price: None,
             transaction: None,
             fee_breakdown: None,
@@ -1353,6 +1360,19 @@ impl OrderQuote {
     /// price guard and encoding — the stages after which the winner is finally known.
     pub(crate) fn set_worker_pool(&mut self, worker_pool: String) {
         self.worker_pool = worker_pool;
+    }
+
+    /// Returns the names of the post-processors that replaced the route of this solution, in
+    /// config order.
+    pub fn post_processed_by(&self) -> &[String] {
+        &self.post_processed_by
+    }
+
+    /// Names the post-processors that replaced the route of this solution.
+    ///
+    /// Set by the worker that builds the quote.
+    pub(crate) fn set_post_processed_by(&mut self, post_processed_by: Vec<String>) {
+        self.post_processed_by = post_processed_by;
     }
 
     /// Returns the effective gas price at the time the route was computed.
