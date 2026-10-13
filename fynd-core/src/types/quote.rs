@@ -1742,6 +1742,13 @@ impl Route {
             .fold(BigUint::ZERO, |acc, g| acc + g)
     }
 
+    /// Whether any swap in this route carries a committed amount, which marks an exclusive leg.
+    pub fn has_exclusive_leg(&self) -> bool {
+        self.swaps
+            .iter()
+            .any(|swap| swap.committed_amount_out.is_some())
+    }
+
     /// Validates that the route is well-formed.
     ///
     /// # Errors
