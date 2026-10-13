@@ -48,8 +48,8 @@ impl PostProcessors {
         }
     }
 
-    /// Runs the post-processors on `route` in config order. Each one gets the route the one
-    /// before returned.
+    /// Runs the post-processors on `route` in config order. Each one gets the last route a
+    /// post-processor before it returned, or `route` when none did.
     ///
     /// At [`PostProcessRequest::deadline`], the worker stops waiting for the post-processor that
     /// is running and keeps the route it had before that call. The post-processors after it do
@@ -70,19 +70,18 @@ impl PostProcessors {
                 );
                 break;
             }
-            let before = route.clone();
-            let processing = post_processor.process(request, route);
-            route = match tokio::time::timeout_at(deadline.into(), processing).await {
-                Ok(processed) => processed,
+            let processing = post_processor.process(request, &route);
+            match tokio::time::timeout_at(deadline.into(), processing).await {
+                Ok(Some(processed)) => route = processed,
+                Ok(None) => {}
                 Err(_) => {
                     warn!(
                         worker_pool = %self.worker_pool,
                         post_processor = post_processor_name,
                         "post-processor passed the task deadline; keeping its input route"
                     );
-                    before
                 }
-            };
+            }
             record_post_processor_duration(
                 &self.worker_pool,
                 post_processor_name,

@@ -57,12 +57,17 @@ pub trait RoutePostProcessor: MarketEventHandler + Send + Sync {
     /// market events. Does nothing by default.
     async fn initialize(&mut self, _market: &MarketData) {}
 
-    /// Returns the route to quote. A processor that cannot improve the route returns `route`
-    /// unchanged, so a failed optimization never fails a quote.
+    /// Returns the route to quote in place of `route`, or `None` to keep `route`. A processor
+    /// that cannot improve the route returns `None`, so a failed optimization never fails a
+    /// quote.
     ///
     /// The worker stops waiting at [`PostProcessRequest::deadline`] and keeps the route it had
     /// before this call.
-    async fn process(&self, request: &PostProcessRequest<'_>, route: RouteResult) -> RouteResult;
+    async fn process(
+        &self,
+        request: &PostProcessRequest<'_>,
+        route: &RouteResult,
+    ) -> Option<RouteResult>;
 }
 
 /// What a post-processor reads about the solve that produced the route.
