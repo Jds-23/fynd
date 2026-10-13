@@ -153,13 +153,18 @@ mod tests {
             }
         }
 
+        /// A request with a deadline that no test reaches.
         fn request(&self) -> PostProcessRequest<'_> {
+            self.request_until(Instant::now() + Duration::from_secs(60))
+        }
+
+        fn request_until(&self, deadline: Instant) -> PostProcessRequest<'_> {
             PostProcessRequest::new(
                 &self.order,
                 &self.market,
-                None,
                 &self.derived,
                 &self.exclusions,
+                deadline,
             )
         }
     }
@@ -209,9 +214,7 @@ mod tests {
             .with_delay(Duration::from_secs(30));
         let post_processors = build_post_processors(vec![("slow", slow)]);
         let fixture = Fixture::new();
-        let request = fixture
-            .request()
-            .with_deadline(Instant::now() + Duration::from_millis(50));
+        let request = fixture.request_until(Instant::now() + Duration::from_millis(50));
 
         let route = post_processors
             .run(&request, route_result(7))
@@ -225,9 +228,7 @@ mod tests {
         let set = MockPostProcessor::new(|route| with_net_amount_out(route, 1000));
         let post_processors = build_post_processors(vec![("set", set)]);
         let fixture = Fixture::new();
-        let request = fixture
-            .request()
-            .with_deadline(Instant::now() - Duration::from_millis(1));
+        let request = fixture.request_until(Instant::now() - Duration::from_millis(1));
 
         let route = post_processors
             .run(&request, route_result(7))
