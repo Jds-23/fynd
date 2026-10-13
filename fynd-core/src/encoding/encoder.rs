@@ -171,7 +171,8 @@ fn solution_from_quote(
         quote.amount_out().clone(),
         min_amount_out,
         swaps,
-    ))
+    )
+    .with_origin(quote.sender().clone()))
 }
 
 /// Converts a slippage fraction (`0.005` = 0.5%) to whole basis points, clamped to 0..=10_000.
@@ -444,8 +445,8 @@ impl Encoder {
                 .clone(),
             Some(slippage_bps(encoding_options.slippage())),
         )?
-        .with_user_transfer_type(encoding_options.transfer_type().clone())
-        .with_origin(quote.sender().clone());
+        .with_user_transfer_type(encoding_options.transfer_type().clone());
+
         let solution = match &self.exclusive_swap_signer {
             Some(signer) => {
                 Self::stamp_exclusive_swaps(solution, quote, signer, encoding_options.slippage())?
