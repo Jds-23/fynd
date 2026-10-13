@@ -210,8 +210,9 @@ fn record_post_processor_duration(
 mod tests {
     use std::sync::{atomic::Ordering, Arc};
 
-    use metrics_util::debugging::DebuggingRecorder;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use num_bigint::BigInt;
+    use rstest::rstest;
     use rustc_hash::FxHashMap;
 
     use super::*;
@@ -349,13 +350,21 @@ mod tests {
         let fixture = Fixture::new();
         let request = fixture.request_until(Instant::now() + Duration::from_millis(50));
 
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let processed = post_processors
             .run(&request, &route_result(7))
             .await
             .expect("the first post-processor replaces the route");
+        let recorded = crate::tests::metrics::recorded_metrics(&snapshotter);
 
         assert_eq!(processed.route.net_amount_out(), &BigInt::from(100));
         assert_eq!(processed.post_processed_by, ["set".to_string()]);
+        assert_eq!(
+            outcomes(&recorded),
+            vec![outcome("set", "replaced"), outcome("slow", "timed_out")]
+        );
     }
 
     #[tokio::test]
@@ -397,6 +406,94 @@ mod tests {
         );
     }
 
+    /// Runs `post_processors` on `input` and returns the recorded metrics.
+    async fn recorded_run(
+        post_processors: &PostProcessors,
+        request: &PostProcessRequest<'_>,
+        input: RouteResult,
+    ) -> Vec<crate::tests::metrics::Recorded> {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        post_processors
+            .run(request, &input)
+            .await;
+        crate::tests::metrics::recorded_metrics(&snapshotter)
+    }
+
+    fn outcomes(recorded: &[crate::tests::metrics::Recorded]) -> Vec<(String, String, u64)> {
+        let mut outcomes = Vec::new();
+        for (name, labels, value) in recorded {
+            if name != "worker_pool_post_processor_outcomes_total" {
+                continue;
+            }
+            let DebugValue::Counter(count) = value else {
+                panic!("expected counter, got {value:?}");
+            };
+            outcomes.push((
+                find_label(labels, "post_processor="),
+                find_label(labels, "outcome="),
+                *count,
+            ));
+        }
+        outcomes.sort();
+        outcomes
+    }
+
+    fn find_label(labels: &[String], prefix: &str) -> String {
+        labels
+            .iter()
+            .find(|label| label.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no label starting with {prefix} in {labels:?}"))
+            .clone()
+    }
+
+    fn outcome(post_processor: &str, outcome: &str) -> (String, String, u64) {
+        (format!("post_processor={post_processor}"), format!("outcome={outcome}"), 1)
+    }
+
+    #[tokio::test]
+    async fn test_run_outcomes_changing_and_unchanged_processors() {
+        let set = MockPostProcessor::new(|route| with_net_amount_out(route, 100));
+        let post_processors =
+            build_post_processors(vec![("set", set), ("keep", MockPostProcessor::unchanged())]);
+        let fixture = Fixture::new();
+
+        let recorded = recorded_run(&post_processors, &fixture.request(), route_result(7)).await;
+
+        assert_eq!(outcomes(&recorded), vec![outcome("keep", "kept"), outcome("set", "replaced")]);
+    }
+
+    #[tokio::test]
+    async fn test_run_outcome_slow_post_processor() {
+        let slow = MockPostProcessor::new(|route| with_net_amount_out(route, 1000))
+            .with_delay(Duration::from_secs(30));
+        let post_processors = build_post_processors(vec![("slow", slow)]);
+        let fixture = Fixture::new();
+        let request = fixture.request_until(Instant::now() + Duration::from_millis(50));
+
+        let recorded = recorded_run(&post_processors, &request, route_result(7)).await;
+
+        assert_eq!(outcomes(&recorded), vec![outcome("slow", "timed_out")]);
+    }
+
+    #[tokio::test]
+    async fn test_run_outcomes_expired_deadline() {
+        let post_processors = build_post_processors(vec![
+            ("first", MockPostProcessor::unchanged()),
+            ("second", MockPostProcessor::unchanged()),
+        ]);
+        let fixture = Fixture::new();
+        let request = fixture.request_until(Instant::now() - Duration::from_millis(1));
+
+        let recorded = recorded_run(&post_processors, &request, route_result(7)).await;
+
+        assert_eq!(
+            outcomes(&recorded),
+            vec![outcome("first", "skipped"), outcome("second", "skipped")]
+        );
+    }
+
     #[tokio::test]
     async fn test_run_post_processed_by_config_order() {
         let post_processors = build_post_processors(vec![
@@ -412,6 +509,49 @@ mod tests {
             .expect("two post-processors replace the route");
 
         assert_eq!(processed.post_processed_by, ["first".to_string(), "last".to_string()]);
+    }
+
+    #[rstest]
+    #[case::gain(100, 125, Some(2_500.0))]
+    #[case::sub_bps_gain(200_000, 200_010, Some(0.5))]
+    #[case::loss(100, 90, Some(-1_000.0))]
+    #[case::zero_input(0, 100, None)]
+    #[case::negative_input(-5, 100, None)]
+    #[tokio::test]
+    async fn test_run_gain_bps(
+        #[case] input: i64,
+        #[case] output: i64,
+        #[case] expected: Option<f64>,
+    ) {
+        let set = MockPostProcessor::new(move |route| with_net_amount_out(route, output));
+        let post_processors = build_post_processors(vec![("set", set)]);
+        let fixture = Fixture::new();
+
+        let recorded =
+            recorded_run(&post_processors, &fixture.request(), route_result(input)).await;
+
+        let gains: Vec<_> = recorded
+            .iter()
+            .filter(|(name, _, _)| name == "worker_pool_post_processor_gain_bps")
+            .collect();
+        match expected {
+            Some(bps) => {
+                assert_eq!(gains.len(), 1);
+                assert_eq!(
+                    gains[0].1,
+                    vec!["pool=test_pool".to_string(), "post_processor=set".to_string()]
+                );
+                let DebugValue::Histogram(values) = &gains[0].2 else {
+                    panic!("expected histogram, got {:?}", gains[0].2);
+                };
+                let recorded_values: Vec<f64> = values
+                    .iter()
+                    .map(|v| v.into_inner())
+                    .collect();
+                assert_eq!(recorded_values, vec![bps]);
+            }
+            None => assert!(gains.is_empty()),
+        }
     }
 
     #[tokio::test]
