@@ -206,10 +206,11 @@ mod tests {
         let fixture = Fixture::new();
 
         let route = post_processors
-            .run(&fixture.request(), route_result(7))
-            .await;
+            .run(&fixture.request(), &route_result(7))
+            .await
+            .expect("both post-processors replace the route");
 
-        assert_eq!(route.net_amount_out(), &BigInt::from(101));
+        assert_eq!(route.route.net_amount_out(), &BigInt::from(101));
     }
 
     #[tokio::test]
@@ -220,10 +221,23 @@ mod tests {
         let fixture = Fixture::new();
 
         let route = post_processors
-            .run(&fixture.request(), route_result(7))
+            .run(&fixture.request(), &route_result(7))
+            .await
+            .expect("the first post-processor replaces the route");
+
+        assert_eq!(route.route.net_amount_out(), &BigInt::from(100));
+    }
+
+    #[tokio::test]
+    async fn test_run_unchanged_post_processor() {
+        let post_processors = build_post_processors(vec![("keep", MockPostProcessor::unchanged())]);
+        let fixture = Fixture::new();
+
+        let route = post_processors
+            .run(&fixture.request(), &route_result(7))
             .await;
 
-        assert_eq!(route.net_amount_out(), &BigInt::from(100));
+        assert!(route.is_none());
     }
 
     #[tokio::test]
@@ -235,10 +249,28 @@ mod tests {
         let request = fixture.request_until(Instant::now() + Duration::from_millis(50));
 
         let route = post_processors
-            .run(&request, route_result(7))
+            .run(&request, &route_result(7))
             .await;
 
-        assert_eq!(route.net_amount_out(), &BigInt::from(7));
+        assert!(route.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_run_timeout_keeps_earlier_replacement() {
+        let set = MockPostProcessor::new(|route| with_net_amount_out(route, 100));
+        let slow = MockPostProcessor::new(|route| with_net_amount_out(route, 1000))
+            .with_delay(Duration::from_secs(30));
+        let post_processors = build_post_processors(vec![("set", set), ("slow", slow)]);
+        let fixture = Fixture::new();
+        let request = fixture.request_until(Instant::now() + Duration::from_millis(50));
+
+        let processed = post_processors
+            .run(&request, &route_result(7))
+            .await
+            .expect("the first post-processor replaces the route");
+
+        assert_eq!(processed.route.net_amount_out(), &BigInt::from(100));
+        assert_eq!(processed.post_processed_by, ["set".to_string()]);
     }
 
     #[tokio::test]
@@ -249,10 +281,10 @@ mod tests {
         let request = fixture.request_until(Instant::now() - Duration::from_millis(1));
 
         let route = post_processors
-            .run(&request, route_result(7))
+            .run(&request, &route_result(7))
             .await;
 
-        assert_eq!(route.net_amount_out(), &BigInt::from(7));
+        assert!(route.is_none());
     }
 
     #[tokio::test]
@@ -265,7 +297,7 @@ mod tests {
         let fixture = Fixture::new();
 
         post_processors
-            .run(&fixture.request(), route_result(7))
+            .run(&fixture.request(), &route_result(7))
             .await;
 
         let recorded = crate::tests::metrics::recorded_metrics(&snapshotter);
@@ -278,6 +310,23 @@ mod tests {
             labels,
             vec![vec!["pool=test_pool".to_string(), "post_processor=first".to_string()]]
         );
+    }
+
+    #[tokio::test]
+    async fn test_run_post_processed_by_config_order() {
+        let post_processors = build_post_processors(vec![
+            ("first", MockPostProcessor::new(|route| with_net_amount_out(route, 10))),
+            ("keep", MockPostProcessor::unchanged()),
+            ("last", MockPostProcessor::new(|route| with_net_amount_out(route, 20))),
+        ]);
+        let fixture = Fixture::new();
+
+        let processed = post_processors
+            .run(&fixture.request(), &route_result(7))
+            .await
+            .expect("two post-processors replace the route");
+
+        assert_eq!(processed.post_processed_by, ["first".to_string(), "last".to_string()]);
     }
 
     #[tokio::test]
@@ -325,20 +374,5 @@ mod tests {
 
         assert_eq!(first_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn test_producer_names_algorithm_then_post_processors() {
-        let post_processors = build_post_processors(vec![
-            ("rfq", MockPostProcessor::unchanged()),
-            ("dedupe", MockPostProcessor::unchanged()),
-        ]);
-
-        assert_eq!(post_processors.producer("most_liquid"), "most_liquid + rfq + dedupe");
-    }
-
-    #[test]
-    fn test_producer_without_post_processors() {
-        assert_eq!(PostProcessors::default().producer("most_liquid"), "most_liquid");
     }
 }

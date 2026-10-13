@@ -2857,8 +2857,12 @@ mod tests {
         let seen = Arc::new(std::sync::Mutex::new(None));
         let recorder = Arc::clone(&seen);
         let recording = MockPostProcessor::with_request(move |request, result| {
-            *recorder.lock().unwrap() =
-                Some((request.label().cloned(), request.exclusions().excludes_pool("p1")));
+            *recorder.lock().unwrap() = Some((
+                request.label().cloned(),
+                request
+                    .exclusions()
+                    .excludes_pool("unused"),
+            ));
             rfq_route(result)
         });
         let mut worker = worker_with_post_processor(recording);
@@ -2869,13 +2873,13 @@ mod tests {
         let params = SolveParams::default()
             .with_state_label("overlay".to_string())
             .with_route_filter(
-                RouteExclusionFilter::default().with_excluded_pools(["p1".to_string()]),
+                RouteExclusionFilter::default().with_excluded_pools(["unused".to_string()]),
             );
 
         worker
             .quote(&a_to_b_order(), params, far_deadline())
             .await
-            .expect("the processed route avoids the excluded pool");
+            .expect("the routes avoid the excluded pool");
 
         assert_eq!(*seen.lock().unwrap(), Some((Some("overlay".to_string()), true)));
     }
@@ -2919,22 +2923,16 @@ mod tests {
     }
 
     #[rstest]
-    #[case::disconnected_swaps(disconnected_route, &[], &[], "invalid route")]
-    #[case::request_excluded_protocol(rfq_route, &[], &["rfq:bebop"], "excluded protocol rfq:bebop")]
-    #[case::pool_excluded_protocol(rfq_route, &["rfq:"], &[], "that this pool leaves out")]
-    #[case::exclusive_component(exclusive_route, &[], &[], "exclusive-leg that this pool leaves")]
-    #[case::net_above_amount_out(
-        inflated_route,
-        &[],
-        &[],
-        "net amount out 121 is above the route amount out 120"
-    )]
+    #[case::disconnected_swaps(disconnected_route, &[], &[])]
+    #[case::request_excluded_protocol(rfq_route, &[], &["rfq:bebop"])]
+    #[case::pool_excluded_protocol(rfq_route, &["rfq:"], &[])]
+    #[case::exclusive_component(exclusive_route, &[], &[])]
+    #[case::net_above_amount_out(inflated_route, &[], &[])]
     #[tokio::test]
-    async fn test_quote_rejects_post_processed_route(
+    async fn test_quote_with_rejected_post_processed_route(
         #[case] rewrite: fn(RouteResult) -> RouteResult,
         #[case] pool_excluded: &[&str],
         #[case] request_excluded: &[&str],
-        #[case] expected: &str,
     ) {
         let mut worker = worker_with_post_processor(MockPostProcessor::new(rewrite))
             .with_exclude_protocols(
@@ -2951,17 +2949,109 @@ mod tests {
             ),
         );
 
-        let result = worker
+        let quote = worker
             .quote(&a_to_b_order(), params, far_deadline())
-            .await;
+            .await
+            .expect("a failed post-processor does not fail the quote");
 
-        let Err(SolveError::AlgorithmError(message)) = result else {
-            panic!("expected an AlgorithmError for the route, got {result:?}");
+        let route = quote
+            .order()
+            .route()
+            .expect("the quote has a route");
+        let components: Vec<&str> = route
+            .swaps()
+            .iter()
+            .map(|swap| swap.component_id())
+            .collect();
+        assert_eq!(components, ["p1", "p2"]);
+        assert_eq!(quote.order().amount_out_net_gas(), &BigUint::from(192u64));
+    }
+
+    /// The value of `worker_pool_post_processed_route_rejected_total` for the test pool.
+    fn rejected_route_count(snapshotter: &metrics_util::debugging::Snapshotter) -> u64 {
+        use metrics_util::debugging::DebugValue;
+
+        let recorded = crate::tests::metrics::recorded_metrics(snapshotter);
+        let (_, labels, value) = recorded
+            .iter()
+            .find(|(name, _, _)| name == "worker_pool_post_processed_route_rejected_total")
+            .expect("the rejection counter is recorded");
+        assert_eq!(labels, &vec!["pool=test_pool".to_string()]);
+        let DebugValue::Counter(count) = value else {
+            panic!("expected counter, got {value:?}");
         };
-        assert!(
-            message.starts_with("split_route_mock + rfq produced an invalid route") &&
-                message.contains(expected),
-            "expected '{expected}' on the producer, got: {message}"
-        );
+        *count
+    }
+
+    fn fallback_rfq_route(result: RouteResult) -> RouteResult {
+        replace_route(result, vec![direct_swap("fallback:rfq:bebop", 120)], 118)
+    }
+
+    /// A processed route whose fallback leg has no fallback pool is rejected like any other
+    /// failed check: the quote uses the algorithm's route.
+    #[tokio::test]
+    async fn test_quote_post_processed_route_with_unbacked_fallback_leg() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let mut worker = worker_with_post_processor(MockPostProcessor::new(fallback_rfq_route));
+
+        let quote = worker
+            .quote(&a_to_b_order(), SolveParams::default(), far_deadline())
+            .await
+            .expect("a failed post-processor does not fail the quote");
+
+        let components: Vec<&str> = quote
+            .order()
+            .route()
+            .expect("the quote has a route")
+            .swaps()
+            .iter()
+            .map(|swap| swap.component_id())
+            .collect();
+        assert_eq!(components, ["p1", "p2"]);
+        assert_eq!(rejected_route_count(&snapshotter), 1);
+    }
+
+    /// The fallback amount of a processed route reaches the quoted route.
+    #[tokio::test]
+    async fn test_quote_post_processed_route_prices_fallback_leg() {
+        let mut worker = worker_with_post_processor(MockPostProcessor::new(fallback_rfq_route));
+        add_fallback_pool(&worker.market_data);
+        worker
+            .market_data
+            .try_write()
+            .expect("uncontended")
+            .update_states([(
+                FALLBACK_POOL.to_string(),
+                Box::new(MockProtocolSim::new(2.0)) as Box<dyn ProtocolSim>,
+            )]);
+
+        let quote = worker
+            .quote(&a_to_b_order(), SolveParams::default(), far_deadline())
+            .await
+            .expect("the fallback leg has a pool");
+
+        let route = quote
+            .order()
+            .route()
+            .expect("the quote has a route");
+        assert_eq!(route.swaps()[0].component_id(), "rfq-leg");
+        assert!(route.fallback_amount_out().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_quote_rejected_post_processed_route_metric() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let mut worker = worker_with_post_processor(MockPostProcessor::new(inflated_route));
+
+        worker
+            .quote(&a_to_b_order(), SolveParams::default(), far_deadline())
+            .await
+            .expect("a failed post-processor does not fail the quote");
+
+        assert_eq!(rejected_route_count(&snapshotter), 1);
     }
 }
