@@ -315,6 +315,9 @@ where
     /// still see them. Empty for every worker pool that does not set
     /// `algorithm_exclude_protocols`.
     algorithm_exclude_protocols: Vec<String>,
+    /// The protocol systems the algorithm's graph and route never use: `exclude_protocols` plus
+    /// `algorithm_exclude_protocols`.
+    algorithm_exclusions: Vec<String>,
     /// Post-processors run on the algorithm's route, in config order. Empty when the pool sets no
     /// `post_processors`.
     post_processors: PostProcessors,
@@ -359,6 +362,7 @@ where
             liquidity_scope: LiquidityScope::default(),
             exclude_protocols: Vec::new(),
             algorithm_exclude_protocols: Vec::new(),
+            algorithm_exclusions: Vec::new(),
             post_processors: PostProcessors::default(),
         }
     }
@@ -372,6 +376,7 @@ where
     /// Sets the protocol systems this worker never routes through.
     pub(crate) fn with_exclude_protocols(mut self, exclude_protocols: Vec<String>) -> Self {
         self.exclude_protocols = exclude_protocols;
+        self.merge_algorithm_exclusions();
         self
     }
 
@@ -381,7 +386,18 @@ where
         algorithm_exclude_protocols: Vec<String>,
     ) -> Self {
         self.algorithm_exclude_protocols = algorithm_exclude_protocols;
+        self.merge_algorithm_exclusions();
         self
+    }
+
+    /// Builds `algorithm_exclusions` from the two exclusion lists.
+    fn merge_algorithm_exclusions(&mut self) {
+        self.algorithm_exclusions = self
+            .exclude_protocols
+            .iter()
+            .chain(&self.algorithm_exclude_protocols)
+            .cloned()
+            .collect();
     }
 
     /// Sets the post-processors this worker runs on every route, in the order given, each with its
@@ -438,9 +454,9 @@ where
             let market = self.market_data.read().await;
             // Owned already, so the graph is built without holding the market lock.
             let topology = market.component_topology();
-            let Self { pamm_admission, liquidity_scope, exclude_protocols, .. } = self;
+            let Self { pamm_admission, liquidity_scope, algorithm_exclusions, .. } = self;
             let caller_drops = |component: &ProtocolComponent| {
-                should_drop_component(*liquidity_scope, exclude_protocols, component)
+                should_drop_component(*liquidity_scope, algorithm_exclusions, component)
             };
             let withheld_pamms =
                 pamm_admission.withhold_from_graph(&market, &topology, &caller_drops);
@@ -457,25 +473,60 @@ where
         self.initialized = true;
     }
 
-    /// Applies one market event to the graph, with the pAMM admission rule run over it first.
+    /// Applies the pAMM admission rule to a market event before passing the event to the graph and
+    /// the post-processors.
+    ///
+    /// The graph drops what the pool rule and `algorithm_exclude_protocols` drop. The
+    /// post-processors drop what the pool rule drops, so they still learn of a component only the
+    /// algorithm leaves out.
     pub async fn process_event(&mut self, event: MarketEvent) {
         let market_data = self.market_data.clone();
-        let event = {
+        let mut post_processor_event = None;
+        let graph_event = {
             let market = market_data.read().await;
-            let Self { pamm_admission, liquidity_scope, exclude_protocols, .. } = self;
-            let caller_drops = |component: &ProtocolComponent| {
+            let Self {
+                pamm_admission,
+                liquidity_scope,
+                exclude_protocols,
+                algorithm_exclude_protocols,
+                algorithm_exclusions,
+                post_processors,
+                ..
+            } = self;
+            let pool_drops = |component: &ProtocolComponent| {
                 should_drop_component(*liquidity_scope, exclude_protocols, component)
             };
+            let graph_drops = |component: &ProtocolComponent| {
+                should_drop_component(*liquidity_scope, algorithm_exclusions, component)
+            };
             let mut event = event;
-            pamm_admission.apply_pamm_admission(&market, &caller_drops, &mut event);
-            filter_event(market.base_market_state(), event, &caller_drops)
+            pamm_admission.apply_pamm_admission(&market, &graph_drops, &mut event);
+            if post_processors.is_empty() || algorithm_exclude_protocols.is_empty() {
+                // One event serves both: the graph rule is the pool rule, or nobody else reads it.
+                filter_event(market.base_market_state(), event, &graph_drops)
+            } else {
+                // The graph rule drops everything the pool rule drops, so it can filter the
+                // post-processors' event instead of the original.
+                let for_post_processors =
+                    filter_event(market.base_market_state(), event, &pool_drops);
+                let for_graph = filter_event(
+                    market.base_market_state(),
+                    for_post_processors.clone(),
+                    &graph_drops,
+                );
+                post_processor_event = Some(for_post_processors);
+                for_graph
+            }
         };
+        let post_processor_event = post_processor_event
+            .as_ref()
+            .unwrap_or(&graph_event);
 
-        match event {
+        match &graph_event {
             MarketEvent::MarketUpdated { .. } => {
                 if let Err(e) = self
                     .graph_manager
-                    .handle_event(&event)
+                    .handle_event(&graph_event)
                     .await
                 {
                     // Graph errors currently returned by handle_event are non-fatal, so we just log
@@ -483,7 +534,7 @@ where
                     warn!("Error handling market event: {:?}", e);
                 }
                 self.post_processors
-                    .handle_event(&event)
+                    .handle_event(post_processor_event)
                     .await;
             }
         }
@@ -556,7 +607,7 @@ where
             &market,
             self.pamm_admission.fallback_pools(),
             params.route_filter(),
-            &self.exclude_protocols,
+            &self.algorithm_exclusions,
         ) {
             Ok(amount) => {
                 route.set_fallback_amount_out(amount);
