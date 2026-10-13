@@ -2220,6 +2220,14 @@ impl Swap {
         self
     }
 
+    /// Sets the token pair and the split of this swap, in place. The amounts, pool, and state
+    /// remain unchanged.
+    pub(crate) fn retarget(&mut self, token_in: Address, token_out: Address, split: f64) {
+        self.token_in = token_in;
+        self.token_out = token_out;
+        self.split = split;
+    }
+
     /// Attaches the pool this pAMM leg falls back to, in place.
     pub(crate) fn set_fallback(&mut self, fallback: FallbackLeg) {
         self.fallback = Some(fallback);

@@ -2,14 +2,30 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use crate::post_process::RoutePostProcessor;
+use crate::post_process::{rfq::RfqSwapReplacer, RoutePostProcessor};
 
 /// Builds one post-processor. Called once per worker.
 type Factory = Arc<dyn Fn() -> Box<dyn RoutePostProcessor> + Send + Sync>;
 
-/// Registering a post-processor under a name that is already taken.
+/// Builds one built-in post-processor.
+type BuiltInFactory = fn() -> Box<dyn RoutePostProcessor>;
+
+/// The post-processors that ship with fynd-core, each with its name and its factory. A registry
+/// never holds them: `resolve` finds them.
+const BUILT_INS: &[(&str, BuiltInFactory)] =
+    &[(RfqSwapReplacer::NAME, || Box::<RfqSwapReplacer>::default())];
+
+/// The factory of the built-in post-processor `name`, if there is one.
+fn find_built_in(name: &str) -> Option<Factory> {
+    BUILT_INS
+        .iter()
+        .find(|(built_in_name, _)| *built_in_name == name)
+        .map(|(_, factory)| Arc::new(*factory) as Factory)
+}
+
+/// Registering a post-processor under a name that is already taken, or that a built-in uses.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
-#[error("post-processor '{name}' is already registered")]
+#[error("post-processor '{name}' is already registered or built in")]
 pub struct PostProcessorAlreadyRegistered {
     /// The name that clashes.
     pub name: String,
@@ -19,17 +35,13 @@ pub struct PostProcessorAlreadyRegistered {
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 #[error(
     "worker pool '{worker_pool}' lists unknown post-processor '{post_processor_name}'. \
-     Registered: {}",
-    if registered_post_processors.is_empty() {
-        "none".to_string()
-    } else {
-        registered_post_processors.join(", ")
-    }
+     Available: {}",
+    available_post_processors.join(", ")
 )]
 pub struct UnknownPostProcessorError {
     worker_pool: String,
     post_processor_name: String,
-    registered_post_processors: Vec<String>,
+    available_post_processors: Vec<String>,
 }
 
 impl UnknownPostProcessorError {
@@ -66,7 +78,8 @@ impl std::fmt::Debug for PostProcessorFactories {
     }
 }
 
-/// Post-processor factories, keyed by the name a pool configuration lists. Empty by default.
+/// Custom post-processor factories, keyed by the name a pool configuration lists. Empty by
+/// default. The built-in post-processors need no registration.
 #[derive(Default, Clone)]
 pub struct PostProcessorRegistry {
     by_name: HashMap<String, Factory>,
@@ -85,7 +98,8 @@ impl PostProcessorRegistry {
     ///
     /// # Errors
     ///
-    /// [`PostProcessorAlreadyRegistered`] when an earlier call took `name`.
+    /// [`PostProcessorAlreadyRegistered`] when an earlier call took `name`, or a built-in
+    /// post-processor uses it.
     pub fn with_post_processor<P, F>(
         mut self,
         name: impl Into<String>,
@@ -96,7 +110,7 @@ impl PostProcessorRegistry {
         F: Fn() -> P + Send + Sync + 'static,
     {
         let name = name.into();
-        if self.by_name.contains_key(&name) {
+        if find_built_in(&name).is_some() || self.by_name.contains_key(&name) {
             return Err(PostProcessorAlreadyRegistered { name });
         }
         self.by_name
@@ -104,7 +118,7 @@ impl PostProcessorRegistry {
         Ok(self)
     }
 
-    /// The names this registry holds, in no fixed order.
+    /// The custom names this registry holds, in no fixed order.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.by_name.keys().map(String::as_str)
     }
@@ -113,8 +127,9 @@ impl PostProcessorRegistry {
     ///
     /// # Errors
     ///
-    /// [`UnknownPostProcessorError`] for the first name that is not registered. Raised when the
-    /// solver is built, so a misspelled name fails at start and not at the first quote.
+    /// [`UnknownPostProcessorError`] for the first name that is neither built in nor registered.
+    /// Raised when the solver is built, so a misspelled name fails at start and not at the first
+    /// quote.
     pub(crate) fn resolve(
         &self,
         worker_pool: &str,
@@ -122,19 +137,25 @@ impl PostProcessorRegistry {
     ) -> Result<PostProcessorFactories, UnknownPostProcessorError> {
         let mut factories = Vec::with_capacity(names.len());
         for name in names {
-            let Some(factory) = self.by_name.get(name) else {
-                let mut registered_post_processors: Vec<String> = self
+            let Some(factory) = self
+                .by_name
+                .get(name)
+                .cloned()
+                .or_else(|| find_built_in(name))
+            else {
+                let mut available_post_processors: Vec<String> = self
                     .names()
+                    .chain(BUILT_INS.iter().map(|(name, _)| *name))
                     .map(str::to_string)
                     .collect();
-                registered_post_processors.sort();
+                available_post_processors.sort();
                 return Err(UnknownPostProcessorError {
                     worker_pool: worker_pool.to_string(),
                     post_processor_name: name.clone(),
-                    registered_post_processors,
+                    available_post_processors,
                 });
             };
-            factories.push((name.clone(), factory.clone()));
+            factories.push((name.clone(), factory));
         }
         Ok(PostProcessorFactories(factories))
     }

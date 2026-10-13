@@ -189,7 +189,8 @@ pub struct PoolConfig {
     #[serde(default)]
     exclude_protocols: Option<Vec<String>>,
     /// Names of the post-processors every worker in this pool runs, in order, on the route its
-    /// algorithm returned. Absent = none. Each name must be in the
+    /// algorithm returned. Absent = none. Each name is either built in
+    /// (`rfq_swap_replacer`) or registered in the
     /// [`PostProcessorRegistry`](crate::PostProcessorRegistry) given to the builder.
     #[serde(default)]
     post_processors: Vec<String>,
@@ -365,7 +366,7 @@ pub enum SolverBuildError {
     /// A worker pool referenced an algorithm name that is not registered.
     #[error(transparent)]
     UnknownAlgorithm(#[from] UnknownAlgorithmError),
-    /// A worker pool listed a post-processor that is not registered.
+    /// A worker pool listed a post-processor that is neither built in nor registered.
     #[error(transparent)]
     UnknownPostProcessor(#[from] UnknownPostProcessorError),
     /// No native gas token is defined for the requested chain.
@@ -791,8 +792,9 @@ impl FyndBuilder {
 
     /// Serves the post-processors a pool lists by name.
     ///
-    /// A pool lists post-processor names; this hands the builder the ones the caller registered. A
-    /// name that `post_processors` does not hold fails [`build`](Self::build) with
+    /// A pool lists post-processor names; this hands the builder the ones the caller registered.
+    /// The built-in names need no registration. A name that is neither built in nor in
+    /// `post_processors` fails [`build`](Self::build) with
     /// [`SolverBuildError::UnknownPostProcessor`].
     pub fn with_post_processors(mut self, post_processors: PostProcessorRegistry) -> Self {
         self.post_processors = post_processors;

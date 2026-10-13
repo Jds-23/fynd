@@ -6,6 +6,9 @@
 //! algorithm's route first, then runs the post-processors, then checks the processed route. The
 //! router ranks the quote after that.
 //!
+//! `rfq_swap_replacer` is built in: a pool config lists it with no registration. A registry adds
+//! only custom names.
+//!
 //! ```ignore
 //! // In the deployment's binary:
 //! let post_processors = PostProcessorRegistry::new().with_post_processor("rfq", Rfq::new)?;
@@ -20,6 +23,7 @@
 
 mod pipeline;
 pub mod registry;
+mod rfq;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
