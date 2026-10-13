@@ -128,7 +128,7 @@ impl<'a> PostProcessRequest<'a> {
     }
 
     /// The time after which the worker stops waiting for the post-processor. The worker sets it
-    /// to the deadline of the task.
+    /// a little before the deadline of the task, so it can still send the route it had in time.
     pub fn deadline(&self) -> Instant {
         self.deadline
     }

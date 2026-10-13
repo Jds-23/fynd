@@ -39,6 +39,12 @@ use crate::{
     BlockInfo, Order, OrderQuote, QuoteStatus, SingleOrderQuote, SolveError, SolveParams,
 };
 
+/// How long before the task deadline the worker stops waiting for post-processors. A worker sends
+/// one answer per task, after it validates and prices the route, and the router reads no answer
+/// after the deadline. Without this margin, a post-processor that runs to the deadline would also
+/// lose the algorithm's route.
+const POST_PROCESS_DEADLINE_MARGIN: Duration = Duration::from_millis(10);
+
 /// Whether a worker with this scope and exclusion list must keep `component` out of its graph: an
 /// exclusive component in a `PublicOnly` worker pool, or a component of an excluded protocol
 /// system.
@@ -490,7 +496,8 @@ where
 
     /// Returns a quote for an order, optionally solved against a named state overlay.
     ///
-    /// `deadline` is when the caller stops waiting. Post-processors do not run past it.
+    /// `deadline` is when the caller stops waiting. Post-processors stop
+    /// [`POST_PROCESS_DEADLINE_MARGIN`] before it.
     pub async fn quote(
         &mut self,
         order: &Order,
@@ -577,7 +584,9 @@ where
                         &self.market_data,
                         &self.derived_data,
                         &exclusions,
-                        deadline,
+                        deadline
+                            .checked_sub(POST_PROCESS_DEADLINE_MARGIN)
+                            .unwrap_or(deadline),
                     )
                     .with_label(params.state_label());
                     self.post_processors
