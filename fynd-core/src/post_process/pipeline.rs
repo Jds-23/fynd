@@ -62,7 +62,7 @@ impl PostProcessors {
         let deadline = request.deadline();
         for (post_processor_name, post_processor) in &self.instances {
             let started = Instant::now();
-            if deadline.is_some_and(|deadline| started >= deadline) {
+            if started >= deadline {
                 warn!(
                     worker_pool = %self.worker_pool,
                     post_processor = post_processor_name,
@@ -70,26 +70,17 @@ impl PostProcessors {
                 );
                 break;
             }
-            route = match deadline {
-                Some(deadline) => {
-                    let before = route.clone();
-                    let processing = post_processor.process(request, route);
-                    match tokio::time::timeout_at(deadline.into(), processing).await {
-                        Ok(processed) => processed,
-                        Err(_) => {
-                            warn!(
-                                worker_pool = %self.worker_pool,
-                                post_processor = post_processor_name,
-                                "post-processor passed the task deadline; keeping its input route"
-                            );
-                            before
-                        }
-                    }
-                }
-                None => {
-                    post_processor
-                        .process(request, route)
-                        .await
+            let before = route.clone();
+            let processing = post_processor.process(request, route);
+            route = match tokio::time::timeout_at(deadline.into(), processing).await {
+                Ok(processed) => processed,
+                Err(_) => {
+                    warn!(
+                        worker_pool = %self.worker_pool,
+                        post_processor = post_processor_name,
+                        "post-processor passed the task deadline; keeping its input route"
+                    );
+                    before
                 }
             };
             record_post_processor_duration(

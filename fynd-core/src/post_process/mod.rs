@@ -72,25 +72,25 @@ pub struct PostProcessRequest<'a> {
     label: Option<&'a StateLabel>,
     derived: &'a SharedDerivedDataRef,
     exclusions: &'a RouteExclusions,
-    deadline: Option<Instant>,
+    deadline: Instant,
 }
 
 impl<'a> PostProcessRequest<'a> {
-    /// A request with no deadline.
+    /// A request on the base market state, which the worker stops waiting for at `deadline`.
     pub fn new(
         order: &'a Order,
         market: &'a MarketData,
-        label: Option<&'a StateLabel>,
         derived: &'a SharedDerivedDataRef,
         exclusions: &'a RouteExclusions,
+        deadline: Instant,
     ) -> Self {
-        Self { order, market, label, derived, exclusions, deadline: None }
+        Self { order, market, label: None, derived, exclusions, deadline }
     }
 
-    /// Sets the time after which the worker stops waiting for the post-processor.
+    /// Sets the overlay the solve ran against. `None` is the base market state.
     #[must_use]
-    pub fn with_deadline(mut self, deadline: Instant) -> Self {
-        self.deadline = Some(deadline);
+    pub fn with_label(mut self, label: Option<&'a StateLabel>) -> Self {
+        self.label = label;
         self
     }
 
@@ -122,9 +122,9 @@ impl<'a> PostProcessRequest<'a> {
         self.exclusions
     }
 
-    /// The time after which the worker stops waiting for the post-processor, if the request has
-    /// one. The worker sets it to the deadline of the task.
-    pub fn deadline(&self) -> Option<Instant> {
+    /// The time after which the worker stops waiting for the post-processor. The worker sets it
+    /// to the deadline of the task.
+    pub fn deadline(&self) -> Instant {
         self.deadline
     }
 }

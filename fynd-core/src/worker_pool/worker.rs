@@ -575,11 +575,11 @@ where
                     let post_process_request = PostProcessRequest::new(
                         order,
                         &self.market_data,
-                        params.state_label(),
                         &self.derived_data,
                         &exclusions,
+                        deadline,
                     )
-                    .with_deadline(deadline);
+                    .with_label(params.state_label());
                     self.post_processors
                         .run(&post_process_request, result)
                         .await
