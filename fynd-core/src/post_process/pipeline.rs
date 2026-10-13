@@ -2,6 +2,8 @@
 
 use std::time::{Duration, Instant};
 
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 use tracing::warn;
 
 use crate::{
@@ -16,6 +18,30 @@ pub(crate) struct ProcessedRoute {
     pub(crate) route: RouteResult,
     /// The names of the post-processors that returned a route, in config order.
     pub(crate) post_processed_by: Vec<String>,
+}
+
+/// What happened when a post-processor ran on a route.
+#[derive(Clone, Copy)]
+enum PostProcessOutcome {
+    /// The post-processor returned a replacement route.
+    Replaced,
+    /// The post-processor returned no replacement route.
+    Kept,
+    /// The post-processor did not finish before the post-process deadline.
+    TimedOut,
+    /// The post-process deadline had passed before the post-processor could start.
+    Skipped,
+}
+
+impl PostProcessOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Replaced => "replaced",
+            Self::Kept => "kept",
+            Self::TimedOut => "timed_out",
+            Self::Skipped => "skipped",
+        }
+    }
 }
 
 /// The named post-processor instances of one worker, in config order.
@@ -62,7 +88,7 @@ impl PostProcessors {
     ///
     /// At [`PostProcessRequest::deadline`], the worker stops waiting for the post-processor that
     /// is running and keeps the route it had before that call. The post-processors after it do
-    /// not run.
+    /// not run. Each post-processor records one [`PostProcessOutcome`].
     pub(crate) async fn run(
         &self,
         request: &PostProcessRequest<'_>,
@@ -71,7 +97,7 @@ impl PostProcessors {
         let deadline = request.deadline();
         let mut latest: Option<RouteResult> = None;
         let mut post_processed_by: Vec<String> = Vec::new();
-        for (post_processor_name, post_processor) in &self.instances {
+        for (index, (post_processor_name, post_processor)) in self.instances.iter().enumerate() {
             let started = Instant::now();
             if started >= deadline {
                 warn!(
@@ -79,24 +105,40 @@ impl PostProcessors {
                     post_processor = post_processor_name,
                     "post-process deadline passed; skipping the remaining post-processors"
                 );
+                for (skipped_name, _) in &self.instances[index..] {
+                    record_post_processor_outcome(
+                        &self.worker_pool,
+                        skipped_name,
+                        PostProcessOutcome::Skipped,
+                    );
+                }
                 break;
             }
             let current = latest.as_ref().unwrap_or(route);
             let processing = post_processor.process(request, current);
-            match tokio::time::timeout_at(deadline.into(), processing).await {
+            let outcome = match tokio::time::timeout_at(deadline.into(), processing).await {
                 Ok(Some(replacement)) => {
+                    record_post_processor_gain(
+                        &self.worker_pool,
+                        post_processor_name,
+                        current,
+                        &replacement,
+                    );
                     post_processed_by.push(post_processor_name.clone());
                     latest = Some(replacement);
+                    PostProcessOutcome::Replaced
                 }
-                Ok(None) => {}
+                Ok(None) => PostProcessOutcome::Kept,
                 Err(_) => {
                     warn!(
                         worker_pool = %self.worker_pool,
                         post_processor = post_processor_name,
                         "post-processor passed the post-process deadline; keeping its input route"
                     );
+                    PostProcessOutcome::TimedOut
                 }
-            }
+            };
+            record_post_processor_outcome(&self.worker_pool, post_processor_name, outcome);
             record_post_processor_duration(
                 &self.worker_pool,
                 post_processor_name,
@@ -105,6 +147,49 @@ impl PostProcessors {
         }
         latest.map(|route| ProcessedRoute { route, post_processed_by })
     }
+}
+
+/// Counts one outcome of a post-processor on a route.
+fn record_post_processor_outcome(
+    worker_pool: &str,
+    post_processor_name: &str,
+    outcome: PostProcessOutcome,
+) {
+    metrics::counter!(
+        "worker_pool_post_processor_outcomes_total",
+        "pool" => worker_pool.to_string(),
+        "post_processor" => post_processor_name.to_string(),
+        "outcome" => outcome.label()
+    )
+    .increment(1);
+}
+
+/// Records how much `replacement` gains over `input`, in basis points of the input net amount out.
+///
+/// Records negative gains unchanged. Nothing is recorded when the input net amount out is not
+/// positive. A replacement that later fails the worker checks still counts here;
+/// `worker_pool_post_processed_route_rejected_total` counts those.
+fn record_post_processor_gain(
+    worker_pool: &str,
+    post_processor_name: &str,
+    input: &RouteResult,
+    replacement: &RouteResult,
+) {
+    let input_net = input.net_amount_out();
+    if *input_net <= BigInt::ZERO {
+        return;
+    }
+    let gain = replacement.net_amount_out() - input_net;
+    let (Some(gain), Some(input_net)) = (gain.to_f64(), input_net.to_f64()) else {
+        return;
+    };
+    let gain_bps = gain * 10_000.0 / input_net;
+    metrics::histogram!(
+        "worker_pool_post_processor_gain_bps",
+        "pool" => worker_pool.to_string(),
+        "post_processor" => post_processor_name.to_string()
+    )
+    .record(gain_bps);
 }
 
 /// Records the wall time of one post-processor run on a route.
