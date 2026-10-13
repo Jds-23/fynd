@@ -603,3 +603,696 @@ fn find_reachable(swaps: &[Swap], start: &Address, direction: Direction) -> FxHa
     reached
 }
 
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use rstest::rstest;
+    use tycho_simulation::tycho_common::{
+        models::protocol::ProtocolComponent, simulation::protocol_sim::ProtocolSim,
+    };
+
+    use super::*;
+    use crate::{
+        algorithm::test_utils::{
+            component, component_with_protocol, order, setup_market_weighted, token,
+            MockProtocolSim,
+        },
+        derived::DerivedData,
+        types::{Order, OrderSide, RouteExclusions},
+    };
+
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    fn tokens() -> (Token, Token, Token) {
+        (token(0x0A, "A"), token(0x0B, "B"), token(0x0C, "C"))
+    }
+
+    fn market() -> MarketData {
+        setup_market_weighted(Vec::new()).0
+    }
+
+    async fn add_component(
+        market: &MarketData,
+        id: &str,
+        protocol: &str,
+        component_tokens: &[&Token],
+        sim: MockProtocolSim,
+    ) {
+        let component_tokens: Vec<Token> = component_tokens
+            .iter()
+            .map(|token| (*token).clone())
+            .collect();
+        let mut state = market.write().await;
+        state.upsert_components(std::iter::once(component_with_protocol(
+            id,
+            protocol,
+            &component_tokens,
+        )));
+        state.update_states([(id.to_string(), Box::new(sim) as Box<dyn ProtocolSim>)]);
+        state.upsert_tokens(component_tokens);
+    }
+
+    async fn add_rfq(
+        market: &MarketData,
+        id: &str,
+        component_tokens: &[&Token],
+        sim: MockProtocolSim,
+    ) {
+        add_component(market, id, "rfq:bebop", component_tokens, sim).await;
+    }
+
+    async fn replacer(market: &MarketData) -> RfqSwapReplacer {
+        let mut replacer = RfqSwapReplacer::default();
+        replacer.initialize(market).await;
+        replacer
+    }
+
+    /// A swap as returned by the algorithm, with gas priced at one output-token unit per gas unit.
+    fn swap(id: &str, pair: (&Token, &Token), amounts: (u64, u64), split: f64, price: f64) -> Swap {
+        Swap::new(
+            id.to_string(),
+            "uniswap_v2".to_string(),
+            pair.0.address.clone(),
+            pair.1.address.clone(),
+            BigUint::from(amounts.0),
+            BigUint::from(amounts.1),
+            BigUint::from(10u64),
+            component(id, &[pair.0.clone(), pair.1.clone()]),
+            Box::new(MockProtocolSim::new(price).with_gas(10)),
+        )
+        .with_split(split)
+    }
+
+    fn result(swaps: Vec<Swap>, all_tokens: &[&Token]) -> RouteResult {
+        let gas: u64 = swaps.len() as u64 * 10;
+        let output = swaps
+            .last()
+            .expect("the test route has swaps")
+            .token_out()
+            .clone();
+        let route = Route::new(
+            swaps,
+            all_tokens
+                .iter()
+                .map(|token| (token.address.clone(), (*token).clone())),
+        )
+        .expect("the test swaps form a route");
+        let amount_out = BigInt::from(route.amount_out(&output));
+        RouteResult::new(route, amount_out - gas, BigUint::from(1u64))
+    }
+
+    fn sequential_route() -> RouteResult {
+        let (a, b, c) = tokens();
+        result(
+            vec![
+                swap("ab", (&a, &b), (1000, 2000), 0.0, 2.0),
+                swap("bc", (&b, &c), (2000, 4000), 0.0, 2.0),
+            ],
+            &[&a, &b, &c],
+        )
+    }
+
+    fn sell_order(from: &Token, to: &Token) -> Order {
+        order(from, to, 1000, OrderSide::Sell)
+    }
+
+    async fn run(
+        replacer: &RfqSwapReplacer,
+        market: &MarketData,
+        order: &Order,
+        exclusions: &RouteExclusions,
+        route: RouteResult,
+    ) -> Option<RouteResult> {
+        let derived = DerivedData::new_shared();
+        let request = PostProcessRequest::new(order, market, &derived, exclusions, far_deadline());
+        replacer.process(&request, &route).await
+    }
+
+    fn replaced(out: Option<RouteResult>) -> RouteResult {
+        out.expect("the replacer replaces the route")
+    }
+
+    /// The component ids of the replacement, or none when the replacer keeps the route.
+    fn replaced_ids(out: &Option<RouteResult>) -> Vec<&str> {
+        out.as_ref()
+            .map(component_ids)
+            .unwrap_or_default()
+    }
+
+    fn component_ids(result: &RouteResult) -> Vec<&str> {
+        result
+            .route()
+            .swaps()
+            .iter()
+            .map(Swap::component_id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_rfq_hop_with_downstream_swaps() {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(3.0).with_gas(10)).await;
+        let replacer = replacer(&market).await;
+
+        let out = replaced(
+            run(
+                &replacer,
+                &market,
+                &sell_order(&a, &c),
+                &RouteExclusions::default(),
+                sequential_route(),
+            )
+            .await,
+        );
+
+        assert_eq!(component_ids(&out), ["rfq_ab", "bc"]);
+        let swaps = out.route().swaps();
+        assert_eq!(swaps[0].amount_out(), &BigUint::from(3000u64));
+        assert_eq!(swaps[1].amount_in(), &BigUint::from(3000u64));
+        assert_eq!(swaps[1].amount_out(), &BigUint::from(6000u64));
+        assert_eq!(out.net_amount_out(), &BigInt::from(5980));
+    }
+
+    #[tokio::test]
+    async fn test_rfq_lower_amount_out() {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(1.5).with_gas(10)).await;
+        let replacer = replacer(&market).await;
+
+        let out = run(
+            &replacer,
+            &market,
+            &sell_order(&a, &c),
+            &RouteExclusions::default(),
+            sequential_route(),
+        )
+        .await;
+
+        assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_rfq_for_whole_order() {
+        let (a, _, c) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_ac", &[&a, &c], MockProtocolSim::new(5.0).with_gas(5)).await;
+        let replacer = replacer(&market).await;
+
+        let out = replaced(
+            run(
+                &replacer,
+                &market,
+                &sell_order(&a, &c),
+                &RouteExclusions::default(),
+                sequential_route(),
+            )
+            .await,
+        );
+
+        assert_eq!(component_ids(&out), ["rfq_ac"]);
+        assert_eq!(out.route().swaps()[0].amount_out(), &BigUint::from(5000u64));
+        assert_eq!(out.net_amount_out(), &BigInt::from(4995));
+    }
+
+    fn split_route() -> RouteResult {
+        let (a, b, _) = tokens();
+        result(
+            vec![
+                swap("p1", (&a, &b), (600, 1200), 0.6, 2.0),
+                swap("p2", (&a, &b), (400, 800), 0.0, 2.0),
+            ],
+            &[&a, &b],
+        )
+    }
+
+    #[tokio::test]
+    async fn test_rfq_for_parallel_swaps() {
+        let (a, b, _) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(3.0).with_gas(10)).await;
+        let replacer = replacer(&market).await;
+
+        let out = replaced(
+            run(
+                &replacer,
+                &market,
+                &sell_order(&a, &b),
+                &RouteExclusions::default(),
+                split_route(),
+            )
+            .await,
+        );
+
+        assert_eq!(component_ids(&out), ["rfq_ab"]);
+        assert_eq!(out.route().swaps()[0].amount_in(), &BigUint::from(1000u64));
+        assert_eq!(out.net_amount_out(), &BigInt::from(2990));
+    }
+
+    #[tokio::test]
+    async fn test_rfq_for_one_leg_with_split() {
+        let (a, b, _) = tokens();
+        let market = market();
+        let limited = MockProtocolSim::new(3.0)
+            .with_gas(10)
+            .with_liquidity(1800);
+        add_rfq(&market, "rfq_ab", &[&a, &b], limited).await;
+        let replacer = replacer(&market).await;
+
+        let out = replaced(
+            run(
+                &replacer,
+                &market,
+                &sell_order(&a, &b),
+                &RouteExclusions::default(),
+                split_route(),
+            )
+            .await,
+        );
+
+        assert_eq!(component_ids(&out), ["rfq_ab", "p2"]);
+        let swaps = out.route().swaps();
+        assert_eq!(*swaps[0].split(), 0.6);
+        assert_eq!(swaps[0].amount_out(), &BigUint::from(1800u64));
+        assert_eq!(swaps[1].amount_out(), &BigUint::from(800u64));
+        assert_eq!(out.net_amount_out(), &BigInt::from(2580));
+    }
+
+    #[tokio::test]
+    async fn test_rfq_excluded_component() {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(3.0).with_gas(10)).await;
+        let replacer = replacer(&market).await;
+        let exclusions = RouteExclusions::default().with_pools(["rfq_ab".to_string()]);
+
+        let out =
+            run(&replacer, &market, &sell_order(&a, &c), &exclusions, sequential_route()).await;
+
+        assert!(out.is_none());
+    }
+
+    fn added(id: &str, pair: &[&Token]) -> MarketEvent {
+        MarketEvent::MarketUpdated {
+            added_components: [(
+                id.to_string(),
+                pair.iter()
+                    .map(|token| token.address.clone())
+                    .collect(),
+            )]
+            .into_iter()
+            .collect(),
+            removed_components: Vec::new(),
+            updated_components: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rfq_component_added_after_initialize() {
+        let (a, b, c) = tokens();
+        let market = market();
+        let mut replacer = replacer(&market).await;
+        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(3.0).with_gas(10)).await;
+
+        replacer
+            .handle_event(&added("rfq_ab", &[&a, &b]))
+            .await
+            .expect("adding an RFQ component");
+
+        let out = replaced(
+            run(
+                &replacer,
+                &market,
+                &sell_order(&a, &c),
+                &RouteExclusions::default(),
+                sequential_route(),
+            )
+            .await,
+        );
+        assert_eq!(component_ids(&out), ["rfq_ab", "bc"]);
+    }
+
+    #[tokio::test]
+    async fn test_rfq_component_removed_after_initialize() {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(3.0).with_gas(10)).await;
+        let mut replacer = replacer(&market).await;
+        let removed = MarketEvent::MarketUpdated {
+            added_components: FxHashMap::default(),
+            removed_components: vec!["rfq_ab".to_string()],
+            updated_components: Vec::new(),
+        };
+
+        replacer
+            .handle_event(&removed)
+            .await
+            .expect("removing an RFQ component");
+
+        let out = run(
+            &replacer,
+            &market,
+            &sell_order(&a, &c),
+            &RouteExclusions::default(),
+            sequential_route(),
+        )
+        .await;
+        assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_non_rfq_component_added_after_initialize() {
+        let (a, b, c) = tokens();
+        let market = market();
+        let mut replacer = replacer(&market).await;
+        add_component(
+            &market,
+            "v2_ab",
+            "uniswap_v2",
+            &[&a, &b],
+            MockProtocolSim::new(3.0).with_gas(10),
+        )
+        .await;
+
+        replacer
+            .handle_event(&added("v2_ab", &[&a, &b]))
+            .await
+            .expect("adding a non-RFQ component");
+
+        let out = run(
+            &replacer,
+            &market,
+            &sell_order(&a, &c),
+            &RouteExclusions::default(),
+            sequential_route(),
+        )
+        .await;
+        assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_event_before_initialize() {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(3.0).with_gas(10)).await;
+        let mut replacer = RfqSwapReplacer::default();
+
+        replacer
+            .handle_event(&added("rfq_ab", &[&a, &b]))
+            .await
+            .expect("an event before initialize");
+
+        let out = run(
+            &replacer,
+            &market,
+            &sell_order(&a, &c),
+            &RouteExclusions::default(),
+            sequential_route(),
+        )
+        .await;
+        assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_route_with_exclusive_leg() {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(3.0).with_gas(10)).await;
+        let replacer = replacer(&market).await;
+        let mut route = sequential_route()
+            .route()
+            .clone()
+            .into_swaps();
+        route[0].set_committed_amount_out(BigUint::from(1u64));
+        let route = result(route, &[&a, &b, &c]);
+
+        let out =
+            run(&replacer, &market, &sell_order(&a, &c), &RouteExclusions::default(), route).await;
+
+        assert!(out.is_none());
+    }
+
+    #[rstest]
+    #[case::cheap_gas(50, Some(2450))]
+    #[case::costly_gas(600, None)]
+    #[tokio::test]
+    async fn test_rfq_gas_cost(#[case] rfq_gas: u64, #[case] expected_net: Option<i64>) {
+        let (a, b, _) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(2.5).with_gas(rfq_gas)).await;
+        let replacer = replacer(&market).await;
+        let route = result(vec![swap("ab", (&a, &b), (1000, 2000), 0.0, 2.0)], &[&a, &b]);
+
+        let out =
+            run(&replacer, &market, &sell_order(&a, &b), &RouteExclusions::default(), route).await;
+
+        match expected_net {
+            Some(net) => {
+                let out = replaced(out);
+                assert_eq!(component_ids(&out), ["rfq_ab"]);
+                assert_eq!(out.net_amount_out(), &BigInt::from(net));
+            }
+            None => assert!(out.is_none()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rfq_for_two_hops() {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(3.0).with_gas(10)).await;
+        add_rfq(&market, "rfq_bc", &[&b, &c], MockProtocolSim::new(3.0).with_gas(10)).await;
+        let replacer = replacer(&market).await;
+
+        let out = replaced(
+            run(
+                &replacer,
+                &market,
+                &sell_order(&a, &c),
+                &RouteExclusions::default(),
+                sequential_route(),
+            )
+            .await,
+        );
+
+        assert_eq!(component_ids(&out), ["rfq_ab", "rfq_bc"]);
+        let swaps = out.route().swaps();
+        assert_eq!(swaps[0].amount_out(), &BigUint::from(3000u64));
+        assert_eq!(swaps[1].amount_in(), &BigUint::from(3000u64));
+        assert_eq!(swaps[1].amount_out(), &BigUint::from(9000u64));
+        assert_eq!(out.net_amount_out(), &BigInt::from(8980));
+    }
+
+    #[tokio::test]
+    async fn test_rfq_component_covering_two_legs() {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_abc", &[&a, &b, &c], MockProtocolSim::new(3.0).with_gas(10)).await;
+        let replacer = replacer(&market).await;
+
+        let out = replaced(
+            run(
+                &replacer,
+                &market,
+                &sell_order(&a, &c),
+                &RouteExclusions::default(),
+                sequential_route(),
+            )
+            .await,
+        );
+
+        assert_eq!(component_ids(&out), ["rfq_abc", "bc"]);
+    }
+
+    #[tokio::test]
+    async fn test_rfq_deadline_in_the_past() {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(3.0).with_gas(10)).await;
+        let replacer = replacer(&market).await;
+        let derived = DerivedData::new_shared();
+        let order = sell_order(&a, &c);
+        let exclusions = RouteExclusions::default();
+        let request =
+            PostProcessRequest::new(&order, &market, &derived, &exclusions, Instant::now());
+
+        let out = replacer
+            .process(&request, &sequential_route())
+            .await;
+
+        assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_rfq_unknown_state_label() {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(3.0).with_gas(10)).await;
+        let replacer = replacer(&market).await;
+        let derived = DerivedData::new_shared();
+        let order = sell_order(&a, &c);
+        let exclusions = RouteExclusions::default();
+        let label = "missing".to_string();
+        let request =
+            PostProcessRequest::new(&order, &market, &derived, &exclusions, far_deadline())
+                .with_label(Some(&label));
+
+        let out = replacer
+            .process(&request, &sequential_route())
+            .await;
+
+        assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_route_without_gas() {
+        let (a, b, _) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(3.0).with_gas(10)).await;
+        let replacer = replacer(&market).await;
+        let free = Swap::new(
+            "ab".to_string(),
+            "uniswap_v2".to_string(),
+            a.address.clone(),
+            b.address.clone(),
+            BigUint::from(1000u64),
+            BigUint::from(2000u64),
+            BigUint::ZERO,
+            component("ab", &[a.clone(), b.clone()]),
+            Box::new(MockProtocolSim::new(2.0)),
+        );
+        let route = Route::new(vec![free], [(a.address.clone(), a.clone())]).expect("one swap");
+        let route = RouteResult::new(route, BigInt::from(2000), BigUint::from(1u64));
+
+        let out =
+            run(&replacer, &market, &sell_order(&a, &b), &RouteExclusions::default(), route).await;
+
+        assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_rfq_two_components_same_pair() {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_1", &[&a, &b], MockProtocolSim::new(3.0).with_gas(10)).await;
+        add_rfq(&market, "rfq_2", &[&a, &b], MockProtocolSim::new(2.5).with_gas(10)).await;
+        let replacer = replacer(&market).await;
+
+        let out = replaced(
+            run(
+                &replacer,
+                &market,
+                &sell_order(&a, &c),
+                &RouteExclusions::default(),
+                sequential_route(),
+            )
+            .await,
+        );
+
+        assert_eq!(component_ids(&out), ["rfq_1", "bc"]);
+    }
+
+    #[tokio::test]
+    async fn test_rfq_component_dropped_by_pool() {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(3.0).with_gas(10)).await;
+        let replacer = replacer(&market).await;
+        let derived = DerivedData::new_shared();
+        let order = sell_order(&a, &c);
+        let exclusions = RouteExclusions::default();
+        let drops = |component: &ProtocolComponent| component.id == "rfq_ab";
+        let request =
+            PostProcessRequest::new(&order, &market, &derived, &exclusions, far_deadline())
+                .with_pool_drops(&drops);
+
+        let out = replacer
+            .process(&request, &sequential_route())
+            .await;
+
+        assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_rfq_stale_original_route() {
+        let (a, b, _) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(2.0).with_gas(10)).await;
+        let replacer = replacer(&market).await;
+        let stale = result(vec![swap("ab", (&a, &b), (1000, 1500), 0.0, 2.0)], &[&a, &b]);
+
+        let out =
+            run(&replacer, &market, &sell_order(&a, &b), &RouteExclusions::default(), stale).await;
+
+        assert!(out.is_none());
+    }
+
+    /// The original route claims a net above what a new simulation gives, so a replacement that
+    /// beats the simulation can still pay less than the original route.
+    #[tokio::test]
+    async fn test_rfq_below_original_net() {
+        let (a, b, _) = tokens();
+        let market = market();
+        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(2.2).with_gas(10)).await;
+        let replacer = replacer(&market).await;
+        let optimistic = result(vec![swap("ab", (&a, &b), (1000, 2500), 0.0, 2.0)], &[&a, &b]);
+
+        let out =
+            run(&replacer, &market, &sell_order(&a, &b), &RouteExclusions::default(), optimistic)
+                .await;
+
+        assert!(out.is_none());
+    }
+
+    fn legs(spec: &[(char, char)]) -> Vec<Swap> {
+        let mut swaps = Vec::new();
+        for (position, (from, to)) in spec.iter().enumerate() {
+            swaps.push(swap(
+                &format!("s{position}"),
+                (&letter(*from), &letter(*to)),
+                (1, 1),
+                0.0,
+                1.0,
+            ));
+        }
+        swaps
+    }
+
+    fn letter(letter: char) -> Token {
+        token(letter as u8 - b'A' + 0x0A, &letter.to_string())
+    }
+
+    #[rstest]
+    #[case::sequential(&[('A', 'B'), ('B', 'C'), ('C', 'D')], "ABCD", &[&[0, 1][..], &[0, 1, 2], &[1, 2]])]
+    #[case::split_and_merge(
+        &[('A', 'B'), ('A', 'C'), ('B', 'D'), ('C', 'D')],
+        "AD",
+        &[&[0, 1, 2, 3][..]]
+    )]
+    #[case::split_before_hop(&[('A', 'B'), ('A', 'B'), ('B', 'C')], "ABC", &[&[0, 1][..], &[0, 1, 2]])]
+    fn test_cut_tokens_and_segments(
+        #[case] spec: &[(char, char)],
+        #[case] expected_cuts: &str,
+        #[case] expected_replaced: &[&[usize]],
+    ) {
+        let swaps = legs(spec);
+
+        let cuts = find_cut_tokens(&swaps);
+        let targets = build_segment_targets(&swaps);
+
+        let expected: Vec<Address> = expected_cuts
+            .chars()
+            .map(|c| letter(c).address)
+            .collect();
+        assert_eq!(cuts, expected);
+        let replaced: Vec<&[usize]> = targets
+            .iter()
+            .map(|target| target.replaced.as_slice())
+            .collect();
+        assert_eq!(replaced, expected_replaced);
+    }
+}
