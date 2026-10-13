@@ -1184,6 +1184,38 @@ mod tests {
         assert!(out.is_none());
     }
 
+    /// Only a protocol that fills partially replaces a swap after the sell token.
+    #[rstest]
+    #[case::partial_fill_after_sell_token("rfq:bebop", false, &["ab", "rfq"])]
+    #[case::partial_fill_via_fallback_router("fallback:rfq:bebop", false, &["ab", "rfq"])]
+    #[case::exact_fill_after_sell_token("rfq:hashflow", false, &[])]
+    #[case::exact_fill_via_fallback_router("fallback:rfq:hashflow", false, &[])]
+    #[case::exact_fill_at_sell_token("rfq:hashflow", true, &["rfq", "bc"])]
+    #[tokio::test]
+    async fn test_rfq_partial_fill(
+        #[case] protocol: &str,
+        #[case] at_sell_token: bool,
+        #[case] expected: &[&str],
+    ) {
+        let (a, b, c) = tokens();
+        let pair = if at_sell_token { [&a, &b] } else { [&b, &c] };
+        let market = market();
+        add_component(&market, "rfq", protocol, &pair, MockProtocolSim::new(3.0).with_gas(10))
+            .await;
+        let replacer = replacer(&market).await;
+
+        let out = run(
+            &replacer,
+            &market,
+            &sell_order(&a, &c),
+            &RouteExclusions::default(),
+            sequential_route(),
+        )
+        .await;
+
+        assert_eq!(replaced_ids(&out), expected);
+    }
+
     #[tokio::test]
     async fn test_rfq_two_components_same_pair() {
         let (a, b, c) = tokens();
