@@ -3058,4 +3058,28 @@ mod tests {
 
         assert_eq!(rejected_route_count(&snapshotter), 1);
     }
+
+    #[tokio::test]
+    async fn test_quote_post_processor_pool_drops() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let recording = MockPostProcessor::with_request(move |request, result| {
+            let rfq = direct_swap("rfq:bebop", 120);
+            let plain = direct_swap("uniswap_v2", 120);
+            recorder.lock().unwrap().extend([
+                request.drops_component(rfq.protocol_component()),
+                request.drops_component(plain.protocol_component()),
+            ]);
+            result
+        });
+        let mut worker =
+            worker_with_post_processor(recording).with_exclude_protocols(vec!["rfq:".to_string()]);
+
+        worker
+            .quote(&a_to_b_order(), SolveParams::default(), far_deadline())
+            .await
+            .expect("the route is valid");
+
+        assert_eq!(*seen.lock().unwrap(), [true, false]);
+    }
 }
