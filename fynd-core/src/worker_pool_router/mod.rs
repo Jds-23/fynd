@@ -4482,4 +4482,56 @@ mod tests {
 
         assert!(capture_winning_protocols(&quote).is_empty());
     }
+
+    /// The post-processor label reaches the win counter and whichever volume metric the quote
+    /// prices into.
+    #[rstest]
+    #[case::none(&[], false, "post_processed_by=none")]
+    #[case::two(&["a", "b"], false, "post_processed_by=a+b")]
+    #[case::two_priced(&["a", "b"], true, "post_processed_by=a+b")]
+    fn test_record_win_post_processed_by_label(
+        #[case] names: &[&str],
+        #[case] priced: bool,
+        #[case] expected: &str,
+    ) {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let mut quote = success_quote(1_000);
+        if priced {
+            quote = quote.with_gas_price(BigUint::from(1u64));
+        }
+        quote.set_worker_pool("pool".to_string());
+        quote.set_post_processed_by(
+            names
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        );
+
+        record_win(&quote);
+
+        let recorded = crate::tests::metrics::recorded_metrics(&snapshotter);
+        let labels_of = |metric: &str| -> Vec<Vec<String>> {
+            recorded
+                .iter()
+                .filter(|(name, _, _)| name == metric)
+                .map(|(_, labels, _)| {
+                    let mut labels = labels.clone();
+                    labels.sort();
+                    labels
+                })
+                .collect()
+        };
+        let (volume_metric, absent_metric) = if priced {
+            ("worker_router_won_volume_gas_token", "worker_router_unpriced_won_quotes_total")
+        } else {
+            ("worker_router_unpriced_won_quotes_total", "worker_router_won_volume_gas_token")
+        };
+        let expected_labels =
+            vec![vec!["algorithm=algo".to_string(), "pool=pool".to_string(), expected.to_string()]];
+        assert_eq!(labels_of("worker_router_best_quote_pool"), expected_labels);
+        assert_eq!(labels_of(volume_metric), expected_labels);
+        assert!(labels_of(absent_metric).is_empty());
+    }
 }

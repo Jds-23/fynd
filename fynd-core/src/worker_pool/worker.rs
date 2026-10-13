@@ -2855,6 +2855,7 @@ mod tests {
         );
         assert_eq!(quote.order().amount_out(), &BigUint::from(120u64));
         assert_eq!(quote.order().amount_out_net_gas(), &BigUint::from(118u64));
+        assert_eq!(quote.order().post_processed_by(), ["rfq".to_string()]);
     }
 
     #[tokio::test]
@@ -2970,6 +2971,10 @@ mod tests {
             .collect();
         assert_eq!(components, ["p1", "p2"]);
         assert_eq!(quote.order().amount_out_net_gas(), &BigUint::from(192u64));
+        assert!(quote
+            .order()
+            .post_processed_by()
+            .is_empty());
     }
 
     /// The value of `worker_pool_post_processed_route_rejected_total` for the test pool.
@@ -3015,6 +3020,10 @@ mod tests {
             .map(|swap| swap.component_id())
             .collect();
         assert_eq!(components, ["p1", "p2"]);
+        assert!(quote
+            .order()
+            .post_processed_by()
+            .is_empty());
         assert_eq!(rejected_route_count(&snapshotter), 1);
     }
 
@@ -3043,6 +3052,7 @@ mod tests {
             .expect("the quote has a route");
         assert_eq!(route.swaps()[0].component_id(), "rfq-leg");
         assert!(route.fallback_amount_out().is_some());
+        assert_eq!(quote.order().post_processed_by(), ["rfq".to_string()]);
     }
 
     #[tokio::test]
