@@ -1,4 +1,16 @@
 
+## [0.112.1](https://github.com/propeller-heads/fynd/compare/0.112.0...0.112.1) (2026-10-13)
+
+### Features
+
+* **deps:** build against tycho 0.451.0 ([2237a86](https://github.com/propeller-heads/fynd/commit/2237a8685c5d8b1e6879fea4c3deb3cc22d37fa9))
+* **core:** send the order sender to Bebop as the origin ([8c60af3](https://github.com/propeller-heads/fynd/commit/8c60af339aa6216eb9422e7efe71a0b5324d2250))
+
+### Bug Fixes
+
+* Cargo audit package bump ([8624094](https://github.com/propeller-heads/fynd/commit/862409400b585d7c2b45409cd112db0328375e91))
+
+
 ## [0.112.0](https://github.com/propeller-heads/fynd/compare/0.111.1...0.112.0) (2026-10-08)
 
 ### Bug Fixes
