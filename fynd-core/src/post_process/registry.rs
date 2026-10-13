@@ -178,9 +178,9 @@ mod tests {
         async fn process(
             &self,
             _request: &PostProcessRequest<'_>,
-            route: RouteResult,
-        ) -> RouteResult {
-            route
+            _route: &RouteResult,
+        ) -> Option<RouteResult> {
+            None
         }
     }
 

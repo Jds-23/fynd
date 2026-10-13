@@ -208,6 +208,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_run_none_keeps_previous_route() {
+        let set = MockPostProcessor::new(|route| with_net_amount_out(route, 100));
+        let post_processors =
+            build_post_processors(vec![("set", set), ("keep", MockPostProcessor::unchanged())]);
+        let fixture = Fixture::new();
+
+        let route = post_processors
+            .run(&fixture.request(), route_result(7))
+            .await;
+
+        assert_eq!(route.net_amount_out(), &BigInt::from(100));
+    }
+
+    #[tokio::test]
     async fn test_run_slow_post_processor_keeps_previous_route() {
         let slow = MockPostProcessor::new(|route| with_net_amount_out(route, 1000))
             .with_delay(Duration::from_secs(30));

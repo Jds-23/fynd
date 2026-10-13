@@ -22,10 +22,11 @@ use crate::{
     types::{Route, RouteResult, Swap},
 };
 
-type Rewrite = Box<dyn Fn(&PostProcessRequest<'_>, RouteResult) -> RouteResult + Send + Sync>;
+type Rewrite =
+    Box<dyn Fn(&PostProcessRequest<'_>, RouteResult) -> Option<RouteResult> + Send + Sync>;
 
-/// A post-processor that applies `rewrite` after `delay`. It counts the calls it receives and can
-/// fail every market event.
+/// A post-processor that applies `rewrite` to a copy of the route after `delay`. It counts the
+/// calls it receives and can fail every market event.
 pub(crate) struct MockPostProcessor {
     rewrite: Rewrite,
     delay: Duration,
@@ -45,17 +46,22 @@ impl MockPostProcessor {
     pub(crate) fn with_request(
         rewrite: impl Fn(&PostProcessRequest<'_>, RouteResult) -> RouteResult + Send + Sync + 'static,
     ) -> Self {
+        Self::with_rewrite(Box::new(move |request, route| Some(rewrite(request, route))))
+    }
+
+    /// A post-processor that keeps every route.
+    pub(crate) fn unchanged() -> Self {
+        Self::with_rewrite(Box::new(|_, _| None))
+    }
+
+    fn with_rewrite(rewrite: Rewrite) -> Self {
         Self {
-            rewrite: Box::new(rewrite),
+            rewrite,
             delay: Duration::ZERO,
             fail_events: false,
             initialize_calls: Arc::default(),
             event_count: Arc::default(),
         }
-    }
-
-    pub(crate) fn unchanged() -> Self {
-        Self::new(|route| route)
     }
 
     pub(crate) fn with_delay(mut self, delay: Duration) -> Self {
@@ -88,9 +94,13 @@ impl RoutePostProcessor for MockPostProcessor {
             .fetch_add(1, Ordering::SeqCst);
     }
 
-    async fn process(&self, request: &PostProcessRequest<'_>, route: RouteResult) -> RouteResult {
+    async fn process(
+        &self,
+        request: &PostProcessRequest<'_>,
+        route: &RouteResult,
+    ) -> Option<RouteResult> {
         tokio::time::sleep(self.delay).await;
-        (self.rewrite)(request, route)
+        (self.rewrite)(request, route.clone())
     }
 }
 
