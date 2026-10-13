@@ -13,7 +13,7 @@ use crate::{
     feed::{
         events::{EventError, MarketEvent, MarketEventHandler},
         market_data::{MarketData, MarketDataView},
-        protocol_registry::is_rfq_protocol,
+        protocol_registry::{is_rfq_protocol, strip_fallback_prefix},
     },
     post_process::{PostProcessRequest, RoutePostProcessor},
     replay::{simulate_swaps, ReplayError, SimulatedRoute, SimulationEnds},
@@ -25,7 +25,8 @@ use crate::{
 /// It replaces one swap, or all swaps of a segment: the run of swaps between two tokens that every
 /// path of the order passes through. It keeps a replacement only when the net amount out rises.
 /// Only sell orders without an exclusive leg change. It uses only RFQ components that the request
-/// does not exclude and the pool does not drop. The server must index `rfq:` or `fallback:rfq:`
+/// does not exclude and the pool does not drop. An RFQ protocol that cannot fill partially replaces
+/// only swaps that start at the sell token. The server must index `rfq:` or `fallback:rfq:`
 /// protocols for the replacer to find components.
 #[derive(Default)]
 pub(crate) struct RfqSwapReplacer {
@@ -107,6 +108,17 @@ impl RoutePostProcessor for RfqSwapReplacer {
         };
         Search::new(snapshot, request, route).and_then(Search::run)
     }
+}
+
+/// RFQ protocols whose signed quotes support input amounts smaller than the quoted amount. The
+/// replacer uses other RFQ protocols only for swaps starting at the sell token, where the input
+/// amount matches the quoted amount exactly.
+const PARTIAL_FILL_PROTOCOLS: &[&str] = &["rfq:bebop"];
+
+/// True when `protocol_system` is in [`PARTIAL_FILL_PROTOCOLS`], through its own executor or its
+/// fallback router.
+fn fills_partially(protocol_system: &str) -> bool {
+    PARTIAL_FILL_PROTOCOLS.contains(&strip_fallback_prefix(protocol_system))
 }
 
 /// The RFQ components of the market, by token.
@@ -367,7 +379,7 @@ impl<'a> Search<'a> {
         let mut best_net = current_net.clone();
         for target in build_targets(swaps) {
             for position in 0..self.rfq.len() {
-                if !fits(&self.rfq[position], &target, swaps) {
+                if !fits(&self.rfq[position], &target, swaps, &self.input_token) {
                     continue;
                 }
                 if self.deadline_passed() {
@@ -461,9 +473,11 @@ impl<'a> Search<'a> {
 }
 
 /// Whether the RFQ swap `leg` holds both tokens of `target` and `swaps` do not use its component.
-fn fits(leg: &Swap, target: &Target, swaps: &[Swap]) -> bool {
+/// A leg whose protocol cannot fill partially fits only a target that starts at `sell_token`.
+fn fits(leg: &Swap, target: &Target, swaps: &[Swap], sell_token: &Address) -> bool {
     let tokens = &leg.protocol_component().tokens;
-    tokens.contains(&target.token_in) &&
+    (fills_partially(leg.protocol()) || target.token_in == *sell_token) &&
+        tokens.contains(&target.token_in) &&
         tokens.contains(&target.token_out) &&
         !swaps
             .iter()
