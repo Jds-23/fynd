@@ -187,7 +187,7 @@ Each worker:
 2. Runs a prioritized `select!` loop: shutdown > market events > derived events > solve tasks
 3. Maintains a `ReadinessTracker` for derived data requirements
 4. Calls the algorithm's `find_best_route` with a `SolveRequest`: the local graph, the shared market data, the order, and the pools and tokens the request excluded
-5. Runs the pool's post-processors, in config order, on the route `find_best_route` returned, before it validates the route. Market events also go to each post-processor
+5. Validates the route `find_best_route` returned, then runs the pool's post-processors on it, in config order. If the processed route fails the checks, the worker logs a warning and keeps the algorithm's route. Market events also go to each post-processor
 
 ***
 
