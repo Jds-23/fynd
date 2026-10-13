@@ -3,7 +3,7 @@
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -33,6 +33,8 @@ pub(crate) struct MockPostProcessor {
     fail_events: bool,
     pub(crate) initialize_calls: Arc<AtomicUsize>,
     pub(crate) event_count: Arc<AtomicUsize>,
+    /// IDs of components added by market events received by this mock.
+    pub(crate) added_component_ids: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockPostProcessor {
@@ -61,6 +63,7 @@ impl MockPostProcessor {
             fail_events: false,
             initialize_calls: Arc::default(),
             event_count: Arc::default(),
+            added_component_ids: Arc::default(),
         }
     }
 
@@ -77,7 +80,12 @@ impl MockPostProcessor {
 
 #[async_trait]
 impl MarketEventHandler for MockPostProcessor {
-    async fn handle_event(&mut self, _event: &MarketEvent) -> Result<(), EventError> {
+    async fn handle_event(&mut self, event: &MarketEvent) -> Result<(), EventError> {
+        let MarketEvent::MarketUpdated { added_components, .. } = event;
+        self.added_component_ids
+            .lock()
+            .expect("the test holds no other lock")
+            .extend(added_components.keys().cloned());
         self.event_count
             .fetch_add(1, Ordering::SeqCst);
         if self.fail_events {

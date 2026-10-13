@@ -1218,7 +1218,7 @@ fn solve_error_from_algorithm_error(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::atomic::Ordering, time::Duration};
 
     use rstest::rstest;
     use rustc_hash::FxHashMap;
@@ -1832,6 +1832,34 @@ mod tests {
         );
     }
 
+    /// The algorithm's fallback pricing leaves out `algorithm_exclude_protocols`, as it does the
+    /// pool's `exclude_protocols`. The control is the test below, where the pool prices.
+    #[tokio::test]
+    async fn test_quote_pamm_route_with_algorithm_excluded_fallback() {
+        let mut worker = SolverWorker::new(
+            market_with_unpriceable_fallback_pool(),
+            DerivedData::new_shared(),
+            PropAMMRouteAlgorithm,
+            0,
+            "test_pool".to_string(),
+        )
+        .with_algorithm_exclude_protocols(vec!["uniswap_v3".to_string()]);
+        worker.initialize_graph().await;
+        let ord = order(&token(0x01, "A"), &token(0x02, "B"), 100, OrderSide::Sell);
+
+        let result = worker
+            .quote(&ord, SolveParams::default(), far_deadline())
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(SolveError::RouteRejected { reason: RouteRejection::FallbackExcluded, .. })
+            ),
+            "expected the excluded fallback pool to leave the leg no fallback, got {result:?}"
+        );
+    }
+
     /// Without a fallback pool for the pair the fallback reverts too, so there is no fallback
     /// amount to check `min_amount_out` against.
     #[tokio::test]
@@ -2258,8 +2286,8 @@ mod tests {
     #[tokio::test]
     async fn test_process_event_readmits_a_pamm_behind_an_excluded_fallback_pool() {
         let market = market_with_pamm();
-        let mut worker = admission_worker(market.clone());
-        worker.exclude_protocols = vec!["uniswap_v3".to_string()];
+        let mut worker =
+            admission_worker(market.clone()).with_exclude_protocols(vec!["uniswap_v3".to_string()]);
         worker.initialize_graph().await;
         assert_eq!(
             worker.pamm_admission.state_of(PAMM),
@@ -2285,8 +2313,8 @@ mod tests {
     #[tokio::test]
     async fn test_initialize_graph_leaves_an_excluded_pamm_off_the_record() {
         let market = market_with_pamm_and_fallback();
-        let mut worker = admission_worker(market);
-        worker.exclude_protocols = vec![FALLBACK_PREFIX.to_string()];
+        let mut worker =
+            admission_worker(market).with_exclude_protocols(vec![FALLBACK_PREFIX.to_string()]);
 
         worker.initialize_graph().await;
 
@@ -3157,5 +3185,118 @@ mod tests {
             .expect("the route is valid");
 
         assert_eq!(*seen.lock().unwrap(), [true, false]);
+    }
+
+    /// Adds the `rfq:bebop` component `rfq-leg` and its tokens to `market`.
+    fn add_bebop_component(market: &MarketData) -> ProtocolComponent {
+        let tokens = [token(0x01, "A"), token(0x02, "B")];
+        let rfq = component_with_protocol("rfq-leg", "rfq:bebop", &tokens);
+        let mut state = market.try_write().expect("uncontended");
+        state.upsert_tokens(tokens);
+        state.upsert_components([rfq.clone()]);
+        rfq
+    }
+
+    fn has_graph_edge(worker: &SolverWorker<SplitRouteAlgorithm>, component_id: &str) -> bool {
+        worker
+            .graph_manager
+            .graph()
+            .edge_weights()
+            .any(|edge| edge.component_id == component_id)
+    }
+
+    fn worker_on_market(
+        market: MarketData,
+        excluded: &[&str],
+    ) -> SolverWorker<SplitRouteAlgorithm> {
+        SolverWorker::new(
+            market,
+            DerivedData::new_shared(),
+            SplitRouteAlgorithm { reported_spot_price: 2.0 },
+            0,
+            "test_pool".to_string(),
+        )
+        .with_algorithm_exclude_protocols(
+            excluded
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        )
+    }
+
+    /// A component in the market at startup is out of the algorithm's graph when
+    /// `algorithm_exclude_protocols` names it, and in the graph without the key.
+    #[rstest]
+    #[case::excluded(&["rfq:bebop"], false)]
+    #[case::not_excluded(&[], true)]
+    #[tokio::test]
+    async fn test_initialize_graph_algorithm_exclude_protocols(
+        #[case] excluded: &[&str],
+        #[case] in_graph: bool,
+    ) {
+        let (market, _) = setup_market_weighted(vec![]);
+        add_bebop_component(&market);
+        let post_processor = MockPostProcessor::unchanged();
+        let initialize_calls = Arc::clone(&post_processor.initialize_calls);
+        let mut worker = worker_on_market(market, excluded)
+            .with_post_processors(vec![("rfq".to_string(), Box::new(post_processor))]);
+
+        worker.initialize_graph().await;
+
+        assert_eq!(has_graph_edge(&worker, "rfq-leg"), in_graph);
+        assert_eq!(initialize_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A component the algorithm leaves out is out of its graph, but the post-processors still
+    /// receive its market event.
+    #[rstest]
+    #[case::excluded(&["rfq:bebop"], false)]
+    #[case::not_excluded(&[], true)]
+    #[tokio::test]
+    async fn test_process_event_algorithm_exclude_protocols(
+        #[case] excluded: &[&str],
+        #[case] in_graph: bool,
+    ) {
+        let (market, _) = setup_market_weighted(vec![]);
+        let post_processor = MockPostProcessor::unchanged();
+        let added_ids = Arc::clone(&post_processor.added_component_ids);
+        let mut worker = worker_on_market(market, excluded)
+            .with_post_processors(vec![("rfq".to_string(), Box::new(post_processor))]);
+        worker.initialize_graph().await;
+        let rfq = add_bebop_component(&worker.market_data);
+        let event = MarketEvent::MarketUpdated {
+            added_components: FxHashMap::from_iter([("rfq-leg".to_string(), rfq.tokens)]),
+            removed_components: Vec::new(),
+            updated_components: Vec::new(),
+        };
+
+        worker.process_event(event).await;
+
+        assert_eq!(has_graph_edge(&worker, "rfq-leg"), in_graph);
+        assert_eq!(*added_ids.lock().unwrap(), ["rfq-leg".to_string()]);
+    }
+
+    /// The post-processor may put a component into the final quote that the algorithm cannot use.
+    #[tokio::test]
+    async fn test_quote_post_processor_uses_algorithm_excluded_protocol() {
+        let mut worker = worker_with_post_processor(MockPostProcessor::new(rfq_route))
+            .with_algorithm_exclude_protocols(vec!["rfq:bebop".to_string()]);
+
+        let quote = worker
+            .quote(&a_to_b_order(), SolveParams::default(), far_deadline())
+            .await
+            .expect("the processed route is valid");
+
+        let route = quote
+            .order()
+            .route()
+            .expect("the quote has a route");
+        assert_eq!(
+            route.swaps()[0]
+                .protocol_component()
+                .protocol_system,
+            "rfq:bebop"
+        );
+        assert_eq!(quote.order().post_processed_by(), ["rfq".to_string()]);
     }
 }

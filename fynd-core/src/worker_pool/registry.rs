@@ -307,6 +307,7 @@ mod tests {
             shutdown_tx,
             liquidity_scope: LiquidityScope::default(),
             exclude_protocols: Vec::new(),
+            algorithm_exclude_protocols: Vec::new(),
             post_processor_factories: PostProcessorFactories::default(),
         }
     }
@@ -348,6 +349,7 @@ mod tests {
             shutdown_tx: shutdown_tx.clone(),
             liquidity_scope: LiquidityScope::default(),
             exclude_protocols: Vec::new(),
+            algorithm_exclude_protocols: Vec::new(),
             post_processor_factories: PostProcessorFactories::default(),
         };
 
@@ -392,6 +394,7 @@ mod tests {
                 shutdown_tx: shutdown_tx.clone(),
                 liquidity_scope: LiquidityScope::default(),
                 exclude_protocols: Vec::new(),
+                algorithm_exclude_protocols: Vec::new(),
                 post_processor_factories: PostProcessorFactories::default(),
             });
         assert!(registry_err.is_err());
@@ -422,6 +425,7 @@ mod tests {
                 shutdown_tx: shutdown_tx.clone(),
                 liquidity_scope: LiquidityScope::default(),
                 exclude_protocols: Vec::new(),
+                algorithm_exclude_protocols: Vec::new(),
                 post_processor_factories: PostProcessorFactories::default(),
             });
 
@@ -453,6 +457,7 @@ mod tests {
             shutdown_tx: shutdown_tx.clone(),
             liquidity_scope: LiquidityScope::default(),
             exclude_protocols: Vec::new(),
+            algorithm_exclude_protocols: Vec::new(),
             post_processor_factories: PostProcessorFactories::default(),
         };
 
@@ -487,6 +492,7 @@ mod tests {
             shutdown_tx: shutdown_tx.clone(),
             liquidity_scope: LiquidityScope::default(),
             exclude_protocols: Vec::new(),
+            algorithm_exclude_protocols: Vec::new(),
             post_processor_factories: PostProcessorFactories::default(),
         };
 

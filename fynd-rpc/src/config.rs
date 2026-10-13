@@ -179,6 +179,7 @@ mod tests {
             max_routes = 50
             liquidity_scope = "include_exclusive"
             exclude_protocols = ["fallback:", "uniswap_v2"]
+            algorithm_exclude_protocols = ["rfq:bebop"]
             post_processors = ["rfq", "dedupe"]
         "#;
         let config: WorkerPoolsConfig = toml::from_str(toml).unwrap();
@@ -195,6 +196,7 @@ mod tests {
             pool.exclude_protocols(),
             Some(["fallback:".to_string(), "uniswap_v2".to_string()].as_slice())
         );
+        assert_eq!(pool.algorithm_exclude_protocols(), Some(["rfq:bebop".to_string()].as_slice()));
         assert_eq!(pool.post_processors(), ["rfq".to_string(), "dedupe".to_string()]);
     }
 
@@ -208,6 +210,7 @@ mod tests {
         let config: WorkerPoolsConfig = toml::from_str(toml).unwrap();
 
         assert_eq!(config.pools()["basic"].exclude_protocols(), None);
+        assert_eq!(config.pools()["basic"].algorithm_exclude_protocols(), None);
     }
 
     /// A config without `post_processors` parses and runs no post-processors.
