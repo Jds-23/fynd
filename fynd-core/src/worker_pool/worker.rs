@@ -33,8 +33,8 @@ use crate::{
         market_data::{MarketData, MarketDataView, StateLabel},
     },
     graph::{EdgeWeightUpdaterWithDerived, GraphManager},
-    post_process::{PostProcessRequest, PostProcessors, RoutePostProcessor},
-    types::{internal::SolveTask, Route, RouteExclusionFilter, RouteExclusions},
+    post_process::{PostProcessRequest, PostProcessors, ProcessedRoute, RoutePostProcessor},
+    types::{internal::SolveTask, Route, RouteExclusionFilter, RouteExclusions, RouteResult},
     worker_pool_router::LiquidityScope,
     BlockInfo, Order, OrderQuote, QuoteStatus, SingleOrderQuote, SolveError, SolveParams,
 };
@@ -100,6 +100,14 @@ fn resolve_exclusions(view: &MarketDataView<'_>, params: &SolveParams) -> Arc<Ro
     }
     *cache = Some((generation, exclusions.clone()));
     exclusions
+}
+
+/// Checks that `route` is valid and that it passes the request's route filter.
+fn check_route(route: &Route, order: &Order, params: &SolveParams) -> Result<(), String> {
+    route
+        .validate()
+        .map_err(|err| err.to_string())?;
+    validate_route_filter(route, order, params.route_filter())
 }
 
 /// Check every leg, including split branches, against the original request filter. Reading
@@ -256,6 +264,16 @@ fn record_price_impact_metrics(pool_name: &str, duration: Duration, outcome: &'s
         "worker_pool_price_impact_calculations_total",
         "pool" => pool_name.to_string(),
         "outcome" => outcome
+    )
+    .increment(1);
+}
+
+/// Counts a post-processed route that failed the checks, so the worker quoted the algorithm's
+/// route instead.
+fn record_post_processed_route_rejected(pool_name: &str) {
+    metrics::counter!(
+        "worker_pool_post_processed_route_rejected_total",
+        "pool" => pool_name.to_string()
     )
     .increment(1);
 }
@@ -494,6 +512,115 @@ where
         Ok(())
     }
 
+    /// Prices the fallback legs of `route` and records the amount out they pay. Does nothing for a
+    /// route with no fallback leg.
+    ///
+    /// A pAMM route is ranked on what its fallbacks pay against `min_amount_out`, so a leg with no
+    /// fallback, or one that cannot be priced, makes the route unquotable: there is no floor to
+    /// check.
+    ///
+    /// # Errors
+    ///
+    /// [`SolveError::RouteRejected`] when a leg cannot be priced, and [`SolveError::NotReady`]
+    /// when the request names an overlay the market no longer holds.
+    async fn price_fallback_legs(
+        &self,
+        order: &Order,
+        params: &SolveParams,
+        route: &mut Route,
+    ) -> Result<(), SolveError> {
+        if !has_fallback_leg(route) {
+            return Ok(());
+        }
+        // The same view the algorithm solved against, so the fallback is selected and priced on
+        // the requested overlay rather than the base state.
+        let market = self
+            .read_market(params.state_label())
+            .await?;
+        match price_through_fallbacks(
+            route,
+            &market,
+            self.pamm_admission.fallback_pools(),
+            params.route_filter(),
+            &self.exclude_protocols,
+        ) {
+            Ok(amount) => {
+                route.set_fallback_amount_out(amount);
+                Ok(())
+            }
+            Err(error) => {
+                let rejection = error.rejection();
+                debug!(order_id = %order.id(), %error, "{rejection}");
+                Err(SolveError::route_rejected(order.id(), rejection))
+            }
+        }
+    }
+
+    /// Runs the post-processors on the algorithm's route, which the worker already checked.
+    /// Returns the route to quote and the names of the post-processors that made it. The names are
+    /// empty when no post-processor replaced the route. A processed route gets its fallback
+    /// pricing here; the algorithm's route does not. When the processed route fails the checks,
+    /// including that pricing, logs the reason and returns the algorithm's route with no names, so
+    /// a post-processor never fails a quote.
+    async fn post_process(
+        &self,
+        order: &Order,
+        params: &SolveParams,
+        exclusions: &RouteExclusions,
+        deadline: Instant,
+        result: RouteResult,
+    ) -> (RouteResult, Vec<String>) {
+        if self.post_processors.is_empty() {
+            return (result, Vec::new());
+        }
+        let request = PostProcessRequest::new(
+            order,
+            &self.market_data,
+            &self.derived_data,
+            exclusions,
+            deadline
+                .checked_sub(POST_PROCESS_DEADLINE_MARGIN)
+                .unwrap_or(deadline),
+        )
+        .with_label(params.state_label());
+        let Some(processed) = self
+            .post_processors
+            .run(&request, &result)
+            .await
+        else {
+            return (result, Vec::new());
+        };
+        let ProcessedRoute { route: mut processed_route, post_processed_by } = processed;
+        let mut checked = check_route(processed_route.route(), order, params).and_then(|()| {
+            self.check_processed_route(
+                order,
+                processed_route.route(),
+                processed_route.net_amount_out(),
+            )
+        });
+        if checked.is_ok() {
+            checked = self
+                .price_fallback_legs(order, params, processed_route.route_mut())
+                .await
+                .map_err(|err| err.to_string());
+        }
+        match checked {
+            Ok(()) => (processed_route, post_processed_by),
+            Err(err) => {
+                warn!(
+                    order_id = %order.id(),
+                    worker_pool = %self.pool_name,
+                    algorithm = self.algorithm.name(),
+                    post_processed_by = %post_processed_by.join("+"),
+                    error = %err,
+                    "post-processed route failed the checks; keeping the algorithm's route"
+                );
+                record_post_processed_route_rejected(&self.pool_name);
+                (result, Vec::new())
+            }
+        }
+    }
+
     /// Returns a quote for an order, optionally solved against a named state overlay.
     ///
     /// `deadline` is when the caller stops waiting. Post-processors stop
@@ -576,23 +703,22 @@ where
 
         let order_quote = match result {
             Ok(result) => {
-                let result = if self.post_processors.is_empty() {
-                    result
-                } else {
-                    let post_process_request = PostProcessRequest::new(
-                        order,
-                        &self.market_data,
-                        &self.derived_data,
-                        &exclusions,
-                        deadline
-                            .checked_sub(POST_PROCESS_DEADLINE_MARGIN)
-                            .unwrap_or(deadline),
-                    )
-                    .with_label(params.state_label());
-                    self.post_processors
-                        .run(&post_process_request, result)
-                        .await
-                };
+                if let Err(err) = check_route(result.route(), order, &params) {
+                    error!(
+                        order_id = %order.id(),
+                        algorithm = self.algorithm.name(),
+                        error = %err,
+                        "algorithm produced an invalid route"
+                    );
+                    return Err(SolveError::AlgorithmError(format!(
+                        "{} produced an invalid route: {err}",
+                        self.algorithm.name()
+                    )));
+                }
+
+                let (result, post_processed_by) = self
+                    .post_process(order, &params, &exclusions, deadline, result)
+                    .await;
                 // Extract scalar values before consuming result with into_route()
                 let net_amount_out = result.net_amount_out().clone();
                 let amount_out_net_gas = net_amount_out
@@ -601,55 +727,10 @@ where
                 let gas_price = result.gas_price().clone();
                 let mut route = result.into_route();
 
-                if let Err(err) = route
-                    .validate()
-                    .map_err(|err| err.to_string())
-                    .and_then(|()| validate_route_filter(&route, order, params.route_filter()))
-                    .and_then(|()| {
-                        if self.post_processors.is_empty() {
-                            return Ok(());
-                        }
-                        self.check_processed_route(order, &route, &net_amount_out)
-                    })
-                {
-                    let producer = self
-                        .post_processors
-                        .producer(self.algorithm.name());
-                    error!(
-                        order_id = %order.id(),
-                        worker_pool = %self.pool_name,
-                        producer = %producer,
-                        error = %err,
-                        "route producer returned an invalid route"
-                    );
-                    return Err(SolveError::AlgorithmError(format!(
-                        "{producer} produced an invalid route: {err}"
-                    )));
-                }
-
-                // A pAMM route is ranked on what its fallbacks pay against `min_amount_out`, so a
-                // leg with no fallback, or one that cannot be priced, is dropped here — there is
-                // no floor to check.
-                if has_fallback_leg(&route) {
-                    // The same view the algorithm solved against, so the fallback is selected and
-                    // priced on the requested overlay rather than the base state.
-                    let market = self
-                        .read_market(params.state_label())
+                // The worker priced a processed route in `post_process`.
+                if post_processed_by.is_empty() {
+                    self.price_fallback_legs(order, &params, &mut route)
                         .await?;
-                    match price_through_fallbacks(
-                        &mut route,
-                        &market,
-                        self.pamm_admission.fallback_pools(),
-                        params.route_filter(),
-                        &self.exclude_protocols,
-                    ) {
-                        Ok(amount) => route.set_fallback_amount_out(amount),
-                        Err(error) => {
-                            let rejection = error.rejection();
-                            debug!(order_id = %order.id(), %error, "{rejection}");
-                            return Err(SolveError::route_rejected(order.id(), rejection));
-                        }
-                    }
                 }
 
                 // This is a first naive approach to getting the total gas of this quote

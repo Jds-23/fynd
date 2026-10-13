@@ -10,6 +10,14 @@ use crate::{
     types::RouteResult,
 };
 
+/// The final replacement route and the names of the post-processors that replaced it.
+pub(crate) struct ProcessedRoute {
+    /// The route that the last replacing post-processor returned.
+    pub(crate) route: RouteResult,
+    /// The names of the post-processors that returned a route, in config order.
+    pub(crate) post_processed_by: Vec<String>,
+}
+
 /// The named post-processor instances of one worker, in config order.
 #[derive(Default)]
 pub(crate) struct PostProcessors {
@@ -49,7 +57,8 @@ impl PostProcessors {
     }
 
     /// Runs the post-processors on `route` in config order. Each one gets the last route a
-    /// post-processor before it returned, or `route` when none did.
+    /// post-processor before it returned, or `route` when none did. Returns the final replacement
+    /// route and the names of all post-processors that replaced a route, or `None` if none did.
     ///
     /// At [`PostProcessRequest::deadline`], the worker stops waiting for the post-processor that
     /// is running and keeps the route it had before that call. The post-processors after it do
@@ -57,28 +66,34 @@ impl PostProcessors {
     pub(crate) async fn run(
         &self,
         request: &PostProcessRequest<'_>,
-        mut route: RouteResult,
-    ) -> RouteResult {
+        route: &RouteResult,
+    ) -> Option<ProcessedRoute> {
         let deadline = request.deadline();
+        let mut latest: Option<RouteResult> = None;
+        let mut post_processed_by: Vec<String> = Vec::new();
         for (post_processor_name, post_processor) in &self.instances {
             let started = Instant::now();
             if started >= deadline {
                 warn!(
                     worker_pool = %self.worker_pool,
                     post_processor = post_processor_name,
-                    "task deadline passed; skipping the remaining post-processors"
+                    "post-process deadline passed; skipping the remaining post-processors"
                 );
                 break;
             }
-            let processing = post_processor.process(request, &route);
+            let current = latest.as_ref().unwrap_or(route);
+            let processing = post_processor.process(request, current);
             match tokio::time::timeout_at(deadline.into(), processing).await {
-                Ok(Some(processed)) => route = processed,
+                Ok(Some(replacement)) => {
+                    post_processed_by.push(post_processor_name.clone());
+                    latest = Some(replacement);
+                }
                 Ok(None) => {}
                 Err(_) => {
                     warn!(
                         worker_pool = %self.worker_pool,
                         post_processor = post_processor_name,
-                        "post-processor passed the task deadline; keeping its input route"
+                        "post-processor passed the post-process deadline; keeping its input route"
                     );
                 }
             }
@@ -88,17 +103,7 @@ impl PostProcessors {
                 started.elapsed(),
             );
         }
-        route
-    }
-
-    /// The algorithm's name, followed by the name of each post-processor: who made the route.
-    pub(crate) fn producer(&self, algorithm_name: &str) -> String {
-        let mut producer = algorithm_name.to_string();
-        for (post_processor_name, _) in &self.instances {
-            producer.push_str(" + ");
-            producer.push_str(post_processor_name);
-        }
-        producer
+        latest.map(|route| ProcessedRoute { route, post_processed_by })
     }
 }
 

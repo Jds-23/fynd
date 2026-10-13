@@ -1640,6 +1640,10 @@ impl RouteResult {
         self.route
     }
 
+    pub(crate) fn route_mut(&mut self) -> &mut Route {
+        &mut self.route
+    }
+
     /// Output less gas, priced in the output token.
     #[must_use]
     pub fn net_amount_out(&self) -> &BigInt {

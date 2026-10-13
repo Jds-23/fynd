@@ -2,8 +2,9 @@
 //!
 //! A pool config lists post-processors by name. Each worker builds one instance of each, keeps it
 //! in step with the market events the worker sees, and runs the instances in config order on the
-//! [`RouteResult`](crate::types::RouteResult) its algorithm returned. This happens before the
-//! worker validates the route. The router ranks the quote after that.
+//! [`RouteResult`](crate::types::RouteResult) its algorithm returned. The worker checks the
+//! algorithm's route first, then runs the post-processors, then checks the processed route. The
+//! router ranks the quote after that.
 //!
 //! ```ignore
 //! // In the deployment's binary:
@@ -26,7 +27,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 
-pub(crate) use self::pipeline::PostProcessors;
+pub(crate) use self::pipeline::{PostProcessors, ProcessedRoute};
 pub use self::registry::{
     PostProcessorAlreadyRegistered, PostProcessorRegistry, UnknownPostProcessorError,
 };
@@ -46,11 +47,11 @@ use crate::{
 /// Events for components the pool drops (exclusive components in a `public_only` pool, excluded
 /// protocols) never arrive, but `initialize` sees the whole market.
 ///
-/// The worker validates the route a processor returns. It fails the quote when the route is
-/// invalid, uses a pool the request excluded, or uses a component the pool drops. A processor
-/// owns `net_amount_out`: the worker does not recompute it, and the router ranks quotes on it.
-/// For a sell order the worker also fails the quote when `net_amount_out` is above the route's
-/// amount out.
+/// The worker checks the route a processor returns. When the route is invalid, uses a pool the
+/// request excluded, or uses a component the pool drops, the worker logs a warning and quotes the
+/// route the algorithm returned. A processor owns `net_amount_out`: the worker does not recompute
+/// it, and the router ranks quotes on it. For a sell order the worker also keeps the algorithm's
+/// route when `net_amount_out` is above the route's amount out.
 #[async_trait]
 pub trait RoutePostProcessor: MarketEventHandler + Send + Sync {
     /// The worker calls this when it builds its graph: at start, and after it falls behind on
@@ -121,8 +122,8 @@ impl<'a> PostProcessRequest<'a> {
         self.derived
     }
 
-    /// The pools and tokens this route must not use. The worker fails the quote when the returned
-    /// route uses one.
+    /// The pools and tokens this route must not use. The worker keeps the algorithm's route when
+    /// the returned route uses one.
     pub fn exclusions(&self) -> &'a RouteExclusions {
         self.exclusions
     }
