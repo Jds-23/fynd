@@ -2799,6 +2799,27 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), Some((Some("overlay".to_string()), true)));
     }
 
+    /// The worker stops waiting for post-processors before the task deadline, so the route it had
+    /// still reaches the router in time.
+    #[tokio::test]
+    async fn test_quote_post_processor_deadline() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let recorder = Arc::clone(&seen);
+        let recording = MockPostProcessor::with_request(move |request, result| {
+            *recorder.lock().unwrap() = Some(request.deadline());
+            result
+        });
+        let mut worker = worker_with_post_processor(recording);
+        let deadline = far_deadline();
+
+        worker
+            .quote(&a_to_b_order(), SolveParams::default(), deadline)
+            .await
+            .expect("the algorithm's route is valid");
+
+        assert_eq!(*seen.lock().unwrap(), Some(deadline - POST_PROCESS_DEADLINE_MARGIN));
+    }
+
     fn disconnected_route(result: RouteResult) -> RouteResult {
         let (token_c, token_d) = (token(0x03, "C"), token(0x04, "D"));
         let leg = swap_through(component("p3", &[token_c, token_d]), 80);
