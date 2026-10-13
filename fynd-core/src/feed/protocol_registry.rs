@@ -860,9 +860,19 @@ fn get_env(var: &str) -> Result<String, DataFeedError> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use rstest::rstest;
     use tycho_simulation::price_level_stream::config::PRICE_LEVEL_STREAM_FAMILY;
 
     use super::*;
+
+    #[rstest]
+    #[case::rfq("rfq:bebop", true)]
+    #[case::rfq_via_fallback_router("fallback:rfq:bebop", true)]
+    #[case::pamm("fallback:tycho_pamm", false)]
+    #[case::onchain("uniswap_v2", false)]
+    fn test_is_rfq_protocol(#[case] protocol_system: &str, #[case] expected: bool) {
+        assert_eq!(is_rfq_protocol(protocol_system), expected);
+    }
 
     /// A writer that keeps every byte a subscriber formats, so a test can assert on the
     /// rendered log lines.
