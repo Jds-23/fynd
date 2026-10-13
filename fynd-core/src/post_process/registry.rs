@@ -18,24 +18,29 @@ pub struct PostProcessorAlreadyRegistered {
 /// A pool configuration listed a post-processor that no registry holds.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 #[error(
-    "worker pool '{pool}' lists unknown post-processor '{name}'. Registered: {}",
-    if registered.is_empty() { "none".to_string() } else { registered.join(", ") }
+    "worker pool '{worker_pool}' lists unknown post-processor '{post_processor_name}'. \
+     Registered: {}",
+    if registered_post_processors.is_empty() {
+        "none".to_string()
+    } else {
+        registered_post_processors.join(", ")
+    }
 )]
 pub struct UnknownPostProcessorError {
-    pool: String,
-    name: String,
-    registered: Vec<String>,
+    worker_pool: String,
+    post_processor_name: String,
+    registered_post_processors: Vec<String>,
 }
 
 impl UnknownPostProcessorError {
-    /// The name that was not found.
-    pub fn name(&self) -> &str {
-        &self.name
+    /// The post-processor name that was not found.
+    pub fn post_processor_name(&self) -> &str {
+        &self.post_processor_name
     }
 
     /// The worker pool that listed the name.
-    pub fn pool(&self) -> &str {
-        &self.pool
+    pub fn worker_pool(&self) -> &str {
+        &self.worker_pool
     }
 }
 
@@ -104,7 +109,7 @@ impl PostProcessorRegistry {
         self.by_name.keys().map(String::as_str)
     }
 
-    /// The factories behind `names`, in the same order. `pool` is the pool that listed them.
+    /// The factories behind `names`, in the same order. `worker_pool` is the pool that listed them.
     ///
     /// # Errors
     ///
@@ -112,21 +117,21 @@ impl PostProcessorRegistry {
     /// solver is built, so a misspelled name fails at start and not at the first quote.
     pub(crate) fn resolve(
         &self,
-        pool: &str,
+        worker_pool: &str,
         names: &[String],
     ) -> Result<PostProcessorFactories, UnknownPostProcessorError> {
         let mut factories = Vec::with_capacity(names.len());
         for name in names {
             let Some(factory) = self.by_name.get(name) else {
-                let mut registered: Vec<String> = self
+                let mut registered_post_processors: Vec<String> = self
                     .names()
                     .map(str::to_string)
                     .collect();
-                registered.sort();
+                registered_post_processors.sort();
                 return Err(UnknownPostProcessorError {
-                    pool: pool.to_string(),
-                    name: name.clone(),
-                    registered,
+                    worker_pool: worker_pool.to_string(),
+                    post_processor_name: name.clone(),
+                    registered_post_processors,
                 });
             };
             factories.push((name.clone(), factory.clone()));
@@ -256,8 +261,8 @@ mod tests {
             .resolve("main", &["zeta".to_string(), "missing".to_string()])
             .expect_err("the second name is not registered");
 
-        assert_eq!(error.name(), "missing");
-        assert_eq!(error.pool(), "main");
+        assert_eq!(error.post_processor_name(), "missing");
+        assert_eq!(error.worker_pool(), "main");
         assert_eq!(
             error.to_string(),
             "worker pool 'main' lists unknown post-processor 'missing'. Registered: alpha, zeta"

@@ -17,7 +17,7 @@
 //! post_processors = ["rfq"]
 //! ```
 
-mod chain;
+mod pipeline;
 pub mod registry;
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 
-pub(crate) use self::chain::PostProcessors;
+pub(crate) use self::pipeline::PostProcessors;
 pub use self::registry::{
     PostProcessorAlreadyRegistered, PostProcessorRegistry, UnknownPostProcessorError,
 };

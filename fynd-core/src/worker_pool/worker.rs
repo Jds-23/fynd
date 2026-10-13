@@ -608,6 +608,7 @@ where
                         .producer(self.algorithm.name());
                     error!(
                         order_id = %order.id(),
+                        worker_pool = %self.pool_name,
                         producer = %producer,
                         error = %err,
                         "route producer returned an invalid route"

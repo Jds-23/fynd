@@ -13,20 +13,20 @@ use crate::{
 /// The named post-processor instances of one worker, in config order.
 #[derive(Default)]
 pub(crate) struct PostProcessors {
-    pool_name: String,
+    worker_pool: String,
     instances: Vec<(String, Box<dyn RoutePostProcessor>)>,
 }
 
 impl PostProcessors {
-    /// The instances of the pool `pool_name`, each with its registered name.
+    /// The instances of the worker pool `worker_pool`, each with its registered name.
     pub(crate) fn new(
-        pool_name: String,
+        worker_pool: String,
         instances: Vec<(String, Box<dyn RoutePostProcessor>)>,
     ) -> Self {
-        Self { pool_name, instances }
+        Self { worker_pool, instances }
     }
 
-    /// True when the pool sets no post-processors.
+    /// True when the worker pool sets no post-processors.
     pub(crate) fn is_empty(&self) -> bool {
         self.instances.is_empty()
     }
@@ -41,9 +41,9 @@ impl PostProcessors {
     /// Sends `event` to each post-processor. An error is logged and the next one still gets the
     /// event.
     pub(crate) async fn handle_event(&mut self, event: &MarketEvent) {
-        for (name, post_processor) in &mut self.instances {
+        for (post_processor_name, post_processor) in &mut self.instances {
             if let Err(e) = post_processor.handle_event(event).await {
-                warn!(post_processor = name, "Error handling market event: {:?}", e);
+                warn!(post_processor = post_processor_name, "Error handling market event: {:?}", e);
             }
         }
     }
@@ -60,12 +60,12 @@ impl PostProcessors {
         mut route: RouteResult,
     ) -> RouteResult {
         let deadline = request.deadline();
-        for (name, post_processor) in &self.instances {
+        for (post_processor_name, post_processor) in &self.instances {
             let started = Instant::now();
             if deadline.is_some_and(|deadline| started >= deadline) {
                 warn!(
-                    pool = %self.pool_name,
-                    post_processor = name,
+                    worker_pool = %self.worker_pool,
+                    post_processor = post_processor_name,
                     "task deadline passed; skipping the remaining post-processors"
                 );
                 break;
@@ -78,8 +78,8 @@ impl PostProcessors {
                         Ok(processed) => processed,
                         Err(_) => {
                             warn!(
-                                pool = %self.pool_name,
-                                post_processor = name,
+                                worker_pool = %self.worker_pool,
+                                post_processor = post_processor_name,
                                 "post-processor passed the task deadline; keeping its input route"
                             );
                             before
@@ -92,7 +92,11 @@ impl PostProcessors {
                         .await
                 }
             };
-            record_post_processor_duration(&self.pool_name, name, started.elapsed());
+            record_post_processor_duration(
+                &self.worker_pool,
+                post_processor_name,
+                started.elapsed(),
+            );
         }
         route
     }
@@ -100,20 +104,24 @@ impl PostProcessors {
     /// The algorithm's name, followed by the name of each post-processor: who made the route.
     pub(crate) fn producer(&self, algorithm_name: &str) -> String {
         let mut producer = algorithm_name.to_string();
-        for (name, _) in &self.instances {
+        for (post_processor_name, _) in &self.instances {
             producer.push_str(" + ");
-            producer.push_str(name);
+            producer.push_str(post_processor_name);
         }
         producer
     }
 }
 
 /// Records the wall time of one post-processor run on a route.
-fn record_post_processor_duration(pool_name: &str, post_processor: &str, duration: Duration) {
+fn record_post_processor_duration(
+    worker_pool: &str,
+    post_processor_name: &str,
+    duration: Duration,
+) {
     metrics::histogram!(
         "worker_pool_post_processor_duration_seconds",
-        "pool" => pool_name.to_string(),
-        "post_processor" => post_processor.to_string()
+        "pool" => worker_pool.to_string(),
+        "post_processor" => post_processor_name.to_string()
     )
     .record(duration.as_secs_f64());
 }
@@ -165,11 +173,14 @@ mod tests {
         }
     }
 
-    fn chain(post_processors: Vec<(&str, MockPostProcessor)>) -> PostProcessors {
+    fn build_post_processors(post_processors: Vec<(&str, MockPostProcessor)>) -> PostProcessors {
         let instances = post_processors
             .into_iter()
-            .map(|(name, post_processor)| {
-                (name.to_string(), Box::new(post_processor) as Box<dyn RoutePostProcessor>)
+            .map(|(post_processor_name, post_processor)| {
+                (
+                    post_processor_name.to_string(),
+                    Box::new(post_processor) as Box<dyn RoutePostProcessor>,
+                )
             })
             .collect();
         PostProcessors::new(POOL.to_string(), instances)
@@ -191,10 +202,10 @@ mod tests {
             let net_amount_out = route.net_amount_out() + 1;
             RouteResult::new(route.route().clone(), net_amount_out, route.gas_price().clone())
         });
-        let chain = chain(vec![("set", set), ("add_one", add_one)]);
+        let post_processors = build_post_processors(vec![("set", set), ("add_one", add_one)]);
         let fixture = Fixture::new();
 
-        let route = chain
+        let route = post_processors
             .run(&fixture.request(), route_result(7))
             .await;
 
@@ -205,13 +216,13 @@ mod tests {
     async fn test_run_slow_post_processor_keeps_previous_route() {
         let slow = MockPostProcessor::new(|route| with_net_amount_out(route, 1000))
             .with_delay(Duration::from_secs(30));
-        let chain = chain(vec![("slow", slow)]);
+        let post_processors = build_post_processors(vec![("slow", slow)]);
         let fixture = Fixture::new();
         let request = fixture
             .request()
             .with_deadline(Instant::now() + Duration::from_millis(50));
 
-        let route = chain
+        let route = post_processors
             .run(&request, route_result(7))
             .await;
 
@@ -221,13 +232,13 @@ mod tests {
     #[tokio::test]
     async fn test_run_passed_deadline_skips_post_processors() {
         let set = MockPostProcessor::new(|route| with_net_amount_out(route, 1000));
-        let chain = chain(vec![("set", set)]);
+        let post_processors = build_post_processors(vec![("set", set)]);
         let fixture = Fixture::new();
         let request = fixture
             .request()
             .with_deadline(Instant::now() - Duration::from_millis(1));
 
-        let route = chain
+        let route = post_processors
             .run(&request, route_result(7))
             .await;
 
@@ -239,10 +250,11 @@ mod tests {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let _guard = metrics::set_default_local_recorder(&recorder);
-        let chain = chain(vec![("first", MockPostProcessor::unchanged())]);
+        let post_processors =
+            build_post_processors(vec![("first", MockPostProcessor::unchanged())]);
         let fixture = Fixture::new();
 
-        chain
+        post_processors
             .run(&fixture.request(), route_result(7))
             .await;
 
@@ -264,9 +276,9 @@ mod tests {
         let second = MockPostProcessor::unchanged();
         let (first_events, second_events) =
             (Arc::clone(&first.event_count), Arc::clone(&second.event_count));
-        let mut chain = chain(vec![("first", first), ("second", second)]);
+        let mut post_processors = build_post_processors(vec![("first", first), ("second", second)]);
 
-        chain
+        post_processors
             .handle_event(&market_event())
             .await;
 
@@ -279,9 +291,9 @@ mod tests {
         let failing = MockPostProcessor::unchanged().failing_events();
         let next = MockPostProcessor::unchanged();
         let next_events = Arc::clone(&next.event_count);
-        let mut chain = chain(vec![("failing", failing), ("next", next)]);
+        let mut post_processors = build_post_processors(vec![("failing", failing), ("next", next)]);
 
-        chain
+        post_processors
             .handle_event(&market_event())
             .await;
 
@@ -294,10 +306,12 @@ mod tests {
         let second = MockPostProcessor::unchanged();
         let (first_calls, second_calls) =
             (Arc::clone(&first.initialize_calls), Arc::clone(&second.initialize_calls));
-        let mut chain = chain(vec![("first", first), ("second", second)]);
+        let mut post_processors = build_post_processors(vec![("first", first), ("second", second)]);
         let fixture = Fixture::new();
 
-        chain.initialize(&fixture.market).await;
+        post_processors
+            .initialize(&fixture.market)
+            .await;
 
         assert_eq!(first_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_calls.load(Ordering::SeqCst), 1);
@@ -305,12 +319,12 @@ mod tests {
 
     #[test]
     fn test_producer_names_algorithm_then_post_processors() {
-        let chain = chain(vec![
+        let post_processors = build_post_processors(vec![
             ("rfq", MockPostProcessor::unchanged()),
             ("dedupe", MockPostProcessor::unchanged()),
         ]);
 
-        assert_eq!(chain.producer("most_liquid"), "most_liquid + rfq + dedupe");
+        assert_eq!(post_processors.producer("most_liquid"), "most_liquid + rfq + dedupe");
     }
 
     #[test]
