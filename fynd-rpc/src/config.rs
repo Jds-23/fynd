@@ -45,6 +45,18 @@ timeout_ms = 500
 # max_hops = 2
 # timeout_ms = 500
 # exclude_protocols = ["fallback:"]
+
+# Example: a worker pool whose algorithm never routes through a protocol system, while its
+# post-processors still can. Entries match as in exclude_protocols.
+# algorithm_exclude_protocols differs from exclude_protocols only in a pool that lists
+# post_processors.
+# [pools.replacer_only]
+# algorithm = "bellman_ford"
+# num_workers = 3
+# max_hops = 2
+# timeout_ms = 500
+# algorithm_exclude_protocols = ["rfq:bebop"]
+# post_processors = ["rfq_swap_replacer"]
 "#;
 
 /// Worker pools configuration loaded from TOML file.

@@ -311,6 +311,10 @@ where
     /// Protocol systems this worker never routes through. Empty for every worker pool that does
     /// not set `exclude_protocols`.
     exclude_protocols: Vec<String>,
+    /// Protocol systems only this worker's algorithm leaves out of its graph. Post-processors
+    /// still see them. Empty for every worker pool that does not set
+    /// `algorithm_exclude_protocols`.
+    algorithm_exclude_protocols: Vec<String>,
     /// Post-processors run on the algorithm's route, in config order. Empty when the pool sets no
     /// `post_processors`.
     post_processors: PostProcessors,
@@ -354,6 +358,7 @@ where
             pool_name,
             liquidity_scope: LiquidityScope::default(),
             exclude_protocols: Vec::new(),
+            algorithm_exclude_protocols: Vec::new(),
             post_processors: PostProcessors::default(),
         }
     }
@@ -367,6 +372,15 @@ where
     /// Sets the protocol systems this worker never routes through.
     pub(crate) fn with_exclude_protocols(mut self, exclude_protocols: Vec<String>) -> Self {
         self.exclude_protocols = exclude_protocols;
+        self
+    }
+
+    /// Sets the protocol systems only this worker's algorithm never routes through.
+    pub(crate) fn with_algorithm_exclude_protocols(
+        mut self,
+        algorithm_exclude_protocols: Vec<String>,
+    ) -> Self {
+        self.algorithm_exclude_protocols = algorithm_exclude_protocols;
         self
     }
 

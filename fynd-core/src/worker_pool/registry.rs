@@ -65,6 +65,9 @@ pub(crate) struct SpawnWorkersParams {
     pub liquidity_scope: LiquidityScope,
     /// Protocol systems every worker in this worker pool leaves out of its graph.
     pub exclude_protocols: Vec<String>,
+    /// Protocol systems every worker's algorithm leaves out of its graph, though its
+    /// post-processors still see them.
+    pub algorithm_exclude_protocols: Vec<String>,
     /// Factories for the post-processors every worker builds once, in the order they run.
     pub post_processor_factories: PostProcessorFactories,
 }
@@ -196,6 +199,9 @@ where
         let factory = factory.clone();
         let liquidity_scope = params.liquidity_scope;
         let exclude_protocols = params.exclude_protocols.clone();
+        let algorithm_exclude_protocols = params
+            .algorithm_exclude_protocols
+            .clone();
         let post_processor_factories = params.post_processor_factories.clone();
 
         let handle = thread::Builder::new()
@@ -219,6 +225,7 @@ where
                     )
                     .with_liquidity_scope(liquidity_scope)
                     .with_exclude_protocols(exclude_protocols)
+                    .with_algorithm_exclude_protocols(algorithm_exclude_protocols)
                     .with_post_processors(post_processors);
 
                     worker.initialize_graph().await;

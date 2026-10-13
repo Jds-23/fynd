@@ -188,6 +188,11 @@ pub struct PoolConfig {
     /// `["fallback:"]`. Absent = no restriction.
     #[serde(default)]
     exclude_protocols: Option<Vec<String>>,
+    /// Protocol systems this worker pool's algorithm never routes through, e.g.
+    /// `["rfq:bebop"]`. Its post-processors still see them. This key differs from
+    /// `exclude_protocols` only when the pool lists `post_processors`. Absent = no restriction.
+    #[serde(default)]
+    algorithm_exclude_protocols: Option<Vec<String>>,
     /// Names of the post-processors every worker in this pool runs, in order, on the route its
     /// algorithm returned. Absent = none. Each name is either built in
     /// (`rfq_swap_replacer`) or registered in the
@@ -211,6 +216,7 @@ impl PoolConfig {
             connector_tokens: None,
             liquidity_scope: None,
             exclude_protocols: None,
+            algorithm_exclude_protocols: None,
             post_processors: Vec::new(),
         }
     }
@@ -241,6 +247,23 @@ impl PoolConfig {
     /// (`"fallback:"` covers every `fallback:` venue: pAMMs and `fallback:rfq:` RFQ venues).
     pub fn with_exclude_protocols(mut self, exclude_protocols: Vec<String>) -> Self {
         self.exclude_protocols = Some(exclude_protocols);
+        self
+    }
+
+    /// Returns the protocol systems this worker pool's algorithm never routes through.
+    pub fn algorithm_exclude_protocols(&self) -> Option<&[String]> {
+        self.algorithm_exclude_protocols
+            .as_deref()
+    }
+
+    /// Sets the protocol systems this worker pool's algorithm never routes through. Entries match
+    /// as in [`with_exclude_protocols`](Self::with_exclude_protocols). Post-processors still see
+    /// these protocols, so a post-processor can add a swap through one.
+    pub fn with_algorithm_exclude_protocols(
+        mut self,
+        algorithm_exclude_protocols: Vec<String>,
+    ) -> Self {
+        self.algorithm_exclude_protocols = Some(algorithm_exclude_protocols);
         self
     }
 
@@ -418,6 +441,7 @@ enum PoolEntry {
         connector_tokens: Option<FxHashSet<Address>>,
         liquidity_scope: Option<LiquidityScope>,
         exclude_protocols: Vec<String>,
+        algorithm_exclude_protocols: Vec<String>,
         post_processors: Vec<String>,
     },
     Custom(CustomPoolEntry),
@@ -741,6 +765,7 @@ impl FyndBuilder {
             connector_tokens: None,
             liquidity_scope: None,
             exclude_protocols: Vec::new(),
+            algorithm_exclude_protocols: Vec::new(),
             post_processors: Vec::new(),
         });
         self
@@ -886,6 +911,10 @@ impl FyndBuilder {
                 .exclude_protocols()
                 .map(<[String]>::to_vec)
                 .unwrap_or_default(),
+            algorithm_exclude_protocols: config
+                .algorithm_exclude_protocols()
+                .map(<[String]>::to_vec)
+                .unwrap_or_default(),
             post_processors: config.post_processors().to_vec(),
         });
         Ok(self)
@@ -1013,6 +1042,7 @@ impl FyndBuilder {
                     connector_tokens,
                     liquidity_scope: _,
                     exclude_protocols,
+                    algorithm_exclude_protocols,
                     post_processors,
                 } => {
                     let mut algo_cfg = AlgorithmConfig::new(
@@ -1034,6 +1064,7 @@ impl FyndBuilder {
                         .task_queue_capacity(task_queue_capacity)
                         .liquidity_scope(pool_scope)
                         .exclude_protocols(exclude_protocols)
+                        .algorithm_exclude_protocols(algorithm_exclude_protocols)
                         .post_processor_factories(factories);
                     let builder = self
                         .algorithms
