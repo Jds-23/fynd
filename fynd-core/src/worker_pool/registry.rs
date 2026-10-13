@@ -26,6 +26,7 @@ use crate::{
     },
     derived::{events::DerivedDataEvent, SharedDerivedDataRef},
     feed::{events::MarketEvent, market_data::MarketData},
+    post_process::registry::PostProcessorFactories,
     types::internal::SolveTask,
     worker_pool::worker::SolverWorker,
     worker_pool_router::LiquidityScope,
@@ -64,6 +65,8 @@ pub(crate) struct SpawnWorkersParams {
     pub liquidity_scope: LiquidityScope,
     /// Protocol systems every worker in this worker pool leaves out of its graph.
     pub exclude_protocols: Vec<String>,
+    /// Factories for the post-processors every worker builds once, in the order they run.
+    pub post_processor_factories: PostProcessorFactories,
 }
 
 /// Error returned when algorithm registration fails.
@@ -193,6 +196,7 @@ where
         let factory = factory.clone();
         let liquidity_scope = params.liquidity_scope;
         let exclude_protocols = params.exclude_protocols.clone();
+        let post_processor_factories = params.post_processor_factories.clone();
 
         let handle = thread::Builder::new()
             .name(format!("{}-worker-{}", algorithm_name, worker_id))
@@ -204,6 +208,7 @@ where
 
                 rt.block_on(async move {
                     let algorithm = factory(algorithm_config);
+                    let post_processors = post_processor_factories.build();
 
                     let mut worker = SolverWorker::new(
                         market_data,
@@ -213,7 +218,8 @@ where
                         pool_name,
                     )
                     .with_liquidity_scope(liquidity_scope)
-                    .with_exclude_protocols(exclude_protocols);
+                    .with_exclude_protocols(exclude_protocols)
+                    .with_post_processors(post_processors);
 
                     worker.initialize_graph().await;
                     worker
@@ -294,6 +300,7 @@ mod tests {
             shutdown_tx,
             liquidity_scope: LiquidityScope::default(),
             exclude_protocols: Vec::new(),
+            post_processor_factories: PostProcessorFactories::default(),
         }
     }
 
@@ -334,6 +341,7 @@ mod tests {
             shutdown_tx: shutdown_tx.clone(),
             liquidity_scope: LiquidityScope::default(),
             exclude_protocols: Vec::new(),
+            post_processor_factories: PostProcessorFactories::default(),
         };
 
         let workers =
@@ -377,6 +385,7 @@ mod tests {
                 shutdown_tx: shutdown_tx.clone(),
                 liquidity_scope: LiquidityScope::default(),
                 exclude_protocols: Vec::new(),
+                post_processor_factories: PostProcessorFactories::default(),
             });
         assert!(registry_err.is_err());
 
@@ -406,6 +415,7 @@ mod tests {
                 shutdown_tx: shutdown_tx.clone(),
                 liquidity_scope: LiquidityScope::default(),
                 exclude_protocols: Vec::new(),
+                post_processor_factories: PostProcessorFactories::default(),
             });
 
         assert!(workers.is_ok());
@@ -436,6 +446,7 @@ mod tests {
             shutdown_tx: shutdown_tx.clone(),
             liquidity_scope: LiquidityScope::default(),
             exclude_protocols: Vec::new(),
+            post_processor_factories: PostProcessorFactories::default(),
         };
 
         let workers =
@@ -469,6 +480,7 @@ mod tests {
             shutdown_tx: shutdown_tx.clone(),
             liquidity_scope: LiquidityScope::default(),
             exclude_protocols: Vec::new(),
+            post_processor_factories: PostProcessorFactories::default(),
         };
 
         let workers =

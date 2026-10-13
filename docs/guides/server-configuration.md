@@ -196,6 +196,7 @@ All pools solve every incoming order in parallel. Fynd picks the best result acr
 | `timeout_ms`          | `100`           | Maximum time in milliseconds allowed per order processing in this pool |
 | `max_routes`          | _(no limit)_    | Maximum number of candidate routes to evaluate per order               |
 | `connector_tokens`    | _(no restriction)_ | Allowlist of `"0x..."`-prefixed token addresses permitted as intermediate hops. Source and destination are always allowed regardless. Absent = all tokens reachable. |
+| `post_processors`     | _(none)_        | Names of post-processors, in order, that every worker in the pool runs on the route its algorithm returned, before the worker validates the route. The `fynd` binary registers no post-processors; this field is for binaries that embed Fynd. They register the names through `PostProcessorRegistry`. A name that is not registered stops the server from starting |
 
 ### Connector tokens
 

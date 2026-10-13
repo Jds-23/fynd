@@ -44,6 +44,7 @@ use crate::{
         DataFeedError, TychoFeedConfig,
     },
     graph::EdgeWeightUpdaterWithDerived,
+    post_process::{PostProcessorRegistry, UnknownPostProcessorError},
     price_guard::{
         guard::PriceGuard, provider::PriceProvider, provider_registry::PriceProviderRegistry,
     },
@@ -187,6 +188,11 @@ pub struct PoolConfig {
     /// `["fallback:"]`. Absent = no restriction.
     #[serde(default)]
     exclude_protocols: Option<Vec<String>>,
+    /// Names of the post-processors every worker in this pool runs, in order, on the route its
+    /// algorithm returned. Absent = none. Each name must be in the
+    /// [`PostProcessorRegistry`](crate::PostProcessorRegistry) given to the builder.
+    #[serde(default)]
+    post_processors: Vec<String>,
 }
 
 impl PoolConfig {
@@ -204,6 +210,7 @@ impl PoolConfig {
             connector_tokens: None,
             liquidity_scope: None,
             exclude_protocols: None,
+            post_processors: Vec::new(),
         }
     }
 
@@ -233,6 +240,17 @@ impl PoolConfig {
     /// (`"fallback:"` covers every `fallback:` venue: pAMMs and `fallback:rfq:` RFQ venues).
     pub fn with_exclude_protocols(mut self, exclude_protocols: Vec<String>) -> Self {
         self.exclude_protocols = Some(exclude_protocols);
+        self
+    }
+
+    /// Returns the names of the post-processors this worker pool runs, in order.
+    pub fn post_processors(&self) -> &[String] {
+        &self.post_processors
+    }
+
+    /// Sets the names of the post-processors this worker pool runs on each route, in order.
+    pub fn with_post_processors(mut self, post_processors: Vec<String>) -> Self {
+        self.post_processors = post_processors;
         self
     }
 
@@ -347,6 +365,9 @@ pub enum SolverBuildError {
     /// A worker pool referenced an algorithm name that is not registered.
     #[error(transparent)]
     UnknownAlgorithm(#[from] UnknownAlgorithmError),
+    /// A worker pool listed a post-processor that is not registered.
+    #[error(transparent)]
+    UnknownPostProcessor(#[from] UnknownPostProcessorError),
     /// No native gas token is defined for the requested chain.
     #[error("gas token not configured for chain")]
     GasToken,
@@ -396,6 +417,7 @@ enum PoolEntry {
         connector_tokens: Option<FxHashSet<Address>>,
         liquidity_scope: Option<LiquidityScope>,
         exclude_protocols: Vec<String>,
+        post_processors: Vec<String>,
     },
     Custom(CustomPoolEntry),
 }
@@ -486,6 +508,8 @@ struct BuiltComponents {
 pub struct FyndBuilder {
     /// Algorithms the caller brought, served when a pool names one.
     algorithms: AlgorithmRegistry,
+    /// Post-processors the caller brought, served when a pool lists one.
+    post_processors: PostProcessorRegistry,
     chain: Chain,
     tycho_url: String,
     rpc_url: String,
@@ -529,6 +553,7 @@ impl FyndBuilder {
     ) -> Self {
         Self {
             algorithms: AlgorithmRegistry::new(),
+            post_processors: PostProcessorRegistry::new(),
             chain,
             tycho_url: tycho_url.into(),
             rpc_url: rpc_url.into(),
@@ -715,6 +740,7 @@ impl FyndBuilder {
             connector_tokens: None,
             liquidity_scope: None,
             exclude_protocols: Vec::new(),
+            post_processors: Vec::new(),
         });
         self
     }
@@ -760,6 +786,16 @@ impl FyndBuilder {
     /// lives outside this crate without changing how its pools are configured.
     pub fn with_algorithms(mut self, algorithms: AlgorithmRegistry) -> Self {
         self.algorithms = algorithms;
+        self
+    }
+
+    /// Serves the post-processors a pool lists by name.
+    ///
+    /// A pool lists post-processor names; this hands the builder the ones the caller registered. A
+    /// name that `post_processors` does not hold fails [`build`](Self::build) with
+    /// [`SolverBuildError::UnknownPostProcessor`].
+    pub fn with_post_processors(mut self, post_processors: PostProcessorRegistry) -> Self {
+        self.post_processors = post_processors;
         self
     }
 
@@ -848,6 +884,7 @@ impl FyndBuilder {
                 .exclude_protocols()
                 .map(<[String]>::to_vec)
                 .unwrap_or_default(),
+            post_processors: config.post_processors().to_vec(),
         });
         Ok(self)
     }
@@ -974,6 +1011,7 @@ impl FyndBuilder {
                     connector_tokens,
                     liquidity_scope: _,
                     exclude_protocols,
+                    post_processors,
                 } => {
                     let mut algo_cfg = AlgorithmConfig::new(
                         min_hops,
@@ -984,13 +1022,17 @@ impl FyndBuilder {
                     if let Some(tokens) = connector_tokens {
                         algo_cfg = algo_cfg.with_connector_tokens(tokens);
                     }
+                    let factories = self
+                        .post_processors
+                        .resolve(&name, &post_processors)?;
                     let named = WorkerPoolBuilder::new()
                         .name(name)
                         .algorithm_config(algo_cfg)
                         .num_workers(num_workers)
                         .task_queue_capacity(task_queue_capacity)
                         .liquidity_scope(pool_scope)
-                        .exclude_protocols(exclude_protocols);
+                        .exclude_protocols(exclude_protocols)
+                        .post_processor_factories(factories);
                     let builder = self
                         .algorithms
                         .configure(&algorithm, named)?;
@@ -1801,5 +1843,52 @@ mod tests {
             Duration::from_millis(100),
         );
         assert!(over.is_empty());
+    }
+
+    #[test]
+    fn test_pool_config_with_post_processors() {
+        let config = PoolConfig::new("most_liquid")
+            .with_post_processors(vec!["a".to_string(), "b".to_string()]);
+
+        assert_eq!(config.post_processors(), ["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn test_pool_config_default_post_processors() {
+        assert!(PoolConfig::new("most_liquid")
+            .post_processors()
+            .is_empty());
+    }
+
+    /// A misspelled name has to stop the build, not the first quote that reaches the pool.
+    #[tokio::test]
+    async fn test_build_unregistered_post_processor() {
+        let config = PoolConfig::new("most_liquid").with_post_processors(vec!["rfq".to_string()]);
+        let result = FyndBuilder::new(
+            Chain::Ethereum,
+            "wss://example.invalid",
+            "https://example.invalid",
+            vec!["uniswap_v2".to_string()],
+            100.0,
+        )
+        .add_pool("pool", &config)
+        .expect("add_pool should accept the config")
+        .build();
+
+        let Err(error) = result else {
+            panic!("a pool listing an unregistered post-processor must not build");
+        };
+        assert!(
+            matches!(error, SolverBuildError::UnknownPostProcessor(_)),
+            "expected UnknownPostProcessor, got: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("pool 'pool'") &&
+                error.to_string().contains("'rfq'"),
+            "expected the error to name the pool and the unregistered post-processor 'rfq', \
+             got: {error}"
+        );
     }
 }

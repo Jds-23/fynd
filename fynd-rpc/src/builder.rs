@@ -95,6 +95,20 @@ impl FyndRPCBuilder {
         self
     }
 
+    /// Serves the post-processors a pool lists by name. A name that `post_processors` does not
+    /// hold fails the build.
+    ///
+    /// See [`FyndBuilder::with_post_processors`](fynd_core::FyndBuilder::with_post_processors).
+    pub fn with_post_processors(
+        mut self,
+        post_processors: fynd_core::PostProcessorRegistry,
+    ) -> Self {
+        self.fynd_builder = self
+            .fynd_builder
+            .with_post_processors(post_processors);
+        self
+    }
+
     /// Sets the HTTP host (default: "0.0.0.0").
     pub fn http_host(mut self, host: String) -> Self {
         self.http_host = host;
