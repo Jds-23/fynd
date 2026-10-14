@@ -113,7 +113,7 @@ impl RoutePostProcessor for RfqSwapReplacer {
 /// RFQ protocols whose signed quotes support input amounts smaller than the quoted amount. The
 /// replacer uses other RFQ protocols only for swaps starting at the sell token, where the input
 /// amount matches the quoted amount exactly.
-const PARTIAL_FILL_PROTOCOLS: &[&str] = &["rfq:bebop"];
+const PARTIAL_FILL_PROTOCOLS: &[&str] = &["rfq:bebop", "rfq:hashflow"];
 
 /// True when `protocol_system` is in [`PARTIAL_FILL_PROTOCOLS`], through its own executor or its
 /// fallback router.

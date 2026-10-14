@@ -201,7 +201,7 @@ All pools solve every incoming order in parallel. Fynd picks the best result acr
 
 ### Post-processors
 
-`rfq_swap_replacer` replaces one swap, or a run of swaps between two tokens that every path passes through, with one swap through an RFQ component when that raises the net amount out. The server must index `rfq:` or `fallback:rfq:` protocols (`--protocols`, see Including RFQ Protocols), and the pool must not drop them with `exclude_protocols`. Only `rfq:bebop` supports an input amount smaller than the quoted amount, so it can replace any swap. Every other RFQ protocol can replace only swaps starting at the sell token, where the input amount matches the quoted amount exactly. The default `worker_pools.toml` does not enable it.
+`rfq_swap_replacer` replaces one swap, or a run of swaps between two tokens that every path passes through, with one swap through an RFQ component when that raises the net amount out. The server must index `rfq:` or `fallback:rfq:` protocols (`--protocols`, see Including RFQ Protocols), and the pool must not drop them with `exclude_protocols`. Only `rfq:bebop` and `rfq:hashflow` support an input amount smaller than the quoted amount, so they can replace any swap. Every other RFQ protocol can replace only swaps starting at the sell token, where the input amount matches the quoted amount exactly. The default `worker_pools.toml` does not enable it.
 
 ```toml
 [pools.most_liquid_rfq]
