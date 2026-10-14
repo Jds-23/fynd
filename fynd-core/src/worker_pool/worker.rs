@@ -775,6 +775,7 @@ where
                 if let Err(err) = check_route(result.route(), order, &params) {
                     error!(
                         order_id = %order.id(),
+                        worker_pool = %self.pool_name,
                         algorithm = self.algorithm.name(),
                         error = %err,
                         "algorithm produced an invalid route"
