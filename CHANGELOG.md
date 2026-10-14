@@ -1,4 +1,21 @@
 
+## [0.112.2](https://github.com/propeller-heads/fynd/compare/0.112.1...0.112.2) (2026-10-14)
+
+### Features
+
+* **core:** run pool post-processors in the worker ([75130b6](https://github.com/propeller-heads/fynd/commit/75130b6f4e69f8ea5dd7aaee6cf2365698a8c6da))
+* **core:** add RoutePostProcessor trait and registry ([28e0c35](https://github.com/propeller-heads/fynd/commit/28e0c35ffbe2ead5e628c3198347b8b183ce1530))
+* **rpc:** pass post-processors through fynd-rpc ([b4e3dd8](https://github.com/propeller-heads/fynd/commit/b4e3dd865bd9438020910793889949a4cefa799c))
+
+### Bug Fixes
+
+* **core:** stop post-processors before the task deadline ([e0c4312](https://github.com/propeller-heads/fynd/commit/e0c43120eddd8cfb7e2380f06c2094143c1b61e3))
+
+### Performance Improvements
+
+* **core:** let post-processors borrow the route ([bbd3c7e](https://github.com/propeller-heads/fynd/commit/bbd3c7e5b2b10c94079fba36498a1aace3f2ec0d))
+
+
 ## [0.112.1](https://github.com/propeller-heads/fynd/compare/0.112.0...0.112.1) (2026-10-13)
 
 ### Features
