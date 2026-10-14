@@ -36,7 +36,7 @@ use crate::{
         token_layout::{discover_layout, DiscoveryError, TokenLayout},
     },
     solver::defaults::SIMULATION_LAYOUT_DISCOVERY_TIMEOUT,
-    OrderQuote, SimulationResult,
+    EncodingOptions, OrderQuote, SimulationResult,
 };
 
 /// Balance and allowance every simulated account is given.
@@ -75,6 +75,13 @@ const SIMULATION_COINBASE: Address = address!("0x95222290DD7278Aa3Ddd389Cc1E1d16
 /// Nonce given to the sender, because an account that never sent a transaction reads as a
 /// simulation.
 const SIMULATION_SENDER_NONCE: u64 = 1;
+
+/// Runtime code that answers every call with ERC-1271's magic value, `isValidSignature`'s selector
+/// left-aligned in one word, whatever the calldata or value.
+///
+/// `PUSH4 0x1626ba7e PUSH1 0xe0 SHL PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN`
+const ACCEPT_ANY_ERC1271_SIGNATURE_CODE: [u8; 16] =
+    alloy::primitives::hex!("631626ba7e60e01b60005260206000f3");
 
 /// Budget for the trace that recovers a revert's error.
 ///
@@ -179,13 +186,25 @@ impl QuoteSimulator {
     ///
     /// Records the outcome and, on success, how far the simulated amount sits from what the quote
     /// promised. Instrumenting here rather than at the call site keeps every caller measured.
-    pub(crate) async fn simulate_attempt(&self, quote: &OrderQuote) -> SimulationAttempt {
-        let attempt = self.attempt(quote).await;
+    ///
+    /// `encoding_options` are the ones the quote was encoded with.
+    pub(crate) async fn simulate_attempt(
+        &self,
+        quote: &OrderQuote,
+        encoding_options: &EncodingOptions,
+    ) -> SimulationAttempt {
+        let attempt = self
+            .attempt(quote, encoding_options)
+            .await;
         record_outcome(quote, &attempt);
         attempt
     }
 
-    async fn attempt(&self, quote: &OrderQuote) -> SimulationAttempt {
+    async fn attempt(
+        &self,
+        quote: &OrderQuote,
+        encoding_options: &EncodingOptions,
+    ) -> SimulationAttempt {
         let transaction = match quote.transaction() {
             Some(value) => value,
             None => return failure("simulation setup failed: quote has no encoded transaction"),
@@ -210,13 +229,20 @@ impl QuoteSimulator {
             Ok(value) => value,
             Err(error) => return failure_with(format!("simulation setup failed: {error}")),
         };
-        let overrides = match self
+        let mut overrides = match self
             .overrides(sender, token_in, router)
             .await
         {
             Ok(value) => value,
             Err(reason) => return failure_with(reason),
         };
+        if let Some(fee) = encoding_options.client_fee_params() {
+            let receiver = match crate::rpc::to_address(fee.receiver(), "client fee receiver") {
+                Ok(value) => value,
+                Err(error) => return failure_with(format!("simulation setup failed: {error}")),
+            };
+            accept_client_fee_signature(&mut overrides, receiver);
+        }
         let value = U256::from_be_slice(
             transaction
                 .value()
@@ -643,6 +669,23 @@ fn sender_override() -> AccountOverride {
 
 fn native_balance_override(sender: Address) -> StateOverride {
     StateOverride::from_iter([(sender, sender_override())])
+}
+
+/// Lets the router's client fee signature check pass for a quote the client has not signed yet.
+///
+/// The client signs `ClientFee` after quoting, over the amounts and swaps the quote returns, so
+/// the calldata carries a zero placeholder where the receiver's signature goes. The router tries
+/// ECDSA first and falls back to ERC-1271 on the receiver, so code at the receiver that accepts
+/// every signature lets the rest of the call run. The receiver keeps its address, so the
+/// FeeCalculator still charges the fee client and rates the signed transaction will.
+///
+/// The code is merged into any override the receiver already has, so a receiver that is also the
+/// sender stays funded.
+fn accept_client_fee_signature(overrides: &mut StateOverride, receiver: Address) {
+    overrides
+        .entry(receiver)
+        .or_default()
+        .code = Some(Bytes::from_static(&ACCEPT_ANY_ERC1271_SIGNATURE_CODE));
 }
 
 /// Funds and approves every account a route can pull the input token from.
