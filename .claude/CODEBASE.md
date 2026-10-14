@@ -64,7 +64,7 @@ See `docs/ARCHITECTURE.md` for the full architecture diagram and detailed compon
    `MostLiquidAlgorithm`, `BellmanFordAlgorithm`, `PathFrankWolfeAlgorithm`, and
    `WaterFillAlgorithm`
    **Post-processors** (`fynd-core/src/post_process/`) — `RoutePostProcessor`s a pool runs on the
-   algorithm's route before validation
+   algorithm's route after the worker validates it; a processed route that fails the checks falls back to the algorithm's route. `rfq_swap_replacer` is built in
 5. **MarketState** (`fynd-core/src/feed/market_data.rs`) — `Arc<RwLock<>>` of all component/token/gas state; accessed via `MarketData` handle
 6. **TychoFeed** (`fynd-core/src/feed/tycho_feed.rs`) — Background task: Tycho WebSocket → MarketState → broadcast events
 7. **Derived Data** (`fynd-core/src/derived/`) — Pre-computed spot prices, component (pool) depths, token gas prices

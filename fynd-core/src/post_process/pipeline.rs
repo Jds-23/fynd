@@ -2,6 +2,8 @@
 
 use std::time::{Duration, Instant};
 
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 use tracing::warn;
 
 use crate::{
@@ -9,6 +11,38 @@ use crate::{
     post_process::{PostProcessRequest, RoutePostProcessor},
     types::RouteResult,
 };
+
+/// The final replacement route and the names of the post-processors that replaced it.
+pub(crate) struct ProcessedRoute {
+    /// The route that the last replacing post-processor returned.
+    pub(crate) route: RouteResult,
+    /// The names of the post-processors that returned a route, in config order.
+    pub(crate) post_processed_by: Vec<String>,
+}
+
+/// What happened when a post-processor ran on a route.
+#[derive(Clone, Copy)]
+enum PostProcessOutcome {
+    /// The post-processor returned a replacement route.
+    Replaced,
+    /// The post-processor returned no replacement route.
+    Kept,
+    /// The post-processor did not finish before the post-process deadline.
+    TimedOut,
+    /// The post-process deadline had passed before the post-processor could start.
+    Skipped,
+}
+
+impl PostProcessOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Replaced => "replaced",
+            Self::Kept => "kept",
+            Self::TimedOut => "timed_out",
+            Self::Skipped => "skipped",
+        }
+    }
+}
 
 /// The named post-processor instances of one worker, in config order.
 #[derive(Default)]
@@ -49,57 +83,113 @@ impl PostProcessors {
     }
 
     /// Runs the post-processors on `route` in config order. Each one gets the last route a
-    /// post-processor before it returned, or `route` when none did.
+    /// post-processor before it returned, or `route` when none did. Returns the final replacement
+    /// route and the names of all post-processors that replaced a route, or `None` if none did.
     ///
     /// At [`PostProcessRequest::deadline`], the worker stops waiting for the post-processor that
     /// is running and keeps the route it had before that call. The post-processors after it do
-    /// not run.
+    /// not run. Each post-processor records one [`PostProcessOutcome`].
     pub(crate) async fn run(
         &self,
         request: &PostProcessRequest<'_>,
-        mut route: RouteResult,
-    ) -> RouteResult {
+        route: &RouteResult,
+    ) -> Option<ProcessedRoute> {
         let deadline = request.deadline();
-        for (post_processor_name, post_processor) in &self.instances {
+        let mut latest: Option<RouteResult> = None;
+        let mut post_processed_by: Vec<String> = Vec::new();
+        for (index, (post_processor_name, post_processor)) in self.instances.iter().enumerate() {
             let started = Instant::now();
             if started >= deadline {
                 warn!(
                     worker_pool = %self.worker_pool,
                     post_processor = post_processor_name,
-                    "task deadline passed; skipping the remaining post-processors"
+                    "post-process deadline passed; skipping the remaining post-processors"
                 );
+                for (skipped_name, _) in &self.instances[index..] {
+                    record_post_processor_outcome(
+                        &self.worker_pool,
+                        skipped_name,
+                        PostProcessOutcome::Skipped,
+                    );
+                }
                 break;
             }
-            let processing = post_processor.process(request, &route);
-            match tokio::time::timeout_at(deadline.into(), processing).await {
-                Ok(Some(processed)) => route = processed,
-                Ok(None) => {}
+            let current = latest.as_ref().unwrap_or(route);
+            let processing = post_processor.process(request, current);
+            let outcome = match tokio::time::timeout_at(deadline.into(), processing).await {
+                Ok(Some(replacement)) => {
+                    record_post_processor_gain(
+                        &self.worker_pool,
+                        post_processor_name,
+                        current,
+                        &replacement,
+                    );
+                    post_processed_by.push(post_processor_name.clone());
+                    latest = Some(replacement);
+                    PostProcessOutcome::Replaced
+                }
+                Ok(None) => PostProcessOutcome::Kept,
                 Err(_) => {
                     warn!(
                         worker_pool = %self.worker_pool,
                         post_processor = post_processor_name,
-                        "post-processor passed the task deadline; keeping its input route"
+                        "post-processor passed the post-process deadline; keeping its input route"
                     );
+                    PostProcessOutcome::TimedOut
                 }
-            }
+            };
+            record_post_processor_outcome(&self.worker_pool, post_processor_name, outcome);
             record_post_processor_duration(
                 &self.worker_pool,
                 post_processor_name,
                 started.elapsed(),
             );
         }
-        route
+        latest.map(|route| ProcessedRoute { route, post_processed_by })
     }
+}
 
-    /// The algorithm's name, followed by the name of each post-processor: who made the route.
-    pub(crate) fn producer(&self, algorithm_name: &str) -> String {
-        let mut producer = algorithm_name.to_string();
-        for (post_processor_name, _) in &self.instances {
-            producer.push_str(" + ");
-            producer.push_str(post_processor_name);
-        }
-        producer
+/// Counts one outcome of a post-processor on a route.
+fn record_post_processor_outcome(
+    worker_pool: &str,
+    post_processor_name: &str,
+    outcome: PostProcessOutcome,
+) {
+    metrics::counter!(
+        "worker_pool_post_processor_outcomes_total",
+        "pool" => worker_pool.to_string(),
+        "post_processor" => post_processor_name.to_string(),
+        "outcome" => outcome.label()
+    )
+    .increment(1);
+}
+
+/// Records how much `replacement` gains over `input`, in basis points of the input net amount out.
+///
+/// Records negative gains unchanged. Nothing is recorded when the input net amount out is not
+/// positive. A replacement that later fails the worker checks still counts here;
+/// `worker_pool_post_processed_route_rejected_total` counts those.
+fn record_post_processor_gain(
+    worker_pool: &str,
+    post_processor_name: &str,
+    input: &RouteResult,
+    replacement: &RouteResult,
+) {
+    let input_net = input.net_amount_out();
+    if *input_net <= BigInt::ZERO {
+        return;
     }
+    let gain = replacement.net_amount_out() - input_net;
+    let (Some(gain), Some(input_net)) = (gain.to_f64(), input_net.to_f64()) else {
+        return;
+    };
+    let gain_bps = gain * 10_000.0 / input_net;
+    metrics::histogram!(
+        "worker_pool_post_processor_gain_bps",
+        "pool" => worker_pool.to_string(),
+        "post_processor" => post_processor_name.to_string()
+    )
+    .record(gain_bps);
 }
 
 /// Records the wall time of one post-processor run on a route.
@@ -120,8 +210,9 @@ fn record_post_processor_duration(
 mod tests {
     use std::sync::{atomic::Ordering, Arc};
 
-    use metrics_util::debugging::DebuggingRecorder;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use num_bigint::BigInt;
+    use rstest::rstest;
     use rustc_hash::FxHashMap;
 
     use super::*;
@@ -201,10 +292,11 @@ mod tests {
         let fixture = Fixture::new();
 
         let route = post_processors
-            .run(&fixture.request(), route_result(7))
-            .await;
+            .run(&fixture.request(), &route_result(7))
+            .await
+            .expect("both post-processors replace the route");
 
-        assert_eq!(route.net_amount_out(), &BigInt::from(101));
+        assert_eq!(route.route.net_amount_out(), &BigInt::from(101));
     }
 
     #[tokio::test]
@@ -215,10 +307,23 @@ mod tests {
         let fixture = Fixture::new();
 
         let route = post_processors
-            .run(&fixture.request(), route_result(7))
+            .run(&fixture.request(), &route_result(7))
+            .await
+            .expect("the first post-processor replaces the route");
+
+        assert_eq!(route.route.net_amount_out(), &BigInt::from(100));
+    }
+
+    #[tokio::test]
+    async fn test_run_unchanged_post_processor() {
+        let post_processors = build_post_processors(vec![("keep", MockPostProcessor::unchanged())]);
+        let fixture = Fixture::new();
+
+        let route = post_processors
+            .run(&fixture.request(), &route_result(7))
             .await;
 
-        assert_eq!(route.net_amount_out(), &BigInt::from(100));
+        assert!(route.is_none());
     }
 
     #[tokio::test]
@@ -230,10 +335,36 @@ mod tests {
         let request = fixture.request_until(Instant::now() + Duration::from_millis(50));
 
         let route = post_processors
-            .run(&request, route_result(7))
+            .run(&request, &route_result(7))
             .await;
 
-        assert_eq!(route.net_amount_out(), &BigInt::from(7));
+        assert!(route.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_run_timeout_keeps_earlier_replacement() {
+        let set = MockPostProcessor::new(|route| with_net_amount_out(route, 100));
+        let slow = MockPostProcessor::new(|route| with_net_amount_out(route, 1000))
+            .with_delay(Duration::from_secs(30));
+        let post_processors = build_post_processors(vec![("set", set), ("slow", slow)]);
+        let fixture = Fixture::new();
+        let request = fixture.request_until(Instant::now() + Duration::from_millis(50));
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let processed = post_processors
+            .run(&request, &route_result(7))
+            .await
+            .expect("the first post-processor replaces the route");
+        let recorded = crate::tests::metrics::recorded_metrics(&snapshotter);
+
+        assert_eq!(processed.route.net_amount_out(), &BigInt::from(100));
+        assert_eq!(processed.post_processed_by, ["set".to_string()]);
+        assert_eq!(
+            outcomes(&recorded),
+            vec![outcome("set", "replaced"), outcome("slow", "timed_out")]
+        );
     }
 
     #[tokio::test]
@@ -244,10 +375,10 @@ mod tests {
         let request = fixture.request_until(Instant::now() - Duration::from_millis(1));
 
         let route = post_processors
-            .run(&request, route_result(7))
+            .run(&request, &route_result(7))
             .await;
 
-        assert_eq!(route.net_amount_out(), &BigInt::from(7));
+        assert!(route.is_none());
     }
 
     #[tokio::test]
@@ -260,7 +391,7 @@ mod tests {
         let fixture = Fixture::new();
 
         post_processors
-            .run(&fixture.request(), route_result(7))
+            .run(&fixture.request(), &route_result(7))
             .await;
 
         let recorded = crate::tests::metrics::recorded_metrics(&snapshotter);
@@ -273,6 +404,154 @@ mod tests {
             labels,
             vec![vec!["pool=test_pool".to_string(), "post_processor=first".to_string()]]
         );
+    }
+
+    /// Runs `post_processors` on `input` and returns the recorded metrics.
+    async fn recorded_run(
+        post_processors: &PostProcessors,
+        request: &PostProcessRequest<'_>,
+        input: RouteResult,
+    ) -> Vec<crate::tests::metrics::Recorded> {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        post_processors
+            .run(request, &input)
+            .await;
+        crate::tests::metrics::recorded_metrics(&snapshotter)
+    }
+
+    fn outcomes(recorded: &[crate::tests::metrics::Recorded]) -> Vec<(String, String, u64)> {
+        let mut outcomes = Vec::new();
+        for (name, labels, value) in recorded {
+            if name != "worker_pool_post_processor_outcomes_total" {
+                continue;
+            }
+            let DebugValue::Counter(count) = value else {
+                panic!("expected counter, got {value:?}");
+            };
+            outcomes.push((
+                find_label(labels, "post_processor="),
+                find_label(labels, "outcome="),
+                *count,
+            ));
+        }
+        outcomes.sort();
+        outcomes
+    }
+
+    fn find_label(labels: &[String], prefix: &str) -> String {
+        labels
+            .iter()
+            .find(|label| label.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no label starting with {prefix} in {labels:?}"))
+            .clone()
+    }
+
+    fn outcome(post_processor: &str, outcome: &str) -> (String, String, u64) {
+        (format!("post_processor={post_processor}"), format!("outcome={outcome}"), 1)
+    }
+
+    #[tokio::test]
+    async fn test_run_outcomes_changing_and_unchanged_processors() {
+        let set = MockPostProcessor::new(|route| with_net_amount_out(route, 100));
+        let post_processors =
+            build_post_processors(vec![("set", set), ("keep", MockPostProcessor::unchanged())]);
+        let fixture = Fixture::new();
+
+        let recorded = recorded_run(&post_processors, &fixture.request(), route_result(7)).await;
+
+        assert_eq!(outcomes(&recorded), vec![outcome("keep", "kept"), outcome("set", "replaced")]);
+    }
+
+    #[tokio::test]
+    async fn test_run_outcome_slow_post_processor() {
+        let slow = MockPostProcessor::new(|route| with_net_amount_out(route, 1000))
+            .with_delay(Duration::from_secs(30));
+        let post_processors = build_post_processors(vec![("slow", slow)]);
+        let fixture = Fixture::new();
+        let request = fixture.request_until(Instant::now() + Duration::from_millis(50));
+
+        let recorded = recorded_run(&post_processors, &request, route_result(7)).await;
+
+        assert_eq!(outcomes(&recorded), vec![outcome("slow", "timed_out")]);
+    }
+
+    #[tokio::test]
+    async fn test_run_outcomes_expired_deadline() {
+        let post_processors = build_post_processors(vec![
+            ("first", MockPostProcessor::unchanged()),
+            ("second", MockPostProcessor::unchanged()),
+        ]);
+        let fixture = Fixture::new();
+        let request = fixture.request_until(Instant::now() - Duration::from_millis(1));
+
+        let recorded = recorded_run(&post_processors, &request, route_result(7)).await;
+
+        assert_eq!(
+            outcomes(&recorded),
+            vec![outcome("first", "skipped"), outcome("second", "skipped")]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_post_processed_by_config_order() {
+        let post_processors = build_post_processors(vec![
+            ("first", MockPostProcessor::new(|route| with_net_amount_out(route, 10))),
+            ("keep", MockPostProcessor::unchanged()),
+            ("last", MockPostProcessor::new(|route| with_net_amount_out(route, 20))),
+        ]);
+        let fixture = Fixture::new();
+
+        let processed = post_processors
+            .run(&fixture.request(), &route_result(7))
+            .await
+            .expect("two post-processors replace the route");
+
+        assert_eq!(processed.post_processed_by, ["first".to_string(), "last".to_string()]);
+    }
+
+    #[rstest]
+    #[case::gain(100, 125, Some(2_500.0))]
+    #[case::sub_bps_gain(200_000, 200_010, Some(0.5))]
+    #[case::loss(100, 90, Some(-1_000.0))]
+    #[case::zero_input(0, 100, None)]
+    #[case::negative_input(-5, 100, None)]
+    #[tokio::test]
+    async fn test_run_gain_bps(
+        #[case] input: i64,
+        #[case] output: i64,
+        #[case] expected: Option<f64>,
+    ) {
+        let set = MockPostProcessor::new(move |route| with_net_amount_out(route, output));
+        let post_processors = build_post_processors(vec![("set", set)]);
+        let fixture = Fixture::new();
+
+        let recorded =
+            recorded_run(&post_processors, &fixture.request(), route_result(input)).await;
+
+        let gains: Vec<_> = recorded
+            .iter()
+            .filter(|(name, _, _)| name == "worker_pool_post_processor_gain_bps")
+            .collect();
+        match expected {
+            Some(bps) => {
+                assert_eq!(gains.len(), 1);
+                assert_eq!(
+                    gains[0].1,
+                    vec!["pool=test_pool".to_string(), "post_processor=set".to_string()]
+                );
+                let DebugValue::Histogram(values) = &gains[0].2 else {
+                    panic!("expected histogram, got {:?}", gains[0].2);
+                };
+                let recorded_values: Vec<f64> = values
+                    .iter()
+                    .map(|v| v.into_inner())
+                    .collect();
+                assert_eq!(recorded_values, vec![bps]);
+            }
+            None => assert!(gains.is_empty()),
+        }
     }
 
     #[tokio::test]
@@ -320,20 +599,5 @@ mod tests {
 
         assert_eq!(first_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn test_producer_names_algorithm_then_post_processors() {
-        let post_processors = build_post_processors(vec![
-            ("rfq", MockPostProcessor::unchanged()),
-            ("dedupe", MockPostProcessor::unchanged()),
-        ]);
-
-        assert_eq!(post_processors.producer("most_liquid"), "most_liquid + rfq + dedupe");
-    }
-
-    #[test]
-    fn test_producer_without_post_processors() {
-        assert_eq!(PostProcessors::default().producer("most_liquid"), "most_liquid");
     }
 }
