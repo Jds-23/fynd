@@ -55,6 +55,7 @@ use crate::{
     feed::{exclusivity::is_exclusive, protocol_registry::RFQ_PREFIX},
     price_guard::guard::PriceGuard,
     simulation::simulator::QuoteSimulator,
+    types::RouteRejection,
     worker_pool::task_queue::TaskQueueHandle,
     BlockInfo, EncodingOptions, Order, OrderQuote, OrderSide, Quote, QuoteOptions, QuoteRequest,
     QuoteStatus, SolveError, SolveParams, SurplusInfo, Swap,
@@ -987,15 +988,27 @@ impl WorkerPoolRouter {
                 any_q.receiver().clone(),
                 any_q.solved_against().clone(),
             );
-            // Only label the cause when a quote is actually over the request's
+            // Only label the gas cap when a quote is actually over the request's
             // max_gas, so a future filter or non-Success status cannot silently
-            // get attributed to the gas cap.
+            // get attributed to it.
             let over_max_gas = responses.quotes.iter().any(|pq| {
                 options
                     .max_gas()
                     .is_some_and(|max| pq.quote.gas_estimate() > max)
             });
-            fallback.set_no_route_cause(over_max_gas.then_some(SolveError::MaxGasExceeded));
+            let max_gas_cause = over_max_gas.then_some(SolveError::MaxGasExceeded);
+            let causes = responses
+                .quotes
+                .iter()
+                .filter_map(|pq| pq.quote.no_route_cause())
+                .chain(
+                    responses
+                        .failed_solvers
+                        .iter()
+                        .map(|(_, error)| error),
+                )
+                .chain(&max_gas_cause);
+            fallback.set_no_route_cause(lowest_tier_cause(causes));
             fallback
         } else {
             // No responses at all - determine status from failure types
@@ -1493,9 +1506,15 @@ fn is_native_wrap(swap: &Swap, chain: Chain) -> bool {
 /// rejected route, then no-scorable-paths, then no-graph-path), which beat liquidity, then data,
 /// then algorithm faults, then infrastructure errors. The first error wins within a tier.
 fn aggregate_no_route_cause(failed_solvers: &[(String, SolveError)]) -> Option<SolveError> {
-    failed_solvers
-        .iter()
-        .map(|(_, error)| error)
+    lowest_tier_cause(
+        failed_solvers
+            .iter()
+            .map(|(_, error)| error),
+    )
+}
+
+fn lowest_tier_cause<'a>(causes: impl Iterator<Item = &'a SolveError>) -> Option<SolveError> {
+    causes
         .min_by_key(|error| cause_tier(error))
         .cloned()
 }
@@ -1596,6 +1615,11 @@ fn drop_pamm_quotes_below_min_amount_out(
                 "dropping pAMM quote: the fallback pays less than the user's min_amount_out"
             );
             quote.set_status(QuoteStatus::NoRouteFound);
+            let cause = SolveError::route_rejected(
+                quote.order_id(),
+                RouteRejection::FallbackBelowMinAmountOut,
+            );
+            quote.set_no_route_cause(Some(cause));
         }
     }
     Ok(())
