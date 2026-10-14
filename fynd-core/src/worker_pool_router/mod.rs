@@ -745,7 +745,7 @@ impl WorkerPoolRouter {
                 .map(|quote| async move {
                     if quote.status() == QuoteStatus::Success {
                         let result = simulator
-                            .simulate_attempt(quote)
+                            .simulate_attempt(quote, encoding_options.client_fee_params())
                             .await
                             .into_result();
                         quote.set_simulation_result(result);

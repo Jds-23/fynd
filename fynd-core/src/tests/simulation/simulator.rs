@@ -7,18 +7,21 @@ use alloy::{
         json_rpc::ErrorPayload,
         types::simulate::{SimCallResult, SimulatedBlock},
     },
-    sol_types::SolError,
+    sol_types::{SolCall, SolError},
     transports::mock::Asserter,
 };
 use num_bigint::BigUint;
+use tycho_simulation::tycho_common::Bytes as TychoBytes;
 
 use super::*;
 use crate::{
+    algorithm::test_utils::{component, token, MockProtocolSim},
     simulation::{
         deviation::fixtures::quote_with_fees,
         token_layout::{KeyOrder, MappingPosition, TokenLayout, PROBE_SENTINEL},
     },
     tests::metrics::recorded_metrics,
+    Route, Swap, Transaction,
 };
 
 /// A budget long enough that a mocked provider, which answers at once, never meets it.
@@ -63,6 +66,138 @@ fn test_token_overrides_fund_both_holders_and_both_spenders() {
     assert!(state_diff.contains_key(&layout.allowance_slot(sender, router)));
     assert!(state_diff.contains_key(&layout.allowance_slot(sender, permit2)));
     assert_eq!(state_diff.len(), 4);
+}
+
+/// The signature code merges into the sender's existing override. Replacing that override would
+/// drop the sender's funding, and the simulation would revert on an empty balance instead of in
+/// the swap.
+#[test]
+fn test_client_fee_signature_override_on_the_sender() {
+    let sender = Address::repeat_byte(1);
+    let mut overrides = native_balance_override(sender);
+
+    add_client_fee_receiver_override(&mut overrides, sender);
+
+    let account = &overrides[&sender];
+    assert_eq!(account.balance, Some(SIMULATION_FUNDING_VALUE));
+    assert_eq!(account.nonce, Some(SIMULATION_SENDER_NONCE));
+    assert_eq!(account.code, Some(Bytes::from_static(&ACCEPT_ANY_ERC1271_SIGNATURE_CODE)));
+}
+
+/// The byte the mocked simulator's native-token address repeats. A quote selling the native token
+/// skips token layout discovery, so the simulation is the only RPC call.
+const MOCKED_NATIVE_TOKEN_BYTE: u8 = 9;
+
+/// The router the encoded quote calls.
+const ENCODED_QUOTE_ROUTER: Address = Address::repeat_byte(0x02);
+
+/// An encoded quote selling the mocked simulator's native token.
+fn encoded_quote() -> OrderQuote {
+    let token_in = token(MOCKED_NATIVE_TOKEN_BYTE, "NATIVE");
+    let token_out = token(0x0B, "OUT");
+    let swap = Swap::new(
+        "pool".to_string(),
+        "uniswap_v2".to_string(),
+        token_in.address.clone(),
+        token_out.address.clone(),
+        BigUint::from(1_000_u64),
+        BigUint::from(990_u64),
+        BigUint::from(50_000_u64),
+        component("pool", &[token_in.clone(), token_out.clone()]),
+        Box::new(MockProtocolSim::new(1.0)),
+    );
+    let route = Route::new(
+        vec![swap],
+        [(token_in.address.clone(), token_in), (token_out.address.clone(), token_out)],
+    )
+    .expect("a one-swap route");
+    let mut quote = quote_with_fees(1_000_000).with_route(route);
+    quote.set_transaction(Transaction::new(
+        TychoBytes::from(ENCODED_QUOTE_ROUTER.as_slice()),
+        BigUint::ZERO,
+        vec![0x12],
+    ));
+    quote
+}
+
+/// Client fee params naming `receiver`, with the zero placeholder signature the TS client sends.
+fn client_fee_params(receiver: &[u8]) -> ClientFeeParams {
+    ClientFeeParams::new(
+        100,
+        TychoBytes::from(receiver),
+        BigUint::ZERO,
+        u64::MAX,
+        TychoBytes::from(vec![0; 65]),
+    )
+}
+
+/// With client fee params on the quote, the simulation gives the fee receiver code that accepts
+/// the placeholder signature. Without them, or for a zero receiver the router never checks, no
+/// address gets that code.
+#[rstest::rstest]
+#[case::with_client_fee(Some(Address::repeat_byte(0x0C)), true)]
+#[case::without_client_fee(None, false)]
+#[case::zero_receiver(Some(Address::ZERO), false)]
+#[tokio::test]
+async fn test_simulate_attempt_client_fee_receiver(
+    #[case] receiver: Option<Address>,
+    #[case] receiver_gets_code: bool,
+) {
+    let client_fee = receiver.map(|receiver| client_fee_params(receiver.as_slice()));
+    let asserter = Asserter::new();
+    // Only a reverted attempt carries the replay payload, the one place the overrides the
+    // simulation sent can be read back.
+    asserter.push_success(&simulated_response(
+        crate::simulation::revert::RouterErrors::TychoRouter__EmptySwaps {}.abi_encode(),
+        false,
+        0,
+    ));
+
+    let attempt = mocked_simulator(&asserter, TEST_TIMEOUT)
+        .simulate_attempt(&encoded_quote(), client_fee.as_ref())
+        .await;
+
+    let SimulationAttempt::Reverted { replay, .. } = attempt else {
+        panic!("the mocked call reverts");
+    };
+    let overrides = replay.payload.block_state_calls[0]
+        .state_overrides
+        .as_ref()
+        .expect("state overrides");
+    let code = Bytes::from_static(&ACCEPT_ANY_ERC1271_SIGNATURE_CODE);
+    let accounts_with_code: Vec<Address> = overrides
+        .iter()
+        .filter(|(_, account)| account.code.as_ref() == Some(&code))
+        .map(|(address, _)| *address)
+        .collect();
+    let expected: Vec<Address> = receiver
+        .filter(|_| receiver_gets_code)
+        .into_iter()
+        .collect();
+    assert_eq!(accounts_with_code, expected);
+}
+
+/// A receiver the simulation cannot give code to fails setup before any RPC call: one that is not
+/// an address, and the router, whose own code the override would replace.
+#[rstest::rstest]
+#[case::not_20_bytes(vec![0x0C; 19], "is not 20 bytes")]
+#[case::router(ENCODED_QUOTE_ROUTER.to_vec(), "is the router")]
+#[tokio::test]
+async fn test_simulate_attempt_unusable_client_fee_receiver(
+    #[case] receiver: Vec<u8>,
+    #[case] expected_reason: &str,
+) {
+    let asserter = Asserter::new();
+
+    let attempt = mocked_simulator(&asserter, TEST_TIMEOUT)
+        .simulate_attempt(&encoded_quote(), Some(&client_fee_params(&receiver)))
+        .await;
+
+    let SimulationAttempt::Failure { reason } = attempt else {
+        panic!("setup fails");
+    };
+    assert!(reason.starts_with("simulation setup failed: client fee receiver"), "{reason}");
+    assert!(reason.contains(expected_reason), "{reason}");
 }
 
 /// An envelope for the tests that drive the call directly, without a quote to derive one from.
@@ -155,7 +290,7 @@ fn test_sender_override_funds_a_used_account() {
 fn mocked_simulator(asserter: &Asserter, timeout: Duration) -> QuoteSimulator {
     QuoteSimulator::with_provider(
         RootProvider::new(RpcClient::mocked(asserter.clone())),
-        Address::repeat_byte(9),
+        Address::repeat_byte(MOCKED_NATIVE_TOKEN_BYTE),
         timeout,
     )
 }
@@ -625,6 +760,49 @@ fn test_record_outcome_failed() {
         .iter()
         .any(|(name, labels, _)| name == "quote_simulations_total" &&
             labels.contains(&"outcome=failed".to_string())));
+}
+
+/// Runs the receiver code on a live node: an `isValidSignature` call with a zero placeholder
+/// signature and a 1000-wei transfer with no calldata must both return the ERC-1271 magic value.
+#[tokio::test]
+#[ignore = "requires RPC_URL"]
+async fn test_live_accept_any_erc1271_signature_code() {
+    alloy::sol! {
+        function isValidSignature(bytes32 hash, bytes signature) returns (bytes4 magicValue);
+    }
+
+    let rpc_url = std::env::var("RPC_URL").expect("set RPC_URL");
+    let provider = alloy::providers::ProviderBuilder::default()
+        .connect_http(rpc_url.parse().expect("valid URL"));
+    let sender = Address::repeat_byte(0x11);
+    let receiver = Address::repeat_byte(0x22);
+    let mut overrides = native_balance_override(sender);
+    add_client_fee_receiver_override(&mut overrides, receiver);
+
+    let signature_check =
+        isValidSignatureCall { hash: B256::repeat_byte(0x11), signature: Bytes::from(vec![0; 65]) }
+            .abi_encode();
+    let mut magic_value = [0_u8; 32];
+    magic_value[..4].copy_from_slice(&isValidSignatureCall::SELECTOR);
+
+    for (name, value, data) in [
+        ("isValidSignature", U256::ZERO, signature_check),
+        ("value transfer", U256::from(1_000_u64), Vec::new()),
+    ] {
+        let outcome = simulate_with_overrides(
+            &provider,
+            SimulatedCall { sender, router: receiver, value, data: &data },
+            overrides.clone(),
+            test_envelope(),
+            Duration::from_secs(10),
+        )
+        .await;
+
+        let CallOutcome::Success { amount_out, .. } = outcome else {
+            panic!("{name}: the call to the receiver code did not succeed");
+        };
+        assert_eq!(amount_out, BigUint::from_bytes_be(&magic_value), "{name}");
+    }
 }
 
 /// Drives the real call path against a live node: the simulation must be accepted (the node
