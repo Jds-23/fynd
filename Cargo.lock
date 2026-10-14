@@ -4149,7 +4149,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -5716,7 +5716,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5755,7 +5755,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -7962,9 +7962,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-client"
-version = "0.455.1"
+version = "0.456.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c9e64ee2839fada5c49a2f66e92a2af2328be3d9176b4a0537de9ef58309a8c"
+checksum = "92bdf7ec6af7175992941eaedf560e28c7f95fb1827a41ed28c69aacf0e40be1"
 dependencies = [
  "async-trait",
  "backoff",
@@ -7992,9 +7992,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-common"
-version = "0.455.1"
+version = "0.456.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c548af3487345e3aeeed09ec72928f2b388f87ee44834de60981880d5b04384"
+checksum = "331c3f53b98581fb8e9e7cdf7d37afdc4a2f3f3b12b28421ea37844d7ef374ad"
 dependencies = [
  "anyhow",
  "arrayvec",
@@ -8021,9 +8021,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-ethereum"
-version = "0.455.1"
+version = "0.456.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fa5e516fbc256fd1f98a709a389f0c399062bfd42af26223bd499af8e122bd2"
+checksum = "940dac703b7cd9fdc3946bafbfed7c10db35a4a734ed1930bf3724beade93ae3"
 dependencies = [
  "alloy",
  "async-trait",
@@ -8043,9 +8043,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-execution"
-version = "0.455.1"
+version = "0.456.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "622428e670f385b6e30104c53b280940850dd8f7fa73f4bfe8c598b6b7112e23"
+checksum = "56d2c8abe414a5debab41c25dd96f32d01fbce4a4ba1f47536352ed5756e24cc"
 dependencies = [
  "alloy",
  "chrono",
@@ -8068,9 +8068,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-simulation"
-version = "0.455.1"
+version = "0.456.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5deb828558f3f6341273eb43ba2b0afa716fab5396384d2d18439334a8bb557"
+checksum = "fcf1d526a6553faf235078320110bd8b768182cbf1ff538348fe064dda19ddb6"
 dependencies = [
  "alloy",
  "alloy-chains",
