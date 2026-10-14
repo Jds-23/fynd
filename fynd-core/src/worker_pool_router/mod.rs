@@ -1661,7 +1661,7 @@ mod tests {
         solver::defaults,
         tests::metrics::recorded_metrics,
         types::internal::SolveTask,
-        EncodingOptions, FeeBreakdown, OrderSide, PermitDetails, PermitSingle, Route,
+        EncodingOptions, FeeBreakdown, NoPathReason, OrderSide, PermitDetails, PermitSingle, Route,
         SimulationResult, SingleOrderQuote, Swap, UserTransferType,
     };
 
@@ -1851,11 +1851,66 @@ mod tests {
                 .status(),
             QuoteStatus::NoRouteFound
         );
+        assert!(matches!(
+            order_responses[0].quotes[0]
+                .quote
+                .no_route_cause(),
+            Some(SolveError::RouteRejected {
+                reason: RouteRejection::FallbackBelowMinAmountOut,
+                ..
+            })
+        ));
 
         let ranked = worker_router.rank_quotes(&order_responses[0], &QuoteOptions::default());
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].status(), QuoteStatus::Success);
         assert_eq!(ranked[0].amount_out_net_gas(), &BigUint::from(900u64));
+    }
+
+    /// When every candidate is dropped, the placeholder keeps the drop as the order's cause. The
+    /// rejection outranks the gas cap and a failed solver's path reason, whatever else was seen.
+    #[rstest]
+    #[case::alone(None, vec![])]
+    #[case::over_max_gas(Some(1u64), vec![])]
+    #[case::failed_solver(
+        None,
+        vec![("other".to_string(), SolveError::no_route_found_with_reason(
+            "test-order",
+            NoPathReason::NoGraphPath,
+        ))]
+    )]
+    fn test_rank_quotes_after_dropping_every_pamm_quote_reports_the_drop(
+        #[case] max_gas: Option<u64>,
+        #[case] failed_solvers: Vec<(String, SolveError)>,
+    ) {
+        let worker_router =
+            WorkerPoolRouter::new(vec![], WorkerPoolRouterConfig::default(), default_encoder());
+        let mut order_responses = vec![OrderResponses {
+            order_id: "test-order".to_string(),
+            quotes: vec![worker_quote(("pamm".to_string(), pamm_quote(980, 500)))],
+            failed_solvers,
+        }];
+        drop_pamm_quotes_below_min_amount_out(
+            &worker_router.encoder,
+            &mut order_responses,
+            &EncodingOptions::new(0.01),
+        )
+        .expect("floor check");
+        let mut options = QuoteOptions::default();
+        if let Some(max_gas) = max_gas {
+            options = options.with_max_gas(BigUint::from(max_gas));
+        }
+
+        let ranked = worker_router.rank_quotes(&order_responses[0], &options);
+
+        assert_eq!(ranked[0].status(), QuoteStatus::NoRouteFound);
+        assert!(matches!(
+            ranked[0].no_route_cause(),
+            Some(SolveError::RouteRejected {
+                reason: RouteRejection::FallbackBelowMinAmountOut,
+                ..
+            })
+        ));
     }
 
     /// The stage a service composing its own pipeline calls. It runs unconditionally, so a quote

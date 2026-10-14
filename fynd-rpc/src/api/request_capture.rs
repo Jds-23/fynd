@@ -624,6 +624,13 @@ mod tests {
         assert_eq!(
             failure_reason_slug(
                 s,
+                Some(&SolveError::route_rejected("o", RouteRejection::FallbackBelowMinAmountOut))
+            ),
+            "route/fallback_below_min_amount_out"
+        );
+        assert_eq!(
+            failure_reason_slug(
+                s,
                 Some(&SolveError::insufficient_liquidity(1u32.into(), 0u32.into()))
             ),
             "graph/insufficient_liquidity"
