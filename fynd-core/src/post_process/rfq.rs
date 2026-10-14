@@ -24,7 +24,7 @@ use crate::{
 ///
 /// It replaces one swap, or all swaps of a segment: the run of swaps between two tokens that every
 /// path of the order passes through. It keeps a replacement only when the net amount out rises.
-/// Only sell orders without an exclusive leg change. It uses only RFQ components that the request
+/// Only sell orders change. It uses only RFQ components that the request
 /// does not exclude and the pool does not drop. An RFQ protocol that cannot fill partially replaces
 /// only swaps that start at the sell token. The server must index `rfq:` or `fallback:rfq:`
 /// protocols for the replacer to find components.
@@ -95,8 +95,7 @@ impl RoutePostProcessor for RfqSwapReplacer {
         request: &PostProcessRequest<'_>,
         route: &RouteResult,
     ) -> Option<RouteResult> {
-        if self.index.is_empty() || !request.order().is_sell() || route.route().has_exclusive_leg()
-        {
+        if self.index.is_empty() || !request.order().is_sell() {
             return None;
         }
         let snapshot = match read_market(request.market(), request.label().cloned()).await {
@@ -1024,25 +1023,6 @@ mod tests {
             sequential_route(),
         )
         .await;
-        assert!(out.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_route_with_exclusive_leg() {
-        let (a, b, c) = tokens();
-        let market = market();
-        add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(3.0).with_gas(10)).await;
-        let replacer = replacer(&market).await;
-        let mut route = sequential_route()
-            .route()
-            .clone()
-            .into_swaps();
-        route[0].set_committed_amount_out(BigUint::from(1u64));
-        let route = result(route, &[&a, &b, &c]);
-
-        let out =
-            run(&replacer, &market, &sell_order(&a, &c), &RouteExclusions::default(), route).await;
-
         assert!(out.is_none());
     }
 
