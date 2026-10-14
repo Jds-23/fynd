@@ -51,8 +51,7 @@ use tycho_simulation::tycho_common::Bytes;
 use crate::{
     bps,
     encoding::encoder::Encoder,
-    fallback::FALLBACK_PREFIX,
-    feed::{exclusivity::is_exclusive, protocol_registry::RFQ_PREFIX},
+    feed::{exclusivity::is_exclusive, protocol_registry::is_rfq_protocol},
     price_guard::guard::PriceGuard,
     simulation::simulator::QuoteSimulator,
     worker_pool::task_queue::TaskQueueHandle,
@@ -443,13 +442,10 @@ async fn encode_with_retries(
 /// (`fallback:rfq:bebop`): both fetch the maker's signed quote when encoded.
 fn has_rfq_leg(quote: &OrderQuote) -> bool {
     quote.route().is_some_and(|route| {
-        route.swaps().iter().any(|swap| {
-            let protocol = swap.protocol();
-            protocol
-                .strip_prefix(FALLBACK_PREFIX)
-                .unwrap_or(protocol)
-                .starts_with(RFQ_PREFIX)
-        })
+        route
+            .swaps()
+            .iter()
+            .any(|swap| is_rfq_protocol(swap.protocol()))
     })
 }
 
@@ -1183,13 +1179,17 @@ fn to_gas_token_amount(quote: &OrderQuote, amount: &BigUint) -> Option<BigUint> 
     Some(amount * gas_cost_wei / gas_cost_out)
 }
 
-/// Records the win and the settled volume of one quote the router returns, by pool and algorithm.
+/// Records the win and the settled volume of one quote the router returns, by pool, algorithm and
+/// post-processors.
 ///
 /// Counting wins alone hides size: a solver can win few orders and still settle most of the flow,
 /// or the reverse. Output-token base units do not add up across tokens, so the amount is converted
 /// to the gas token first, the same way `record_gas_token_amount` does it. A quote the conversion
 /// cannot price counts under `worker_router_unpriced_won_quotes_total` rather than recording zero
 /// volume, which would read as a solver that won nothing.
+///
+/// The `post_processed_by` label joins the names of the post-processors that replaced the route
+/// with `+`, in config order. It is `none` when no post-processor replaced the route.
 ///
 /// A quote that found no route has no winner to credit. So has a quote the router built itself,
 /// which is why an empty worker pool is skipped rather than counted under a placeholder label.
@@ -1199,10 +1199,15 @@ fn record_win(quote: &OrderQuote) {
     }
     let worker_pool = quote.worker_pool().to_string();
     let algorithm = quote.algorithm().to_string();
+    let post_processed_by = match quote.post_processed_by() {
+        [] => "none".to_string(),
+        names => names.join("+"),
+    };
     counter!(
         "worker_router_best_quote_pool",
         "pool" => worker_pool.clone(),
-        "algorithm" => algorithm.clone()
+        "algorithm" => algorithm.clone(),
+        "post_processed_by" => post_processed_by.clone()
     )
     .increment(1);
 
@@ -1211,13 +1216,19 @@ fn record_win(quote: &OrderQuote) {
         counter!(
             "worker_router_unpriced_won_quotes_total",
             "pool" => worker_pool,
-            "algorithm" => algorithm
+            "algorithm" => algorithm,
+            "post_processed_by" => post_processed_by
         )
         .increment(1);
         return;
     };
-    gauge!("worker_router_won_volume_gas_token", "pool" => worker_pool, "algorithm" => algorithm)
-        .increment(volume / WEI_PER_GAS_TOKEN);
+    gauge!(
+        "worker_router_won_volume_gas_token",
+        "pool" => worker_pool,
+        "algorithm" => algorithm,
+        "post_processed_by" => post_processed_by
+    )
+    .increment(volume / WEI_PER_GAS_TOKEN);
 }
 
 /// Records an output-token `amount` under `metric`, in whole gas tokens.
@@ -4470,5 +4481,57 @@ mod tests {
         let quote = make_rate_quote(1_000, 900, 0);
 
         assert!(capture_winning_protocols(&quote).is_empty());
+    }
+
+    /// The post-processor label reaches the win counter and whichever volume metric the quote
+    /// prices into.
+    #[rstest]
+    #[case::none(&[], false, "post_processed_by=none")]
+    #[case::two(&["a", "b"], false, "post_processed_by=a+b")]
+    #[case::two_priced(&["a", "b"], true, "post_processed_by=a+b")]
+    fn test_record_win_post_processed_by_label(
+        #[case] names: &[&str],
+        #[case] priced: bool,
+        #[case] expected: &str,
+    ) {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let mut quote = success_quote(1_000);
+        if priced {
+            quote = quote.with_gas_price(BigUint::from(1u64));
+        }
+        quote.set_worker_pool("pool".to_string());
+        quote.set_post_processed_by(
+            names
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        );
+
+        record_win(&quote);
+
+        let recorded = crate::tests::metrics::recorded_metrics(&snapshotter);
+        let labels_of = |metric: &str| -> Vec<Vec<String>> {
+            recorded
+                .iter()
+                .filter(|(name, _, _)| name == metric)
+                .map(|(_, labels, _)| {
+                    let mut labels = labels.clone();
+                    labels.sort();
+                    labels
+                })
+                .collect()
+        };
+        let (volume_metric, absent_metric) = if priced {
+            ("worker_router_won_volume_gas_token", "worker_router_unpriced_won_quotes_total")
+        } else {
+            ("worker_router_unpriced_won_quotes_total", "worker_router_won_volume_gas_token")
+        };
+        let expected_labels =
+            vec![vec!["algorithm=algo".to_string(), "pool=pool".to_string(), expected.to_string()]];
+        assert_eq!(labels_of("worker_router_best_quote_pool"), expected_labels);
+        assert_eq!(labels_of(volume_metric), expected_labels);
+        assert!(labels_of(absent_metric).is_empty());
     }
 }

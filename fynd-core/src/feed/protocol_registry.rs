@@ -73,6 +73,19 @@ const PRICE_LEVEL_STREAM_PREFIX: &str = "pricelevelstream:";
 /// `--protocols` entry and the protocol system of the components the client streams.
 pub(crate) const RFQ_PREFIX: &str = "rfq:";
 
+/// Removes the `fallback:` prefix from `protocol_system`, if it has one.
+pub(crate) fn strip_fallback_prefix(protocol_system: &str) -> &str {
+    protocol_system
+        .strip_prefix(FALLBACK_PREFIX)
+        .unwrap_or(protocol_system)
+}
+
+/// Whether `protocol_system` is an RFQ protocol, through its own executor (`rfq:`) or its
+/// fallback router (`fallback:rfq:`).
+pub(crate) fn is_rfq_protocol(protocol_system: &str) -> bool {
+    strip_fallback_prefix(protocol_system).starts_with(RFQ_PREFIX)
+}
+
 /// Marks a `--protocols` entry that drops a protocol system from the list rather than adding one,
 /// e.g. `exclude:vm:fermiswap`.
 pub const EXCLUDE_PREFIX: &str = "exclude:";
@@ -847,9 +860,19 @@ fn get_env(var: &str) -> Result<String, DataFeedError> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use rstest::rstest;
     use tycho_simulation::price_level_stream::config::PRICE_LEVEL_STREAM_FAMILY;
 
     use super::*;
+
+    #[rstest]
+    #[case::rfq("rfq:bebop", true)]
+    #[case::rfq_via_fallback_router("fallback:rfq:bebop", true)]
+    #[case::pamm("fallback:tycho_pamm", false)]
+    #[case::onchain("uniswap_v2", false)]
+    fn test_is_rfq_protocol(#[case] protocol_system: &str, #[case] expected: bool) {
+        assert_eq!(is_rfq_protocol(protocol_system), expected);
+    }
 
     /// A writer that keeps every byte a subscriber formats, so a test can assert on the
     /// rendered log lines.

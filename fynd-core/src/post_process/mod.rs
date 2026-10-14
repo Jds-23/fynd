@@ -2,8 +2,12 @@
 //!
 //! A pool config lists post-processors by name. Each worker builds one instance of each, keeps it
 //! in step with the market events the worker sees, and runs the instances in config order on the
-//! [`RouteResult`](crate::types::RouteResult) its algorithm returned. This happens before the
-//! worker validates the route. The router ranks the quote after that.
+//! [`RouteResult`](crate::types::RouteResult) its algorithm returned. The worker checks the
+//! algorithm's route first, then runs the post-processors, then checks the processed route. The
+//! router ranks the quote after that.
+//!
+//! `rfq_swap_replacer` is built in: a pool config lists it with no registration. A registry adds
+//! only custom names.
 //!
 //! ```ignore
 //! // In the deployment's binary:
@@ -19,14 +23,16 @@
 
 mod pipeline;
 pub mod registry;
+mod rfq;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
 use std::time::Instant;
 
 use async_trait::async_trait;
+use tycho_simulation::tycho_common::models::protocol::ProtocolComponent;
 
-pub(crate) use self::pipeline::PostProcessors;
+pub(crate) use self::pipeline::{PostProcessors, ProcessedRoute};
 pub use self::registry::{
     PostProcessorAlreadyRegistered, PostProcessorRegistry, UnknownPostProcessorError,
 };
@@ -46,11 +52,11 @@ use crate::{
 /// Events for components the pool drops (exclusive components in a `public_only` pool, excluded
 /// protocols) never arrive, but `initialize` sees the whole market.
 ///
-/// The worker validates the route a processor returns. It fails the quote when the route is
-/// invalid, uses a pool the request excluded, or uses a component the pool drops. A processor
-/// owns `net_amount_out`: the worker does not recompute it, and the router ranks quotes on it.
-/// For a sell order the worker also fails the quote when `net_amount_out` is above the route's
-/// amount out.
+/// The worker checks the route a processor returns. When the route is invalid, uses a pool the
+/// request excluded, or uses a component the pool drops, the worker logs a warning and quotes the
+/// route the algorithm returned. A processor owns `net_amount_out`: the worker does not recompute
+/// it, and the router ranks quotes on it. For a sell order the worker also keeps the algorithm's
+/// route when `net_amount_out` is above the route's amount out.
 #[async_trait]
 pub trait RoutePostProcessor: MarketEventHandler + Send + Sync {
     /// The worker calls this when it builds its graph: at start, and after it falls behind on
@@ -77,6 +83,7 @@ pub struct PostProcessRequest<'a> {
     label: Option<&'a StateLabel>,
     derived: &'a SharedDerivedDataRef,
     exclusions: &'a RouteExclusions,
+    pool_drops: Option<&'a (dyn Fn(&ProtocolComponent) -> bool + Sync)>,
     deadline: Instant,
 }
 
@@ -89,7 +96,18 @@ impl<'a> PostProcessRequest<'a> {
         exclusions: &'a RouteExclusions,
         deadline: Instant,
     ) -> Self {
-        Self { order, market, label: None, derived, exclusions, deadline }
+        Self { order, market, label: None, derived, exclusions, pool_drops: None, deadline }
+    }
+
+    /// Sets the rule for dropping components from the pool. See
+    /// [`drops_component`](Self::drops_component).
+    #[must_use]
+    pub fn with_pool_drops(
+        mut self,
+        pool_drops: &'a (dyn Fn(&ProtocolComponent) -> bool + Sync),
+    ) -> Self {
+        self.pool_drops = Some(pool_drops);
+        self
     }
 
     /// Sets the overlay the solve ran against. `None` is the base market state.
@@ -121,10 +139,17 @@ impl<'a> PostProcessRequest<'a> {
         self.derived
     }
 
-    /// The pools and tokens this route must not use. The worker fails the quote when the returned
-    /// route uses one.
+    /// The pools and tokens this route must not use. The worker keeps the algorithm's route when
+    /// the returned route uses one.
     pub fn exclusions(&self) -> &'a RouteExclusions {
         self.exclusions
+    }
+
+    /// Returns whether the pool drops `component`. The worker rejects processed routes that use
+    /// dropped components. Returns `false` when the request has no pool drop rule.
+    pub fn drops_component(&self, component: &ProtocolComponent) -> bool {
+        self.pool_drops
+            .is_some_and(|drops| drops(component))
     }
 
     /// The time after which the worker stops waiting for the post-processor. The worker sets it

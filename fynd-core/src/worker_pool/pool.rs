@@ -52,6 +52,9 @@ pub struct WorkerPoolConfig {
     liquidity_scope: LiquidityScope,
     /// Protocol systems this worker pool's workers never route through.
     exclude_protocols: Vec<String>,
+    /// Protocol systems this worker pool's algorithms never route through, though its
+    /// post-processors still see them.
+    algorithm_exclude_protocols: Vec<String>,
     /// Factories for the post-processors every worker in this pool builds, in the order they run.
     post_processor_factories: PostProcessorFactories,
 }
@@ -73,6 +76,7 @@ impl Default for WorkerPoolConfig {
             task_queue_capacity: 1000,
             liquidity_scope: LiquidityScope::default(),
             exclude_protocols: Vec::new(),
+            algorithm_exclude_protocols: Vec::new(),
             post_processor_factories: PostProcessorFactories::default(),
         }
     }
@@ -126,6 +130,9 @@ impl WorkerPool {
         // Spawn workers
         let liquidity_scope = config.liquidity_scope;
         let exclude_protocols = config.exclude_protocols.clone();
+        let algorithm_exclude_protocols = config
+            .algorithm_exclude_protocols
+            .clone();
         let post_processor_factories = config.post_processor_factories.clone();
         let params = SpawnWorkersParams {
             algorithm: algorithm.clone(),
@@ -140,6 +147,7 @@ impl WorkerPool {
             shutdown_tx: shutdown_tx.clone(),
             liquidity_scope,
             exclude_protocols,
+            algorithm_exclude_protocols,
             post_processor_factories,
         };
         let workers = config.spawner.spawn(params)?;
@@ -288,6 +296,13 @@ impl WorkerPoolBuilder {
     /// protocol system exactly, or a whole family when it ends with `:` (`fallback:`).
     pub fn exclude_protocols(mut self, exclude_protocols: Vec<String>) -> Self {
         self.config.exclude_protocols = exclude_protocols;
+        self
+    }
+
+    /// Sets the protocol systems this pool's algorithms never route through. Post-processors still
+    /// see them. Entries match as in [`exclude_protocols`](Self::exclude_protocols).
+    pub fn algorithm_exclude_protocols(mut self, algorithm_exclude_protocols: Vec<String>) -> Self {
+        self.config.algorithm_exclude_protocols = algorithm_exclude_protocols;
         self
     }
 
