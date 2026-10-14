@@ -1432,14 +1432,17 @@ fn has_valid_exclusive_route(quote: &OrderQuote) -> bool {
     let Some(leg) = exclusive_legs.next() else {
         return false;
     };
+    if exclusive_legs.next().is_some() {
+        counter!("exclusive_route_multiple_legs_total").increment(1);
+        return false;
+    }
 
     let reaches_output = leg_route_output(swaps, leg, &output_token)
         .is_some_and(|(numerator, _)| numerator > BigUint::ZERO);
-    let valid = exclusive_legs.next().is_none() && reaches_output;
-    if !valid {
-        counter!("exclusive_route_invalid_shape_total").increment(1);
+    if !reaches_output {
+        counter!("exclusive_route_does_not_reach_output_total").increment(1);
     }
-    valid
+    reaches_output
 }
 
 /// Returns the route output that `leg`'s output produces, as the fraction
@@ -4056,6 +4059,41 @@ mod tests {
     fn test_exclusive_route_validation(#[case] legs: &[(&str, u8, u8)], #[case] expected: bool) {
         let quote = make_route_quote(legs);
         assert_eq!(has_valid_exclusive_route(&quote), expected);
+    }
+
+    #[rstest]
+    #[case::multiple_legs(
+        &[("vm:exclusive", 0x01, 0x02), ("vm:exclusive", 0x01, 0x02)],
+        "exclusive_route_multiple_legs_total")]
+    #[case::loop_after_leg(
+        &[
+            ("vm:exclusive", 0x01, 0x02),
+            ("uniswap_v2", 0x02, 0x03),
+            ("uniswap_v2", 0x03, 0x02),
+            ("curve", 0x02, 0x04),
+        ],
+        "exclusive_route_does_not_reach_output_total")]
+    #[case::leg_output_unused(
+        &[("vm:exclusive", 0x01, 0x08), ("uniswap_v2", 0x01, 0x02)],
+        "exclusive_route_does_not_reach_output_total")]
+    fn test_exclusive_route_validation_metrics(
+        #[case] legs: &[(&str, u8, u8)],
+        #[case] counter_name: &str,
+    ) {
+        let quote = make_route_quote(legs);
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || has_valid_exclusive_route(&quote));
+
+        assert_eq!(
+            recorded_metrics(&snapshotter),
+            vec![(
+                counter_name.to_string(),
+                vec![],
+                metrics_util::debugging::DebugValue::Counter(1)
+            )]
+        );
     }
 
     /// Native token, its wrapped form, and an unrelated token.
