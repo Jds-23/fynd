@@ -249,6 +249,12 @@ After a hook pool, a market-maker quote with a minimum order size, or a fixed-ra
 the user can get slightly less; the router's `min_amount_out` bounds that loss by the request's
 slippage.
 
+Two counters report the exclusive candidates `has_valid_exclusive_route` rejects:
+`exclusive_route_multiple_legs_total` (more than one exclusive leg) and
+`exclusive_route_does_not_reach_output_total` (the leg's output never reaches the output token, or
+the swaps after it loop back to a token already on their path). A route with no exclusive leg is
+not counted.
+
 Two gauges report what the overlay is worth, in whole gas tokens: `exclusive_fee_amount` (LP fee
 capture) and `exclusive_user_savings_amount` (user improvement over the public reference).
 `to_gas_token_amount` converts without a price lookup — the quote states its gas cost both in wei
