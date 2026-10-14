@@ -3814,6 +3814,51 @@ mod tests {
         assert_eq!(exclusive_leg_commitment(&combined[0]), Some(BigUint::from(977_778u64)));
     }
 
+    /// A thin Uniswap V2 pool follows the exclusive leg, so a smaller input gets a better price.
+    /// Re-running the pool on the leg's committed amount must give the user at least the
+    /// committed route output.
+    #[test]
+    fn test_pin_commitment_thin_pool_after_exclusive_leg() {
+        use alloy::primitives::U256;
+        use tycho_simulation::{
+            evm::protocol::uniswap_v2::state::UniswapV2State,
+            tycho_common::simulation::protocol_sim::ProtocolSim,
+        };
+
+        use crate::algorithm::test_utils::token_with_decimals;
+
+        let leg_token = token_with_decimals(0x02, "MID", 18);
+        let output_token = token_with_decimals(0x03, "OUT", 18);
+        let thin_pool = UniswapV2State::new(U256::from(2_000_000u64), U256::from(2_000_000u64));
+        let leg_amount_out = BigUint::from(1_000_000u64);
+        let route_amount_out = thin_pool
+            .get_amount_out(leg_amount_out.clone(), &leg_token, &output_token)
+            .expect("thin pool should quote the leg's output")
+            .amount
+            .to_u64()
+            .expect("route output fits in u64");
+        let quote = make_priced_route_quote(
+            &[
+                ("vm:exclusive", 0x01, 0x02, 1000, 1_000_000),
+                ("uniswap_v2", 0x02, 0x03, 1_000_000, route_amount_out),
+            ],
+            route_amount_out,
+        );
+        let committed_amount_out = BigUint::from(route_amount_out - route_amount_out / 100);
+
+        let pinned = pin_commitment(&quote, committed_amount_out.clone());
+
+        let committed_leg = exclusive_leg_commitment(&pinned).expect("leg should be committed");
+        let user_amount_out = thin_pool
+            .get_amount_out(committed_leg, &leg_token, &output_token)
+            .expect("thin pool should quote the committed amount")
+            .amount;
+        assert!(
+            user_amount_out >= committed_amount_out,
+            "user gets {user_amount_out}, below the committed {committed_amount_out}",
+        );
+    }
+
     #[test]
     fn test_combine_no_public_route_first_hop_exclusive_leg() {
         // The fee is 5 bps of the 900_000 the leg produces in the output token (450), not of the
