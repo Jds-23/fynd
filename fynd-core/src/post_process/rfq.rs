@@ -1188,9 +1188,10 @@ mod tests {
     #[rstest]
     #[case::partial_fill_after_sell_token("rfq:bebop", false, &["ab", "rfq"])]
     #[case::partial_fill_via_fallback_router("fallback:rfq:bebop", false, &["ab", "rfq"])]
-    #[case::exact_fill_after_sell_token("rfq:hashflow", false, &[])]
-    #[case::exact_fill_via_fallback_router("fallback:rfq:hashflow", false, &[])]
-    #[case::exact_fill_at_sell_token("rfq:hashflow", true, &["rfq", "bc"])]
+    #[case::partial_fill_hashflow("rfq:hashflow", false, &["ab", "rfq"])]
+    #[case::exact_fill_after_sell_token("rfq:metric", false, &[])]
+    #[case::exact_fill_via_fallback_router("fallback:rfq:metric", false, &[])]
+    #[case::exact_fill_at_sell_token("rfq:metric", true, &["rfq", "bc"])]
     #[tokio::test]
     async fn test_rfq_partial_fill(
         #[case] protocol: &str,
