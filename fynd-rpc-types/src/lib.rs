@@ -2328,10 +2328,15 @@ mod conversions {
         }
 
         #[test]
-        fn test_core_revert_reaches_the_wire_as_a_failure() {
-            let core = fynd_core::SimulationResult::Reverted { reason: "K".to_string() };
-            let wire = SimulationResult::from(core);
-            assert!(matches!(wire, SimulationResult::Failure { reason } if reason == "K"));
+        fn test_core_revert_and_missing_block_reach_the_wire_as_a_failure() {
+            let cores = [
+                fynd_core::SimulationResult::Reverted { reason: "K".to_string() },
+                fynd_core::SimulationResult::BlockUnavailable { reason: "K".to_string() },
+            ];
+            for core in cores {
+                let wire = SimulationResult::from(core);
+                assert!(matches!(wire, SimulationResult::Failure { reason } if reason == "K"));
+            }
         }
 
         #[test]
