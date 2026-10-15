@@ -1017,6 +1017,9 @@ fn test_record_outcome_success() {
         "{:?}",
         counted.1
     );
+    for (name, labels, _) in &recorded {
+        assert!(labels.contains(&"purpose=quote".to_string()), "{name}: {labels:?}");
+    }
 
     let (.., deviation) = recorded
         .iter()
@@ -1141,6 +1144,41 @@ async fn test_live_accept_any_erc1271_signature_code() {
             panic!("{name}: the call to the receiver code did not succeed");
         };
         assert_eq!(amount_out, BigUint::from_bytes_be(&magic_value), "{name}");
+    }
+}
+
+#[test]
+fn test_record_outcome_labels_a_caller_purpose() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+
+    metrics::with_local_recorder(&recorder, || {
+        record_outcome(
+            &quote_with_fees(1_000_000),
+            &SimulationAttempt::Success {
+                amount_out: BigUint::from(999_000u64),
+                gas_used: 120_000,
+                logs: Vec::new(),
+            },
+            SimulationPurpose::new("sample"),
+        );
+    });
+
+    let recorded = recorded_metrics(&snapshotter);
+    let names: Vec<&str> = recorded
+        .iter()
+        .map(|(name, ..)| name.as_str())
+        .collect();
+    for metric in [
+        "quote_simulations_total",
+        "quote_simulation_deviation_bps",
+        "quote_simulation_gas_estimate",
+        "quote_simulation_gas_used",
+    ] {
+        assert!(names.contains(&metric), "{metric} is recorded: {names:?}");
+    }
+    for (name, labels, _) in &recorded {
+        assert!(labels.contains(&"purpose=sample".to_string()), "{name}: {labels:?}");
     }
 }
 
