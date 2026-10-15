@@ -217,6 +217,7 @@ pub(crate) fn failure_reason_slug(status: QuoteStatus, cause: Option<&SolveError
             RouteRejection::FallbackExcluded => "route/fallback_excluded",
             RouteRejection::FallbackPoolMissing => "route/fallback_pool_missing",
             RouteRejection::FallbackNotSimulatable => "route/fallback_not_simulatable",
+            RouteRejection::FallbackBelowMinAmountOut => "route/fallback_below_min_amount_out",
             _ => "route/other",
         },
         SolveError::InsufficientLiquidity { .. } => "graph/insufficient_liquidity",
@@ -619,6 +620,13 @@ mod tests {
                 Some(&SolveError::route_rejected("o", RouteRejection::FallbackPoolMissing))
             ),
             "route/fallback_pool_missing"
+        );
+        assert_eq!(
+            failure_reason_slug(
+                s,
+                Some(&SolveError::route_rejected("o", RouteRejection::FallbackBelowMinAmountOut))
+            ),
+            "route/fallback_below_min_amount_out"
         );
         assert_eq!(
             failure_reason_slug(

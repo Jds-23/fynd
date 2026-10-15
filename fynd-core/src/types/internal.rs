@@ -108,6 +108,9 @@ pub enum RouteRejection {
     /// The route has a `fallback:` leg whose every candidate fallback pool the request excludes,
     /// so no fallback may be selected for it.
     FallbackExcluded,
+    /// The route has a `fallback:` leg whose fallback fill pays less than the user's
+    /// `min_amount_out`, so the router would revert if the maker quote did not land.
+    FallbackBelowMinAmountOut,
 }
 
 impl std::fmt::Display for RouteRejection {
@@ -121,6 +124,9 @@ impl std::fmt::Display for RouteRejection {
             }
             Self::FallbackNotSimulatable => {
                 write!(f, "pAMM route dropped: the fallback could not be run")
+            }
+            Self::FallbackBelowMinAmountOut => {
+                write!(f, "pAMM route dropped: the fallback pays less than min_amount_out")
             }
         }
     }

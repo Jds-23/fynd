@@ -54,6 +54,7 @@ use crate::{
     feed::{exclusivity::is_exclusive, protocol_registry::is_rfq_protocol},
     price_guard::guard::PriceGuard,
     simulation::simulator::QuoteSimulator,
+    types::RouteRejection,
     worker_pool::task_queue::TaskQueueHandle,
     BlockInfo, EncodingOptions, Order, OrderQuote, OrderSide, Quote, QuoteOptions, QuoteRequest,
     QuoteStatus, SolveError, SolveParams, SurplusInfo, Swap,
@@ -982,15 +983,27 @@ impl WorkerPoolRouter {
                 any_q.receiver().clone(),
                 any_q.solved_against().clone(),
             );
-            // Only label the cause when a quote is actually over the request's
+            // Only label the gas cap when a quote is actually over the request's
             // max_gas, so a future filter or non-Success status cannot silently
-            // get attributed to the gas cap.
+            // get attributed to it.
             let over_max_gas = responses.quotes.iter().any(|pq| {
                 options
                     .max_gas()
                     .is_some_and(|max| pq.quote.gas_estimate() > max)
             });
-            fallback.set_no_route_cause(over_max_gas.then_some(SolveError::MaxGasExceeded));
+            let max_gas_cause = over_max_gas.then_some(SolveError::MaxGasExceeded);
+            let causes = responses
+                .quotes
+                .iter()
+                .filter_map(|pq| pq.quote.no_route_cause())
+                .chain(
+                    responses
+                        .failed_solvers
+                        .iter()
+                        .map(|(_, error)| error),
+                )
+                .chain(&max_gas_cause);
+            fallback.set_no_route_cause(lowest_tier_cause(causes));
             fallback
         } else {
             // No responses at all - determine status from failure types
@@ -1531,9 +1544,15 @@ fn consumed_amount(swaps: &[Swap], token: &Bytes) -> BigUint {
 /// rejected route, then no-scorable-paths, then no-graph-path), which beat liquidity, then data,
 /// then algorithm faults, then infrastructure errors. The first error wins within a tier.
 fn aggregate_no_route_cause(failed_solvers: &[(String, SolveError)]) -> Option<SolveError> {
-    failed_solvers
-        .iter()
-        .map(|(_, error)| error)
+    lowest_tier_cause(
+        failed_solvers
+            .iter()
+            .map(|(_, error)| error),
+    )
+}
+
+fn lowest_tier_cause<'a>(causes: impl Iterator<Item = &'a SolveError>) -> Option<SolveError> {
+    causes
         .min_by_key(|error| cause_tier(error))
         .cloned()
 }
@@ -1634,6 +1653,11 @@ fn drop_pamm_quotes_below_min_amount_out(
                 "dropping pAMM quote: the fallback pays less than the user's min_amount_out"
             );
             quote.set_status(QuoteStatus::NoRouteFound);
+            let cause = SolveError::route_rejected(
+                quote.order_id(),
+                RouteRejection::FallbackBelowMinAmountOut,
+            );
+            quote.set_no_route_cause(Some(cause));
         }
     }
     Ok(())
@@ -1675,7 +1699,7 @@ mod tests {
         solver::defaults,
         tests::metrics::recorded_metrics,
         types::internal::SolveTask,
-        EncodingOptions, FeeBreakdown, OrderSide, PermitDetails, PermitSingle, Route,
+        EncodingOptions, FeeBreakdown, NoPathReason, OrderSide, PermitDetails, PermitSingle, Route,
         SimulationResult, SingleOrderQuote, Swap, UserTransferType,
     };
 
@@ -1865,11 +1889,66 @@ mod tests {
                 .status(),
             QuoteStatus::NoRouteFound
         );
+        assert!(matches!(
+            order_responses[0].quotes[0]
+                .quote
+                .no_route_cause(),
+            Some(SolveError::RouteRejected {
+                reason: RouteRejection::FallbackBelowMinAmountOut,
+                ..
+            })
+        ));
 
         let ranked = worker_router.rank_quotes(&order_responses[0], &QuoteOptions::default());
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].status(), QuoteStatus::Success);
         assert_eq!(ranked[0].amount_out_net_gas(), &BigUint::from(900u64));
+    }
+
+    /// When every candidate is dropped, the placeholder keeps the drop as the order's cause. The
+    /// rejection outranks the gas cap and a failed solver's path reason, whatever else was seen.
+    #[rstest]
+    #[case::alone(None, vec![])]
+    #[case::over_max_gas(Some(1u64), vec![])]
+    #[case::failed_solver(
+        None,
+        vec![("other".to_string(), SolveError::no_route_found_with_reason(
+            "test-order",
+            NoPathReason::NoGraphPath,
+        ))]
+    )]
+    fn test_rank_quotes_after_dropping_every_pamm_quote_reports_the_drop(
+        #[case] max_gas: Option<u64>,
+        #[case] failed_solvers: Vec<(String, SolveError)>,
+    ) {
+        let worker_router =
+            WorkerPoolRouter::new(vec![], WorkerPoolRouterConfig::default(), default_encoder());
+        let mut order_responses = vec![OrderResponses {
+            order_id: "test-order".to_string(),
+            quotes: vec![worker_quote(("pamm".to_string(), pamm_quote(980, 500)))],
+            failed_solvers,
+        }];
+        drop_pamm_quotes_below_min_amount_out(
+            &worker_router.encoder,
+            &mut order_responses,
+            &EncodingOptions::new(0.01),
+        )
+        .expect("floor check");
+        let mut options = QuoteOptions::default();
+        if let Some(max_gas) = max_gas {
+            options = options.with_max_gas(BigUint::from(max_gas));
+        }
+
+        let ranked = worker_router.rank_quotes(&order_responses[0], &options);
+
+        assert_eq!(ranked[0].status(), QuoteStatus::NoRouteFound);
+        assert!(matches!(
+            ranked[0].no_route_cause(),
+            Some(SolveError::RouteRejected {
+                reason: RouteRejection::FallbackBelowMinAmountOut,
+                ..
+            })
+        ));
     }
 
     /// The stage a service composing its own pipeline calls. It runs unconditionally, so a quote
