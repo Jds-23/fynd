@@ -1169,6 +1169,7 @@ mod tests {
     #[case::partial_fill_after_sell_token("rfq:bebop", false, &["ab", "rfq"])]
     #[case::partial_fill_via_fallback_router("fallback:rfq:bebop", false, &["ab", "rfq"])]
     #[case::partial_fill_hashflow("rfq:hashflow", false, &["ab", "rfq"])]
+    #[case::partial_fill_native("rfq:native", false, &["ab", "rfq"])]
     #[case::exact_fill_after_sell_token("rfq:metric", false, &[])]
     #[case::exact_fill_via_fallback_router("fallback:rfq:metric", false, &[])]
     #[case::exact_fill_at_sell_token("rfq:metric", true, &["rfq", "bc"])]
