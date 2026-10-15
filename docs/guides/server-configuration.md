@@ -57,7 +57,7 @@ fynd serve \
 **Limitations:**
 
 * RFQ protocols cannot run alone. At least one on-chain protocol is required.
-* When encoding is enabled (`encoding_options` in the quote request), `rfq:bebop` and `rfq:hashflow` quotes require an additional round-trip to the RFQ provider to fetch a signed quote. This can add significant tail latency to solve times. If you are using these protocols, consider quoting first without encoding to evaluate the price, and only request encoding once you are confident the quote is worth executing. `rfq:metric` encodes locally and needs no such round-trip — its executor reads the on-chain oracle Metric updates every block.
+* When encoding is enabled (`encoding_options` in the quote request), `rfq:bebop`, `rfq:hashflow`, `rfq:native` and `rfq:liquorice` quotes require an additional round-trip to the RFQ provider to fetch a signed quote. This can add significant tail latency to solve times. If you are using these protocols, consider quoting first without encoding to evaluate the price, and only request encoding once you are confident the quote is worth executing. `rfq:metric` encodes locally and needs no such round-trip — its executor reads the on-chain oracle Metric updates every block.
 * `rfq:metric` runs on Base and Robinhood only, the chains its executor is deployed on. Naming it on any other chain fails at startup rather than producing quotes that cannot be encoded.
 * Metric is reached by a different entry per chain: `pricelevelstream:metric` on Ethereum, `rfq:metric` on Base and Robinhood. Each is gated on its own chains — the price level stream is Ethereum-only — so the two never serve the same deployment and cannot double-count the liquidity.
 
@@ -65,6 +65,8 @@ fynd serve \
 
 * RFQ protocols require API keys passed via environment variables. Check the [RFQ protocol docs](https://docs.propellerheads.xyz/tycho/for-solvers/request-for-quote-protocols) for the specific variables each protocol needs.
 * `rfq:metric` reads `METRIC_API_KEY` (required — the Bearer token for Metric's quote endpoints) and `METRIC_API_URL` (optional, defaults to `https://api.metric.xyz`).
+* `rfq:native` reads `NATIVE_API_KEY`. It runs on Ethereum, Base, Arbitrum, BSC and Robinhood only. Neither `rfq:native` nor `rfq:liquorice` has a `fallback:rfq:` form.
+* `rfq:liquorice` reads `LIQUORICE_USER` (the solver name) and `LIQUORICE_KEY`. It runs on Ethereum only.
 
 ### pAMM Price Level Stream
 

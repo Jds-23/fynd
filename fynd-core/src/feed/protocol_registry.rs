@@ -44,7 +44,9 @@ use tycho_simulation::{
         protocols::{
             bebop::{client_builder::BebopClientBuilder, state::BebopState},
             hashflow::{client_builder::HashflowClientBuilder, state::HashflowState},
+            liquorice::{client_builder::LiquoriceClientBuilder, state::LiquoriceState},
             metric::{client_builder::MetricClientBuilder, state::MetricState},
+            native::{client_builder::NativeClientBuilder, state::NativeState},
         },
         stream::RFQStreamBuilder,
     },
@@ -616,6 +618,31 @@ pub(crate) fn register_rfq(
                     .map_err(|e| DataFeedError::StreamError(e.to_string()))?;
                 rfq_stream_builder =
                     rfq_stream_builder.add_client::<MetricState>("metric", Box::new(metric_client));
+            }
+            "rfq:native" => {
+                require_executor(chain, protocol)?;
+                let api_key = get_env("NATIVE_API_KEY")?;
+                info!("Adding {protocol} RFQ client...");
+                let native_client = NativeClientBuilder::new(chain, api_key)
+                    .tokens(rfq_tokens.clone())
+                    .tvl_threshold(min_tvl)
+                    .build()
+                    .map_err(|e| DataFeedError::StreamError(e.to_string()))?;
+                rfq_stream_builder =
+                    rfq_stream_builder.add_client::<NativeState>("native", Box::new(native_client));
+            }
+            "rfq:liquorice" => {
+                require_executor(chain, protocol)?;
+                let user = get_env("LIQUORICE_USER")?;
+                let key = get_env("LIQUORICE_KEY")?;
+                info!("Adding {protocol} RFQ client...");
+                let liquorice_client = LiquoriceClientBuilder::new(chain, user, key)
+                    .tokens(rfq_tokens.clone())
+                    .tvl_threshold(min_tvl)
+                    .build()
+                    .map_err(|e| DataFeedError::StreamError(e.to_string()))?;
+                rfq_stream_builder = rfq_stream_builder
+                    .add_client::<LiquoriceState>("liquorice", Box::new(liquorice_client));
             }
             _ => {
                 warn!("Skipping unknown RFQ protocol: {}", protocol);
