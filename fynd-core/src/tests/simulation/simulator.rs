@@ -1013,6 +1013,7 @@ async fn test_live_simulate_and_trace() {
             CallOutcome::Reverted { reason, .. } => format!("reverted: {reason}"),
             CallOutcome::Success { amount_out, .. } => format!("success: {amount_out}"),
             CallOutcome::Failure(reason) => format!("failed: {reason}"),
+            CallOutcome::BlockUnavailable(reason) => format!("block unavailable: {reason}"),
         };
         println!("  {name} -> {described}");
         assert!(

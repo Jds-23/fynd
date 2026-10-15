@@ -1545,6 +1545,11 @@ pub enum SimulationResult {
         /// Readable reason the simulation did not run.
         reason: String,
     },
+    /// The node did not have the block that the simulation runs on, even after the retries.
+    BlockUnavailable {
+        /// Readable reason the node gave.
+        reason: String,
+    },
 }
 
 /// Status of an order solution.

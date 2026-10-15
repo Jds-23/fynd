@@ -2103,7 +2103,10 @@ mod conversions {
                     Self::Success { amount_out, gas_used }
                 }
                 fynd_core::SimulationResult::Reverted { reason } |
-                fynd_core::SimulationResult::Failure { reason } => Self::Failure { reason },
+                fynd_core::SimulationResult::Failure { reason } |
+                fynd_core::SimulationResult::BlockUnavailable { reason } => {
+                    Self::Failure { reason }
+                }
                 // Fallback for future variants added to fynd_core::SimulationResult.
                 _ => Self::Failure { reason: "unrecognised simulation outcome".to_string() },
             }
