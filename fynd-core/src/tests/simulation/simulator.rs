@@ -29,10 +29,14 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[test]
 fn test_success_reports_amount_out_and_gas_used() {
-    let result = SimulationAttempt::Success { amount_out: BigUint::from(42_u8), gas_used: 123_456 }
-        .into_result();
+    let result = SimulationAttempt::Success {
+        amount_out: BigUint::from(42_u8),
+        gas_used: 123_456,
+        logs: Vec::new(),
+    }
+    .into_result();
     assert!(
-        matches!(result, SimulationResult::Success { amount_out, gas_used } if amount_out == BigUint::from(42_u8) && gas_used == 123_456)
+        matches!(result, SimulationResult::Success { amount_out, gas_used, .. } if amount_out == BigUint::from(42_u8) && gas_used == 123_456)
     );
 }
 
@@ -41,7 +45,7 @@ fn test_revert_reports_no_gas() {
     let result =
         SimulationAttempt::Reverted { reason: "no liquidity".to_string(), replay: empty_replay() }
             .into_result();
-    assert!(matches!(result, SimulationResult::Failure { reason } if reason == "no liquidity"));
+    assert!(matches!(result, SimulationResult::Reverted { reason } if reason == "no liquidity"));
 }
 
 #[test]
@@ -331,7 +335,7 @@ async fn test_simulate_call_against_mocked_provider() {
     )
     .await;
     assert!(
-        matches!(result, CallOutcome::Success { amount_out, gas_used } if amount_out == BigUint::from(123_u64) && gas_used == 87_654)
+        matches!(result, CallOutcome::Success { amount_out, gas_used, .. } if amount_out == BigUint::from(123_u64) && gas_used == 87_654)
     );
 }
 
@@ -537,7 +541,7 @@ async fn test_simulate_names_a_revert_the_node_reported_without_a_payload() {
     let attempt = simulate_reverting_call(asserter).await;
 
     assert!(
-        matches!(attempt.into_result(), SimulationResult::Failure { reason }
+        matches!(attempt.into_result(), SimulationResult::Reverted { reason }
             if reason.contains("TychoRouter__EmptySwaps")),
         "the traced error names the revert"
     );
@@ -558,7 +562,7 @@ async fn test_simulate_keeps_the_node_message_when_the_trace_fails() {
     let attempt = simulate_reverting_call(asserter).await;
 
     assert!(
-        matches!(attempt.into_result(), SimulationResult::Failure { reason }
+        matches!(attempt.into_result(), SimulationResult::Reverted { reason }
             if reason == "simulation reverted: execution reverted"),
         "the node's own message survives"
     );
@@ -665,6 +669,7 @@ fn test_record_outcome_success() {
             &SimulationAttempt::Success {
                 amount_out: BigUint::from(999_000u64),
                 gas_used: 120_000,
+                logs: Vec::new(),
             },
         );
     });

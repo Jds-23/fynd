@@ -36,7 +36,7 @@ use crate::{
         token_layout::{discover_layout, DiscoveryError, TokenLayout},
     },
     solver::defaults::SIMULATION_LAYOUT_DISCOVERY_TIMEOUT,
-    ClientFeeParams, OrderQuote, SimulationResult,
+    ClientFeeParams, EventLog, OrderQuote, SimulationResult,
 };
 
 /// Balance and allowance every simulated account is given.
@@ -205,7 +205,7 @@ impl<'a> SimulationSetup<'a> {
 
 pub(crate) enum SimulationAttempt {
     /// The simulated call completed.
-    Success { amount_out: BigUint, gas_used: u64 },
+    Success { amount_out: BigUint, gas_used: u64, logs: Vec<EventLog> },
     /// The simulated call reverted.
     Reverted { reason: String, replay: Box<Replay> },
     /// Simulation could not be completed.
@@ -291,8 +291,8 @@ impl QuoteSimulator {
         )
         .await
         {
-            CallOutcome::Success { amount_out, gas_used } => {
-                SimulationAttempt::Success { amount_out, gas_used }
+            CallOutcome::Success { amount_out, gas_used, logs } => {
+                SimulationAttempt::Success { amount_out, gas_used, logs }
             }
             CallOutcome::Reverted { reason, replay } => SimulationAttempt::Reverted {
                 reason: format!("simulation reverted: {reason}"),
@@ -389,12 +389,11 @@ impl QuoteSimulator {
 impl SimulationAttempt {
     pub(crate) fn into_result(self) -> SimulationResult {
         match self {
-            Self::Success { amount_out, gas_used } => {
-                SimulationResult::Success { amount_out, gas_used }
+            Self::Success { amount_out, gas_used, logs } => {
+                SimulationResult::Success { amount_out, gas_used, logs }
             }
-            Self::Reverted { reason, .. } | Self::Failure { reason } => {
-                SimulationResult::Failure { reason }
-            }
+            Self::Reverted { reason, .. } => SimulationResult::Reverted { reason },
+            Self::Failure { reason } => SimulationResult::Failure { reason },
         }
     }
 }
@@ -449,7 +448,7 @@ fn record_outcome(quote: &OrderQuote, attempt: &SimulationAttempt) {
     let pool = quote.worker_pool().to_string();
     let algorithm = quote.algorithm().to_string();
     let outcome = match attempt {
-        SimulationAttempt::Success { amount_out, gas_used } => {
+        SimulationAttempt::Success { amount_out, gas_used, .. } => {
             if let Some(deviation) = deviation_bps(quote, amount_out) {
                 histogram!(
                     "quote_simulation_deviation_bps",
@@ -610,6 +609,7 @@ async fn simulate_with_overrides(
     CallOutcome::Success {
         amount_out: BigUint::from_bytes_be(&amount.to_be_bytes::<32>()),
         gas_used: result.gas_used,
+        logs: event_logs(&result.logs),
     }
 }
 
@@ -646,11 +646,30 @@ impl Replay {
     }
 }
 
+/// Converts the logs that the node returned to `EventLog`s, in the order that the call emitted
+/// them.
+fn event_logs(logs: &[alloy::rpc::types::Log]) -> Vec<EventLog> {
+    let mut events = Vec::with_capacity(logs.len());
+    for log in logs {
+        let mut topics = Vec::with_capacity(log.topics().len());
+        for topic in log.topics() {
+            topics.push(topic.to_vec().into());
+        }
+        events.push(EventLog {
+            address: log.address().to_vec().into(),
+            topics,
+            data: log.data().data.to_vec().into(),
+        });
+    }
+    events
+}
+
 /// What one simulated call came back with.
 enum CallOutcome {
     Success {
         amount_out: BigUint,
         gas_used: u64,
+        logs: Vec<EventLog>,
     },
     /// The call reverted, with the best reason available: the payload's own error, or the one the
     /// trace recovered, or the node's message.

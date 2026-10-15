@@ -2099,10 +2099,13 @@ mod conversions {
     impl From<fynd_core::SimulationResult> for SimulationResult {
         fn from(core: fynd_core::SimulationResult) -> Self {
             match core {
-                fynd_core::SimulationResult::Success { amount_out, gas_used } => {
+                fynd_core::SimulationResult::Success { amount_out, gas_used, .. } => {
                     Self::Success { amount_out, gas_used }
                 }
+                fynd_core::SimulationResult::Reverted { reason } |
                 fynd_core::SimulationResult::Failure { reason } => Self::Failure { reason },
+                // Fallback for future variants added to fynd_core::SimulationResult.
+                _ => Self::Failure { reason: "unrecognised simulation outcome".to_string() },
             }
         }
     }

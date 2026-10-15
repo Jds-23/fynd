@@ -1506,10 +1506,22 @@ impl OrderQuote {
     }
 }
 
+/// One event log a simulated call emitted, undecoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventLog {
+    /// The contract that emitted the event.
+    pub address: Bytes,
+    /// The indexed topics, the event signature first.
+    pub topics: Vec<Bytes>,
+    /// The ABI-encoded non-indexed fields.
+    pub data: Bytes,
+}
+
 /// Outcome of simulating an encoded quote on the latest block.
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SimulationResult {
     /// The simulated router call returned an amount and consumed gas.
     Success {
@@ -1518,10 +1530,18 @@ pub enum SimulationResult {
         amount_out: BigUint,
         /// Gas consumed by the simulated call.
         gas_used: u64,
+        /// Every event the call emitted, in emission order. Not serialized.
+        #[serde(skip)]
+        logs: Vec<EventLog>,
     },
-    /// The simulated router call could not complete.
+    /// The simulated router call ran and reverted.
+    Reverted {
+        /// Readable reason the simulated call reverted.
+        reason: String,
+    },
+    /// The simulated router call could not be run: setup, transport or timeout.
     Failure {
-        /// Readable reason the simulated call failed.
+        /// Readable reason the simulation did not run.
         reason: String,
     },
 }

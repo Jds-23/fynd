@@ -100,9 +100,9 @@ pub use tycho_simulation::evm::stream::BlockStepController;
 /// to receive raw transaction deltas during pending-block simulation.
 pub use tycho_simulation::tycho_common::traits::TxDeltaIndexer;
 pub use types::{
-    BlockInfo, ClientFeeParams, ComponentId, EncodingOptions, EncodingOptionsError, FeeBreakdown,
-    Order, OrderQuote, OrderSide, OrderValidationError, PermitDetails, PermitSingle, Quote,
-    QuoteOptions, QuoteRequest, QuoteStatus, Route, RouteExclusionFilter, RouteExclusions,
+    BlockInfo, ClientFeeParams, ComponentId, EncodingOptions, EncodingOptionsError, EventLog,
+    FeeBreakdown, Order, OrderQuote, OrderSide, OrderValidationError, PermitDetails, PermitSingle,
+    Quote, QuoteOptions, QuoteRequest, QuoteStatus, Route, RouteExclusionFilter, RouteExclusions,
     RouteValidationError, SimulationResult, SingleOrderQuote, SolveError, SolveParams, SolveResult,
     SurplusInfo, Swap, TaskId, Transaction, UserTransferType,
 };
