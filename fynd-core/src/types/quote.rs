@@ -633,6 +633,17 @@ impl EncodingOptions {
         self
     }
 
+    /// Returns these options with `slippage` as the slippage tolerance. The other options do not
+    /// change.
+    ///
+    /// # Arguments
+    ///
+    /// * `slippage` - The slippage tolerance, as a fraction: `0.005` is 0.5%.
+    pub fn with_slippage(mut self, slippage: f64) -> Self {
+        self.slippage = slippage;
+        self
+    }
+
     /// Returns the slippage tolerance.
     pub fn slippage(&self) -> f64 {
         self.slippage
