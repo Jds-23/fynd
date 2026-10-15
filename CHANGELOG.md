@@ -1,4 +1,26 @@
 
+## [0.112.3](https://github.com/propeller-heads/fynd/compare/0.112.2...0.112.3) (2026-10-14)
+
+### Features
+
+* **core:** let rfq_swap_replacer fill Hashflow quotes partially ([4f8b606](https://github.com/propeller-heads/fynd/commit/4f8b606221b9864201378506ec82d7607d381e14))
+* **core:** count post-processor outcomes and gains ([967b299](https://github.com/propeller-heads/fynd/commit/967b2994df9920af4844896f5f5bf137ab014648))
+* **core:** hide algorithm_exclude_protocols from the algorithm only ([2e3001e](https://github.com/propeller-heads/fynd/commit/2e3001e5efe2e6e3ab7b57885da73dd1b97b73c1))
+* **core:** label won quotes by the post-processors that made them ([a00b5e7](https://github.com/propeller-heads/fynd/commit/a00b5e7d3bf2e568040c04612c1ec6278a1cfb00))
+* **core:** limit RFQs without partial fills to the sell token ([4a8c88d](https://github.com/propeller-heads/fynd/commit/4a8c88d207902211481934cb2639dfec5449c792))
+* **core:** let rfq_swap_replacer use fallback:rfq: components ([6e7512b](https://github.com/propeller-heads/fynd/commit/6e7512b40506888229dd425787ad5989cf37d951))
+* **core:** add rfq_swap_replacer as a built-in post-processor ([835ac82](https://github.com/propeller-heads/fynd/commit/835ac82c5e59c0e62eff4c31444c7d0fb3270943))
+* **core:** pass the pool's drop rule to post-processors ([1fd0f5e](https://github.com/propeller-heads/fynd/commit/1fd0f5e334b5d495a46a0d3f8c1487726d9a77c0))
+* **core:** quote the algorithm's route when a processed route fails ([aa20b04](https://github.com/propeller-heads/fynd/commit/aa20b0450d9cf80c998311ce1cc56acc3bdaa447))
+* count each invalid exclusive route shape separately ([a57048d](https://github.com/propeller-heads/fynd/commit/a57048d2687a7e2509859ead68cf5308c8a28449))
+* allow exclusive legs on any hop of a route ([e3e82f9](https://github.com/propeller-heads/fynd/commit/e3e82f9afb6ba86b514bffae616e3537b91be5d0))
+
+### Bug Fixes
+
+* **deps:** resolve rustls advisories RUSTSEC-2026-0346 to 0349 ([9e0954c](https://github.com/propeller-heads/fynd/commit/9e0954cf1b4d531976286aa046671fc9da82abad))
+* **core:** log the worker pool when the algorithm returns an invalid route ([febd093](https://github.com/propeller-heads/fynd/commit/febd093c070816d9ff46e6b20e5d55a9486881e4))
+
+
 ## [0.112.2](https://github.com/propeller-heads/fynd/compare/0.112.1...0.112.2) (2026-10-14)
 
 ### Features

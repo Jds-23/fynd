@@ -30,7 +30,7 @@ use crate::{
         router_fees::{FeeRates, RouterFees, SharedRouterFees},
     },
     fallback::user_data::fallback_user_data,
-    EncodingOptions, FeeBreakdown, OrderQuote, QuoteStatus, SolveError, Transaction,
+    EncodingOptions, FeeBreakdown, OrderQuote, QuoteStatus, Route, SolveError, Transaction,
 };
 
 /// Canonical Permit2 contract address — identical on all EVM chains.
@@ -454,7 +454,10 @@ impl Encoder {
             None => {
                 // Fail fast rather than emit on-chain-invalid unsigned calldata for an
                 // exclusive leg: an exclusive route requires a signature.
-                if has_exclusive_leg(quote) {
+                if quote
+                    .route()
+                    .is_some_and(Route::has_exclusive_leg)
+                {
                     return Err(SolveError::FailedEncoding(
                         "quote routes through an exclusive pool but no signing key is \
                          configured (set EXCLUSIVE_SWAP_CONTROLLER_KEY)"
@@ -1037,17 +1040,6 @@ impl From<EncodingError> for SolveError {
     fn from(err: EncodingError) -> Self {
         SolveError::FailedEncoding(err.to_string())
     }
-}
-
-/// Returns whether the quote routes through an exclusive component, i.e. any swap in its route
-/// carries a committed amount.
-fn has_exclusive_leg(quote: &OrderQuote) -> bool {
-    quote.route().is_some_and(|route| {
-        route
-            .swaps()
-            .iter()
-            .any(|s| s.committed_amount_out().is_some())
-    })
 }
 
 #[cfg(test)]

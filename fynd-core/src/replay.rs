@@ -10,7 +10,10 @@
 use std::collections::HashMap;
 
 use num_bigint::BigUint;
-use tycho_simulation::tycho_common::{models::Address, simulation::protocol_sim::ProtocolSim};
+use tycho_simulation::tycho_common::{
+    models::{token::Token, Address},
+    simulation::protocol_sim::ProtocolSim,
+};
 
 use crate::{
     algorithm::{sim_guard::GuardedProtocolSim, split_primitives::split_amount},
@@ -66,7 +69,7 @@ pub enum ReplayError {
 /// Returns [`ReplayError`] when a pool's simulation state or a token is missing from `market`,
 /// or a pool simulation fails.
 pub fn replay_route(route: &Route, market: &MarketState) -> Result<RouteReplay, ReplayError> {
-    let swaps = route.swaps();
+    let swaps: Vec<&Swap> = route.swaps().iter().collect();
     let (Some(input_token), Some(output_token)) = (route.input_token(), route.output_token())
     else {
         return Err(ReplayError::EmptyRoute);
@@ -74,24 +77,77 @@ pub fn replay_route(route: &Route, market: &MarketState) -> Result<RouteReplay, 
     let total_in: BigUint = swaps
         .iter()
         .filter(|swap| *swap.token_in() == input_token)
-        .map(Swap::amount_in)
+        .map(|swap| swap.amount_in())
         .sum();
 
+    let simulated = simulate_swaps(
+        &swaps,
+        &SimulationEnds {
+            input_token: &input_token,
+            output_token: &output_token,
+            total_in: &total_in,
+        },
+        |address| market.get_token(address),
+        |swap| market.get_simulation_state(swap.component_id()),
+    )?;
+    Ok(RouteReplay { amount_out: simulated.amount_out, gas: simulated.gas })
+}
+
+/// The amounts and gas of one simulated swap.
+#[derive(Debug, Clone)]
+pub(crate) struct SimulatedSwap {
+    /// Amount of the swap's input token that the swap took.
+    pub(crate) amount_in: BigUint,
+    /// Amount of the swap's output token that the swap produced.
+    pub(crate) amount_out: BigUint,
+    /// Gas estimate the simulation reported for the swap.
+    pub(crate) gas: BigUint,
+}
+
+/// The simulated swaps, total amount out, and total gas returned by [`simulate_swaps`].
+#[derive(Debug, Clone)]
+pub(crate) struct SimulatedRoute {
+    /// One entry per swap, in the order passed to [`simulate_swaps`].
+    pub(crate) swaps: Vec<SimulatedSwap>,
+    /// Amount of the route's output token produced.
+    pub(crate) amount_out: BigUint,
+    /// Sum of the per-swap gas estimates reported by the simulations.
+    pub(crate) gas: BigUint,
+}
+
+/// The tokens a simulation starts and ends on, and the amount it starts with.
+pub(crate) struct SimulationEnds<'a> {
+    /// The token the route starts with.
+    pub(crate) input_token: &'a Address,
+    /// The token the route ends with.
+    pub(crate) output_token: &'a Address,
+    /// Amount of `input_token` the route starts with.
+    pub(crate) total_in: &'a BigUint,
+}
+
+/// Runs `swaps` in the given order, which must be topological, with the split rules of
+/// [`replay_route`]. `get_token` and `get_state` say where a swap reads its tokens and its
+/// simulation state. When two swaps share a pool, the second uses the first swap's post-swap state.
+pub(crate) fn simulate_swaps<'a>(
+    swaps: &[&'a Swap],
+    ends: &SimulationEnds<'_>,
+    get_token: impl Fn(&Address) -> Option<&'a Token>,
+    get_state: impl Fn(&'a Swap) -> Option<&'a dyn ProtocolSim>,
+) -> Result<SimulatedRoute, ReplayError> {
     // Collected balance per token. A token's balance is complete before its first consuming swap
     // runs (topological order), and `branch_totals` snapshots it at that moment: positive splits
     // are fractions of that total, not of the running remainder.
     let mut available: HashMap<Address, BigUint> = HashMap::new();
-    available.insert(input_token, total_in);
+    available.insert(ends.input_token.clone(), ends.total_in.clone());
     let mut branch_totals: HashMap<Address, BigUint> = HashMap::new();
     let mut post_swap: HashMap<ComponentId, Box<dyn ProtocolSim>> = HashMap::new();
     let mut total_gas = BigUint::ZERO;
+    let mut simulated = Vec::with_capacity(swaps.len());
 
-    for swap in swaps {
-        let token_in = market
-            .get_token(swap.token_in())
+    for &swap in swaps {
+        let token_in = get_token(swap.token_in())
             .ok_or_else(|| ReplayError::MissingToken(swap.token_in().clone()))?;
-        let token_out = market
-            .get_token(swap.token_out())
+        let token_out = get_token(swap.token_out())
             .ok_or_else(|| ReplayError::MissingToken(swap.token_out().clone()))?;
 
         let branch_total = branch_totals
@@ -119,10 +175,10 @@ pub fn replay_route(route: &Route, market: &MarketState) -> Result<RouteReplay, 
         let sim = post_swap
             .get(swap.component_id())
             .map(|state| state.as_ref())
-            .or_else(|| market.get_simulation_state(swap.component_id()))
+            .or_else(|| get_state(swap))
             .ok_or_else(|| ReplayError::MissingState(swap.component_id().to_string()))?;
         let result = sim
-            .get_amount_out_guarded(amount_in, token_in, token_out)
+            .get_amount_out_guarded(amount_in.clone(), token_in, token_out)
             .map_err(|e| ReplayError::Simulation {
                 component_id: swap.component_id().to_string(),
                 error: e.to_string(),
@@ -132,13 +188,14 @@ pub fn replay_route(route: &Route, market: &MarketState) -> Result<RouteReplay, 
         *available
             .entry(swap.token_out().clone())
             .or_default() += &result.amount;
+        simulated.push(SimulatedSwap { amount_in, amount_out: result.amount, gas: result.gas });
         post_swap.insert(swap.component_id().to_string(), result.new_state);
     }
 
     let amount_out = available
-        .remove(&output_token)
+        .remove(ends.output_token)
         .unwrap_or_default();
-    Ok(RouteReplay { amount_out, gas: total_gas })
+    Ok(SimulatedRoute { swaps: simulated, amount_out, gas: total_gas })
 }
 
 #[cfg(test)]

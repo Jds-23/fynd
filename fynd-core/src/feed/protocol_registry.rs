@@ -44,7 +44,9 @@ use tycho_simulation::{
         protocols::{
             bebop::{client_builder::BebopClientBuilder, state::BebopState},
             hashflow::{client_builder::HashflowClientBuilder, state::HashflowState},
+            liquorice::{client_builder::LiquoriceClientBuilder, state::LiquoriceState},
             metric::{client_builder::MetricClientBuilder, state::MetricState},
+            native::{client_builder::NativeClientBuilder, state::NativeState},
         },
         stream::RFQStreamBuilder,
     },
@@ -72,6 +74,19 @@ const PRICE_LEVEL_STREAM_PREFIX: &str = "pricelevelstream:";
 /// Marks a protocol served from an RFQ client rather than from Tycho, e.g. `rfq:bebop`: both its
 /// `--protocols` entry and the protocol system of the components the client streams.
 pub(crate) const RFQ_PREFIX: &str = "rfq:";
+
+/// Removes the `fallback:` prefix from `protocol_system`, if it has one.
+pub(crate) fn strip_fallback_prefix(protocol_system: &str) -> &str {
+    protocol_system
+        .strip_prefix(FALLBACK_PREFIX)
+        .unwrap_or(protocol_system)
+}
+
+/// Whether `protocol_system` is an RFQ protocol, through its own executor (`rfq:`) or its
+/// fallback router (`fallback:rfq:`).
+pub(crate) fn is_rfq_protocol(protocol_system: &str) -> bool {
+    strip_fallback_prefix(protocol_system).starts_with(RFQ_PREFIX)
+}
 
 /// Marks a `--protocols` entry that drops a protocol system from the list rather than adding one,
 /// e.g. `exclude:vm:fermiswap`.
@@ -604,6 +619,31 @@ pub(crate) fn register_rfq(
                 rfq_stream_builder =
                     rfq_stream_builder.add_client::<MetricState>("metric", Box::new(metric_client));
             }
+            "rfq:native" => {
+                require_executor(chain, protocol)?;
+                let api_key = get_env("NATIVE_API_KEY")?;
+                info!("Adding {protocol} RFQ client...");
+                let native_client = NativeClientBuilder::new(chain, api_key)
+                    .tokens(rfq_tokens.clone())
+                    .tvl_threshold(min_tvl)
+                    .build()
+                    .map_err(|e| DataFeedError::StreamError(e.to_string()))?;
+                rfq_stream_builder =
+                    rfq_stream_builder.add_client::<NativeState>("native", Box::new(native_client));
+            }
+            "rfq:liquorice" => {
+                require_executor(chain, protocol)?;
+                let user = get_env("LIQUORICE_USER")?;
+                let key = get_env("LIQUORICE_KEY")?;
+                info!("Adding {protocol} RFQ client...");
+                let liquorice_client = LiquoriceClientBuilder::new(chain, user, key)
+                    .tokens(rfq_tokens.clone())
+                    .tvl_threshold(min_tvl)
+                    .build()
+                    .map_err(|e| DataFeedError::StreamError(e.to_string()))?;
+                rfq_stream_builder = rfq_stream_builder
+                    .add_client::<LiquoriceState>("liquorice", Box::new(liquorice_client));
+            }
             _ => {
                 warn!("Skipping unknown RFQ protocol: {}", protocol);
             }
@@ -847,9 +887,19 @@ fn get_env(var: &str) -> Result<String, DataFeedError> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use rstest::rstest;
     use tycho_simulation::price_level_stream::config::PRICE_LEVEL_STREAM_FAMILY;
 
     use super::*;
+
+    #[rstest]
+    #[case::rfq("rfq:bebop", true)]
+    #[case::rfq_via_fallback_router("fallback:rfq:bebop", true)]
+    #[case::pamm("fallback:tycho_pamm", false)]
+    #[case::onchain("uniswap_v2", false)]
+    fn test_is_rfq_protocol(#[case] protocol_system: &str, #[case] expected: bool) {
+        assert_eq!(is_rfq_protocol(protocol_system), expected);
+    }
 
     /// A writer that keeps every byte a subscriber formats, so a test can assert on the
     /// rendered log lines.
@@ -1346,6 +1396,22 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("fallback:rfq:hashflow has no executor on base"),
+            "got {err}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::native_off_executor_chains(Chain::Polygon, "rfq:native")]
+    #[case::native_via_fallback_router(Chain::Ethereum, "fallback:rfq:native")]
+    #[case::liquorice_off_ethereum(Chain::Base, "rfq:liquorice")]
+    #[case::liquorice_via_fallback_router(Chain::Ethereum, "fallback:rfq:liquorice")]
+    fn test_register_rfq_without_executor(#[case] chain: Chain, #[case] entry: &str) {
+        let Err(err) = register_rfq_entries(chain, &[entry]) else {
+            panic!("expected {entry} to be rejected on {chain}");
+        };
+        assert!(
+            err.to_string()
+                .contains(&format!("{entry} has no executor on {chain}")),
             "got {err}"
         );
     }

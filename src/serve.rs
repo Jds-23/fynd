@@ -128,6 +128,10 @@ fn create_metrics_exporter(host: &str, port: u16, chain: &str) -> tokio::task::J
         -1000.0, -500.0, -200.0, -100.0, -50.0, -25.0, -10.0, -5.0, -1.0, 0.0, 1.0, 5.0, 10.0,
         25.0, 50.0, 100.0, 200.0, 500.0, 1000.0,
     ];
+    // Gains are mostly small and positive, so use finer buckets below 100 bps.
+    const POST_PROCESSOR_GAIN_BPS_BUCKETS: &[f64] = &[
+        -100.0, -10.0, -1.0, 0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0,
+    ];
     // Shared by the estimated and the simulated gas, so the two quantiles read off the same
     // bounds. The top reaches past the longest routes the solver builds.
     const SIMULATION_GAS_BUCKETS: &[f64] = &[
@@ -162,6 +166,11 @@ fn create_metrics_exporter(host: &str, port: u16, chain: &str) -> tokio::task::J
         .set_buckets_for_metric(
             Matcher::Full("quote_simulation_deviation_bps".to_string()),
             SIMULATION_DEVIATION_BPS_BUCKETS,
+        )
+        .expect("static bucket list is non-empty")
+        .set_buckets_for_metric(
+            Matcher::Full("worker_pool_post_processor_gain_bps".to_string()),
+            POST_PROCESSOR_GAIN_BPS_BUCKETS,
         )
         .expect("static bucket list is non-empty")
         .set_buckets_for_metric(

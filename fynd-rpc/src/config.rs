@@ -45,6 +45,18 @@ timeout_ms = 500
 # max_hops = 2
 # timeout_ms = 500
 # exclude_protocols = ["fallback:"]
+
+# Example: a worker pool whose algorithm never routes through a protocol system, while its
+# post-processors still can. Entries match as in exclude_protocols.
+# algorithm_exclude_protocols differs from exclude_protocols only in a pool that lists
+# post_processors.
+# [pools.replacer_only]
+# algorithm = "bellman_ford"
+# num_workers = 3
+# max_hops = 2
+# timeout_ms = 500
+# algorithm_exclude_protocols = ["rfq:bebop"]
+# post_processors = ["rfq_swap_replacer"]
 "#;
 
 /// Worker pools configuration loaded from TOML file.
@@ -167,6 +179,7 @@ mod tests {
             max_routes = 50
             liquidity_scope = "include_exclusive"
             exclude_protocols = ["fallback:", "uniswap_v2"]
+            algorithm_exclude_protocols = ["rfq:bebop"]
             post_processors = ["rfq", "dedupe"]
         "#;
         let config: WorkerPoolsConfig = toml::from_str(toml).unwrap();
@@ -183,6 +196,7 @@ mod tests {
             pool.exclude_protocols(),
             Some(["fallback:".to_string(), "uniswap_v2".to_string()].as_slice())
         );
+        assert_eq!(pool.algorithm_exclude_protocols(), Some(["rfq:bebop".to_string()].as_slice()));
         assert_eq!(pool.post_processors(), ["rfq".to_string(), "dedupe".to_string()]);
     }
 
@@ -196,6 +210,7 @@ mod tests {
         let config: WorkerPoolsConfig = toml::from_str(toml).unwrap();
 
         assert_eq!(config.pools()["basic"].exclude_protocols(), None);
+        assert_eq!(config.pools()["basic"].algorithm_exclude_protocols(), None);
     }
 
     /// A config without `post_processors` parses and runs no post-processors.

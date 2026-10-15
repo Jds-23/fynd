@@ -46,13 +46,12 @@ use tycho_execution::encoding::{
     evm::gas_estimator::estimate_gas_usage,
     models::{Solution, Strategy},
 };
-use tycho_simulation::tycho_common::{models::Chain, Bytes};
+use tycho_simulation::tycho_common::Bytes;
 
 use crate::{
     bps,
     encoding::encoder::Encoder,
-    fallback::FALLBACK_PREFIX,
-    feed::{exclusivity::is_exclusive, protocol_registry::RFQ_PREFIX},
+    feed::{exclusivity::is_exclusive, protocol_registry::is_rfq_protocol},
     price_guard::guard::PriceGuard,
     simulation::simulator::QuoteSimulator,
     types::RouteRejection,
@@ -444,13 +443,10 @@ async fn encode_with_retries(
 /// (`fallback:rfq:bebop`): both fetch the maker's signed quote when encoded.
 fn has_rfq_leg(quote: &OrderQuote) -> bool {
     quote.route().is_some_and(|route| {
-        route.swaps().iter().any(|swap| {
-            let protocol = swap.protocol();
-            protocol
-                .strip_prefix(FALLBACK_PREFIX)
-                .unwrap_or(protocol)
-                .starts_with(RFQ_PREFIX)
-        })
+        route
+            .swaps()
+            .iter()
+            .any(|swap| is_rfq_protocol(swap.protocol()))
     })
 }
 
@@ -632,7 +628,6 @@ impl WorkerPoolRouter {
                         request.options(),
                         public_ranked,
                         *USER_IMPROVEMENT_SHARE_BPS,
-                        self.encoder.chain(),
                     )
                 } else {
                     self.rank_quotes(responses, request.options())
@@ -751,7 +746,7 @@ impl WorkerPoolRouter {
                 .map(|quote| async move {
                     if quote.status() == QuoteStatus::Success {
                         let result = simulator
-                            .simulate_attempt(quote)
+                            .simulate_attempt(quote, encoding_options.client_fee_params())
                             .await
                             .into_result();
                         quote.set_simulation_result(result);
@@ -1130,11 +1125,10 @@ impl WorkerPoolRouter {
 /// executes on exclusive liquidity at the public price.
 ///
 /// Per-leg attribution: the route's surplus over the committed amount (`realized − committed`)
-/// is deducted from the exclusive legs — each leg absorbs what it can, capped at its own output,
-/// in route order. Only exclusive legs can withhold output, so the whole
-/// surplus must come out of them; public branches pay out in full. If the exclusive legs cannot
-/// absorb all of it, the remainder is left with the user (who then receives more than the
-/// committed amount).
+/// is deducted from the exclusive legs — each leg absorbs what it can, capped at the route output
+/// it produces, in route order. Only exclusive legs can withhold output, so the whole surplus must
+/// come out of them; public branches pay out in full. If the exclusive legs cannot absorb all of
+/// it, the remainder is left with the user (who then receives more than the committed amount).
 ///
 /// Exact-in orders only: the commitment, both gates, and the surplus are all denominated in
 /// `amount_out`. Exact-out support would invert the logic — fixed output, commitment and surplus
@@ -1145,10 +1139,8 @@ fn combine_with_surplus(
     options: &QuoteOptions,
     public_ranked: Vec<OrderQuote>,
     user_share_bps: u32,
-    chain: Chain,
 ) -> Vec<OrderQuote> {
-    let Some(exclusive_candidate) =
-        best_exclusive_candidate(responses, pool_scopes, options, chain)
+    let Some(exclusive_candidate) = best_exclusive_candidate(responses, pool_scopes, options)
     else {
         return public_ranked;
     };
@@ -1200,13 +1192,17 @@ fn to_gas_token_amount(quote: &OrderQuote, amount: &BigUint) -> Option<BigUint> 
     Some(amount * gas_cost_wei / gas_cost_out)
 }
 
-/// Records the win and the settled volume of one quote the router returns, by pool and algorithm.
+/// Records the win and the settled volume of one quote the router returns, by pool, algorithm and
+/// post-processors.
 ///
 /// Counting wins alone hides size: a solver can win few orders and still settle most of the flow,
 /// or the reverse. Output-token base units do not add up across tokens, so the amount is converted
 /// to the gas token first, the same way `record_gas_token_amount` does it. A quote the conversion
 /// cannot price counts under `worker_router_unpriced_won_quotes_total` rather than recording zero
 /// volume, which would read as a solver that won nothing.
+///
+/// The `post_processed_by` label joins the names of the post-processors that replaced the route
+/// with `+`, in config order. It is `none` when no post-processor replaced the route.
 ///
 /// A quote that found no route has no winner to credit. So has a quote the router built itself,
 /// which is why an empty worker pool is skipped rather than counted under a placeholder label.
@@ -1216,10 +1212,15 @@ fn record_win(quote: &OrderQuote) {
     }
     let worker_pool = quote.worker_pool().to_string();
     let algorithm = quote.algorithm().to_string();
+    let post_processed_by = match quote.post_processed_by() {
+        [] => "none".to_string(),
+        names => names.join("+"),
+    };
     counter!(
         "worker_router_best_quote_pool",
         "pool" => worker_pool.clone(),
-        "algorithm" => algorithm.clone()
+        "algorithm" => algorithm.clone(),
+        "post_processed_by" => post_processed_by.clone()
     )
     .increment(1);
 
@@ -1228,13 +1229,19 @@ fn record_win(quote: &OrderQuote) {
         counter!(
             "worker_router_unpriced_won_quotes_total",
             "pool" => worker_pool,
-            "algorithm" => algorithm
+            "algorithm" => algorithm,
+            "post_processed_by" => post_processed_by
         )
         .increment(1);
         return;
     };
-    gauge!("worker_router_won_volume_gas_token", "pool" => worker_pool, "algorithm" => algorithm)
-        .increment(volume / WEI_PER_GAS_TOKEN);
+    gauge!(
+        "worker_router_won_volume_gas_token",
+        "pool" => worker_pool,
+        "algorithm" => algorithm,
+        "post_processed_by" => post_processed_by
+    )
+    .increment(volume / WEI_PER_GAS_TOKEN);
 }
 
 /// Records an output-token `amount` under `metric`, in whole gas tokens.
@@ -1265,7 +1272,6 @@ fn best_exclusive_candidate<'a>(
     responses: &'a OrderResponses,
     pool_scopes: &FxHashMap<String, LiquidityScope>,
     options: &QuoteOptions,
-    chain: Chain,
 ) -> Option<&'a OrderQuote> {
     responses
         .quotes
@@ -1278,7 +1284,7 @@ fn best_exclusive_candidate<'a>(
                 .map(|max| wq.quote.gas_estimate() <= max)
                 .unwrap_or(true)
         })
-        .filter(|wq| has_valid_exclusive_route(&wq.quote, chain))
+        .filter(|wq| has_valid_exclusive_route(&wq.quote))
         .max_by(|a, b| {
             a.quote
                 .amount_out_net_gas()
@@ -1322,7 +1328,8 @@ fn matched_commitment(
 }
 
 /// Returns the amount to commit if the public worker pools find no route. The amount is the
-/// candidate output minus `NO_PUBLIC_ROUTE_FEE_BPS` of the exclusive leg output.
+/// candidate output minus `NO_PUBLIC_ROUTE_FEE_BPS` of the route output the exclusive leg
+/// produces.
 ///
 /// The fee applies to the exclusive leg only, not to the whole route. The public market prices the
 /// public branches of a split route, so the protocol takes nothing from them.
@@ -1330,15 +1337,15 @@ fn matched_commitment(
 /// Returns `None` if the commitment does not cover the route gas, or if the route has no exclusive
 /// leg.
 fn default_fee_commitment(exclusive_candidate: &OrderQuote) -> Option<BigUint> {
-    let exclusive_leg_amount_out = exclusive_candidate
-        .route()?
-        .swaps()
+    let route = exclusive_candidate.route()?;
+    let swaps = route.swaps();
+    let leg = swaps
         .iter()
-        .find(|swap| is_exclusive(swap.protocol_component()))?
-        .amount_out();
+        .find(|swap| is_exclusive(swap.protocol_component()))?;
+    let (numerator, denominator) = leg_route_output(swaps, leg, &route.output_token()?)?;
 
     let realized_amount_out = exclusive_candidate.amount_out();
-    let fee = bps::scale_truncating(exclusive_leg_amount_out, NO_PUBLIC_ROUTE_FEE_BPS);
+    let fee = bps::scale_truncating(&(numerator / denominator), NO_PUBLIC_ROUTE_FEE_BPS);
     let committed_amount_out = realized_amount_out - fee;
 
     let gas_cost = realized_amount_out - exclusive_candidate.amount_out_net_gas();
@@ -1361,50 +1368,47 @@ fn pin_commitment(exclusive_candidate: &OrderQuote, committed_amount_out: BigUin
 
     let mut surplus_quote = exclusive_candidate.clone();
 
-    // Final output of each swap's path, walked backwards (a path's terminal output propagates
-    // to its chained predecessors). Converting captured surplus into a leg's token needs the
-    // realized downstream price `path_final_out / leg_out`; for terminal legs the ratio is 1.
-    let path_final_outs: Vec<BigUint> = surplus_quote
+    // Route output each exclusive leg produces, read before the swaps are borrowed mutably.
+    let leg_route_outputs: Vec<Option<(BigUint, BigUint)>> = surplus_quote
         .route()
         .map(|route| {
             let swaps = route.swaps();
-            let mut finals = vec![BigUint::ZERO; swaps.len()];
-            let mut current_final = BigUint::ZERO;
-            for i in (0..swaps.len()).rev() {
-                let is_terminal =
-                    i == swaps.len() - 1 || swaps[i + 1].token_in() != swaps[i].token_out();
-                if is_terminal {
-                    current_final = swaps[i].amount_out().clone();
-                }
-                finals[i] = current_final.clone();
-            }
-            finals
+            let output_token = route.output_token();
+            swaps
+                .iter()
+                .map(|swap| {
+                    let output_token = output_token.as_ref()?;
+                    if !is_exclusive(swap.protocol_component()) {
+                        return None;
+                    }
+                    leg_route_output(swaps, swap, output_token)
+                })
+                .collect()
         })
         .unwrap_or_default();
 
     if let Some(route) = surplus_quote.route_mut() {
         // Capture the route's surplus at the exclusive legs.
-        // Each leg absorbs up to its path's capacity; any remainder is left with the user.
+        // Each leg absorbs up to the route output it produces; any remainder is left with the
+        // user.
         let mut surplus = exclusive_route_amount_out - &committed_amount_out;
         for (i, swap) in route.swaps_mut().iter_mut().enumerate() {
             if is_exclusive(swap.protocol_component()) {
-                let Some(path_final_out) = path_final_outs.get(i) else {
+                let Some(Some((numerator, denominator))) = leg_route_outputs.get(i) else {
                     continue;
                 };
+                if *numerator == BigUint::ZERO {
+                    continue;
+                }
                 let captured = surplus
                     .clone()
-                    .min(path_final_out.clone());
-                // Convert into the leg's own token, rounding down so any error is taken
-                // from the protocol, not the user. Today the leg is always the last hop of
-                // its path (validator), so path_final_out equals the leg's output and this
-                // divides by itself — a plain subtraction. Once mid-path legs are allowed,
-                // the "user gets at least the committed amount" guarantee also requires the
-                // components after the leg to have diminishing returns.
-                let captured_leg = if *path_final_out == BigUint::ZERO {
-                    BigUint::ZERO
-                } else {
-                    &captured * swap.amount_out() / path_final_out
-                };
+                    .min(numerator / denominator);
+                // Convert into the leg's own token at the average price of the pools after the
+                // leg, rounding down so any error is taken from the protocol, not the user. The
+                // user gets at least the committed amount when those pools give less per unit
+                // as their input grows. A leg that outputs the route's output token converts at
+                // a price of exactly 1.
+                let captured_leg = &captured * swap.amount_out() * denominator / numerator;
                 debug_assert!(
                     captured_leg <= *swap.amount_out(),
                     "captured amount ({captured_leg}) must not exceed the leg's output ({})",
@@ -1428,78 +1432,112 @@ fn pin_commitment(exclusive_candidate: &OrderQuote, committed_amount_out: BigUin
     surplus_quote.with_surplus(surplus_info)
 }
 
-/// Returns `true` only for routes carrying exactly one exclusive leg that produces the route's
-/// output token, either itself or through a single native wrap leg.
+/// Returns `true` only for routes carrying exactly one exclusive leg whose output reaches the
+/// route's output token. The leg can sit at any hop, on any branch of a split route.
 ///
-/// Returns `false` for routes with no exclusive leg, more than one exclusive leg, an empty route,
-/// no route at all, or an exclusive leg whose output reaches the route's output token any other
-/// way.
+/// Returns `false` for routes with no exclusive leg, more than one exclusive leg, no route at all,
+/// a leg whose output no swap carries to the route's output token, or swaps after the leg that
+/// loop back to a token already on their path.
 ///
-/// The single-leg constraint is a v1 restriction that keeps per-leg surplus attribution
-/// unambiguous: multiple exclusive legs make the per-component attribution non-unique.
-///
-/// A trailing wrap leg is allowed because it converts 1:1, so it needs no inverse simulation.
-/// `pin_commitment` converts captured surplus into a leg's token with the ratio
-/// `path_final_out / leg_out`, which a wrap leaves at exactly 1 — the same arithmetic a terminal
-/// leg gets. Without this a pool quoting the native token could never serve a request for the
-/// wrapped token, even though tycho streams the wrap as an ordinary component.
-fn has_valid_exclusive_route(quote: &OrderQuote, chain: Chain) -> bool {
+/// The single-leg constraint keeps per-leg surplus attribution unambiguous: multiple exclusive
+/// legs make the per-component attribution non-unique.
+fn has_valid_exclusive_route(quote: &OrderQuote) -> bool {
     let Some(route) = quote.route() else {
         return false;
     };
-
-    let swaps = route.swaps();
-    if swaps.is_empty() {
-        return false;
-    }
-
     let Some(output_token) = route.output_token() else {
         return false;
     };
 
-    let mut exclusive_count = 0;
-
-    for (index, swap) in swaps.iter().enumerate() {
-        if !is_exclusive(swap.protocol_component()) {
-            continue;
-        }
-
-        // Only the immediately following leg is considered: a wrap run that ends at the output
-        // token is always a single leg, and requiring adjacency keeps this validator in step with
-        // the chaining rule `pin_commitment` uses to find a path's final output.
-        let reaches_output = *swap.token_out() == output_token ||
-            swaps
-                .get(index + 1)
-                .is_some_and(|next| {
-                    next.token_in() == swap.token_out() &&
-                        next.token_out() == &output_token &&
-                        is_native_wrap(next, chain)
-                });
-        if !reaches_output {
-            counter!("exclusive_route_invalid_shape_total").increment(1);
-            return false;
-        }
-        exclusive_count += 1;
-    }
-
-    exclusive_count == 1
-}
-
-/// Returns `true` when the leg converts between the native token and its wrapped form, which tycho
-/// streams as a 1:1 component.
-///
-/// An unregistered custom chain, or one with no wrapper contract, resolves no wrap pair, so no leg
-/// qualifies and the exclusive leg must be terminal.
-fn is_native_wrap(swap: &Swap, chain: Chain) -> bool {
-    let (Ok(native), Ok(Some(wrapped))) =
-        (chain.try_native_token(), chain.try_wrapped_native_token())
-    else {
+    let swaps = route.swaps();
+    let mut exclusive_legs = swaps
+        .iter()
+        .filter(|swap| is_exclusive(swap.protocol_component()));
+    let Some(leg) = exclusive_legs.next() else {
         return false;
     };
+    if exclusive_legs.next().is_some() {
+        counter!("exclusive_route_multiple_legs_total").increment(1);
+        return false;
+    }
 
-    let (token_in, token_out) = (swap.token_in(), swap.token_out());
-    (*token_in == native.address && *token_out == wrapped.address) ||
-        (*token_in == wrapped.address && *token_out == native.address)
+    let reaches_output = leg_route_output(swaps, leg, &output_token)
+        .is_some_and(|(numerator, _)| numerator > BigUint::ZERO);
+    if !reaches_output {
+        counter!("exclusive_route_does_not_reach_output_total").increment(1);
+    }
+    reaches_output
+}
+
+/// Returns the route output that `leg`'s output produces, as the fraction
+/// `(numerator, denominator)`.
+///
+/// A leg that outputs `output_token` produces its own output. Otherwise the leg gets the share of
+/// its token's route output that its output makes up of all that the later swaps take of the
+/// token. This is the average price of the pools after the leg. Returns `None` when the swaps after
+/// the leg loop back to a token already on their path.
+fn leg_route_output(
+    swaps: &[Swap],
+    leg: &Swap,
+    output_token: &Bytes,
+) -> Option<(BigUint, BigUint)> {
+    if leg.token_out() == output_token {
+        return Some((leg.amount_out().clone(), BigUint::from(1u8)));
+    }
+    let consumed = consumed_amount(swaps, leg.token_out());
+    if consumed == BigUint::ZERO {
+        return Some((BigUint::ZERO, BigUint::from(1u8)));
+    }
+    let (numerator, denominator) =
+        token_route_output(swaps, leg.token_out(), output_token, &mut Vec::new())?;
+    Some((leg.amount_out() * numerator, denominator * consumed))
+}
+
+/// Returns the route output that the swaps taking `token` produce from it, as the fraction
+/// `(numerator, denominator)`, or `None` if they loop back to a token in `path`.
+fn token_route_output(
+    swaps: &[Swap],
+    token: &Bytes,
+    output_token: &Bytes,
+    path: &mut Vec<Bytes>,
+) -> Option<(BigUint, BigUint)> {
+    if path.contains(token) {
+        return None;
+    }
+    path.push(token.clone());
+
+    let mut numerator = BigUint::ZERO;
+    let mut denominator = BigUint::from(1u8);
+    for swap in swaps
+        .iter()
+        .filter(|swap| swap.token_in() == token)
+    {
+        let (swap_numerator, swap_denominator) = if swap.token_out() == output_token {
+            (swap.amount_out().clone(), BigUint::from(1u8))
+        } else {
+            let consumed = consumed_amount(swaps, swap.token_out());
+            let (next_numerator, next_denominator) =
+                token_route_output(swaps, swap.token_out(), output_token, path)?;
+            (swap.amount_out() * next_numerator, next_denominator * consumed)
+        };
+        if swap_numerator == BigUint::ZERO {
+            continue;
+        }
+        numerator = numerator * &swap_denominator + swap_numerator * &denominator;
+        denominator *= swap_denominator;
+    }
+
+    path.pop();
+    Some((numerator, denominator))
+}
+
+/// Returns how much of `token` the route's swaps take in.
+fn consumed_amount(swaps: &[Swap], token: &Bytes) -> BigUint {
+    swaps
+        .iter()
+        .filter(|swap| swap.token_in() == token)
+        .map(|swap| swap.amount_in())
+        .sum()
 }
 
 /// Shared-graph facts beat path-specific reasons (most specific first: amount-too-small and a
@@ -2901,7 +2939,6 @@ mod tests {
             &QuoteOptions::default(),
             vec![public_ranked],
             1_000,
-            SimChain::Ethereum,
         );
 
         // The head is what the caller receives, so it is what attribution must credit. The public
@@ -3460,7 +3497,6 @@ mod tests {
             &QuoteOptions::default(),
             public_ranked,
             user_share_bps,
-            SimChain::Ethereum,
         );
 
         let expected_surplus = expected_surplus.map(BigUint::from);
@@ -3481,8 +3517,8 @@ mod tests {
         make_exclusive_quote(1100).order().clone(),
         Some(50_000)
     )]
-    #[case::mid_route_exclusive_leg(
-        make_route_quote(&[("vm:exclusive", 0x01, 0x02), ("uniswap_v2", 0x02, 0x03)]),
+    #[case::two_exclusive_legs(
+        make_route_quote(&[("vm:exclusive", 0x01, 0x02), ("vm:exclusive", 0x02, 0x03)]),
         None
     )]
     fn test_combine_filters_exclusive_candidate(
@@ -3515,7 +3551,6 @@ mod tests {
             &options,
             public_ranked,
             1_000,
-            SimChain::Ethereum,
         );
 
         assert_eq!(combined.len(), 1);
@@ -3568,7 +3603,6 @@ mod tests {
             &QuoteOptions::default(),
             vec![no_route_quote()],
             1_000,
-            SimChain::Ethereum,
         );
 
         assert_eq!(combined.len(), 2);
@@ -3609,7 +3643,6 @@ mod tests {
             &QuoteOptions::default(),
             vec![no_route_quote()],
             1_000,
-            SimChain::Ethereum,
         );
 
         assert_eq!(*combined[0].amount_out(), BigUint::from(1_099_750u64));
@@ -3648,7 +3681,6 @@ mod tests {
             &QuoteOptions::default(),
             vec![no_route_quote()],
             1_000,
-            SimChain::Ethereum,
         );
 
         assert_eq!(combined.len(), 1);
@@ -3667,7 +3699,6 @@ mod tests {
             &QuoteOptions::default(),
             public_ranked,
             1_000,
-            SimChain::Ethereum,
         );
 
         let surplus_quote = &combined[0];
@@ -3716,7 +3747,6 @@ mod tests {
             &QuoteOptions::default(),
             public_ranked,
             1_000,
-            SimChain::Ethereum,
         );
 
         let route = combined[0]
@@ -3774,7 +3804,6 @@ mod tests {
             &QuoteOptions::default(),
             public_ranked,
             1_000,
-            SimChain::Ethereum,
         );
 
         assert_eq!(*combined[0].amount_out(), BigUint::from(1010u64));
@@ -3798,6 +3827,153 @@ mod tests {
             .find(|s| is_exclusive(s.protocol_component()))
             .expect("should have an exclusive swap");
         assert_eq!(exclusive_leg.committed_amount_out(), Some(&BigUint::from(410u64)));
+    }
+
+    /// Committed amount of the route's exclusive leg.
+    fn exclusive_leg_commitment(quote: &OrderQuote) -> Option<BigUint> {
+        quote
+            .route()
+            .expect("surplus quote should have a route")
+            .swaps()
+            .iter()
+            .find(|s| is_exclusive(s.protocol_component()))
+            .expect("should have an exclusive swap")
+            .committed_amount_out()
+            .cloned()
+    }
+
+    /// The exclusive leg (0x01 -> 0x02) outputs 1_000_000 of 0x02, which the pools after it turn
+    /// into 900_000 of the output token 0x03: an average price of 0.9. Against a public 880_000
+    /// with no user share, the 20_000 surplus converts to 20_000 / 0.9 = 22_222 of 0x02 (rounded
+    /// down), so the leg commits 977_778.
+    #[rstest]
+    #[case::first_hop(
+        &[("vm:exclusive", 0x01, 0x02, 1000, 1_000_000), ("uniswap_v2", 0x02, 0x03, 1_000_000, 900_000)],
+        900_000,
+    )]
+    #[case::before_split(
+        &[
+            ("vm:exclusive", 0x01, 0x02, 1000, 1_000_000),
+            ("uniswap_v2", 0x02, 0x03, 500_000, 450_000),
+            ("curve", 0x02, 0x03, 500_000, 450_000),
+        ],
+        900_000,
+    )]
+    // 0x02 also arrives through 0x01 -> 0x04 -> 0x02. The leg supplies half of the 2_000_000 the
+    // last pool takes, so it produces half of the pool's 1_800_000.
+    #[case::feeding_merge(
+        &[
+            ("vm:exclusive", 0x01, 0x02, 500, 1_000_000),
+            ("uniswap_v2", 0x01, 0x04, 500, 1_000_000),
+            ("uniswap_v2", 0x04, 0x02, 1_000_000, 1_000_000),
+            ("curve", 0x02, 0x03, 2_000_000, 1_800_000),
+        ],
+        1_800_000,
+    )]
+    fn test_combine_exclusive_leg_before_other_pools(
+        #[case] legs: &[(&str, u8, u8, u64, u64)],
+        #[case] route_amount_out: u64,
+    ) {
+        let public_amount_out = route_amount_out - 20_000;
+        let responses = OrderResponses {
+            order_id: "test-order".to_string(),
+            quotes: vec![
+                worker_quote((
+                    "public_pool".to_string(),
+                    make_public_quote_zero_gas(public_amount_out)
+                        .order()
+                        .clone(),
+                )),
+                worker_quote((
+                    "exclusive_access_pool".to_string(),
+                    make_priced_route_quote(legs, route_amount_out),
+                )),
+            ],
+            failed_solvers: vec![],
+        };
+        let public_ranked = vec![make_public_quote_zero_gas(public_amount_out)
+            .order()
+            .clone()];
+        let combined = combine_with_surplus(
+            &responses,
+            &exclusive_access_pool_scopes(),
+            &QuoteOptions::default(),
+            public_ranked,
+            0,
+        );
+
+        assert_eq!(*combined[0].amount_out(), BigUint::from(public_amount_out));
+        assert_eq!(combined[0].surplus_amount(), Some(&BigUint::from(20_000u64)));
+        assert_eq!(exclusive_leg_commitment(&combined[0]), Some(BigUint::from(977_778u64)));
+    }
+
+    /// A thin Uniswap V2 pool follows the exclusive leg, so a smaller input gets a better price.
+    /// Re-running the pool on the leg's committed amount must give the user at least the
+    /// committed route output.
+    #[test]
+    fn test_pin_commitment_thin_pool_after_exclusive_leg() {
+        use alloy::primitives::U256;
+        use tycho_simulation::{
+            evm::protocol::uniswap_v2::state::UniswapV2State,
+            tycho_common::simulation::protocol_sim::ProtocolSim,
+        };
+
+        use crate::algorithm::test_utils::token_with_decimals;
+
+        let leg_token = token_with_decimals(0x02, "MID", 18);
+        let output_token = token_with_decimals(0x03, "OUT", 18);
+        let thin_pool = UniswapV2State::new(U256::from(2_000_000u64), U256::from(2_000_000u64));
+        let leg_amount_out = BigUint::from(1_000_000u64);
+        let route_amount_out = thin_pool
+            .get_amount_out(leg_amount_out.clone(), &leg_token, &output_token)
+            .expect("thin pool should quote the leg's output")
+            .amount
+            .to_u64()
+            .expect("route output fits in u64");
+        let quote = make_priced_route_quote(
+            &[
+                ("vm:exclusive", 0x01, 0x02, 1000, 1_000_000),
+                ("uniswap_v2", 0x02, 0x03, 1_000_000, route_amount_out),
+            ],
+            route_amount_out,
+        );
+        let committed_amount_out = BigUint::from(route_amount_out - route_amount_out / 100);
+
+        let pinned = pin_commitment(&quote, committed_amount_out.clone());
+
+        let committed_leg = exclusive_leg_commitment(&pinned).expect("leg should be committed");
+        let user_amount_out = thin_pool
+            .get_amount_out(committed_leg, &leg_token, &output_token)
+            .expect("thin pool should quote the committed amount")
+            .amount;
+        assert!(
+            user_amount_out >= committed_amount_out,
+            "user gets {user_amount_out}, below the committed {committed_amount_out}",
+        );
+    }
+
+    #[test]
+    fn test_combine_no_public_route_first_hop_exclusive_leg() {
+        // The fee is 5 bps of the 900_000 the leg produces in the output token (450), not of the
+        // leg's own 1_000_000. In the leg's token that is 450 / 0.9 = 500.
+        let responses = no_public_route_responses(make_priced_route_quote(
+            &[
+                ("vm:exclusive", 0x01, 0x02, 1000, 1_000_000),
+                ("uniswap_v2", 0x02, 0x03, 1_000_000, 900_000),
+            ],
+            900_000,
+        ));
+        let combined = combine_with_surplus(
+            &responses,
+            &exclusive_access_pool_scopes(),
+            &QuoteOptions::default(),
+            vec![no_route_quote()],
+            1_000,
+        );
+
+        assert_eq!(*combined[0].amount_out(), BigUint::from(899_550u64));
+        assert_eq!(combined[0].surplus_amount(), Some(&BigUint::from(450u64)));
+        assert_eq!(exclusive_leg_commitment(&combined[0]), Some(BigUint::from(999_500u64)));
     }
 
     /// Builds an `OrderResponses` where both quotes carry explicit `amount_out_net_gas`.
@@ -3830,16 +4006,37 @@ mod tests {
     /// Builds a Success quote whose route has one swap per `(protocol_system, token_in, token_out)`
     /// leg, for exercising `has_valid_exclusive_route` on multi-leg and multi-path route shapes.
     fn make_route_quote(legs: &[(&str, u8, u8)]) -> OrderQuote {
-        let legs: Vec<(&str, Address, Address)> = legs
+        let legs: Vec<(&str, u8, u8, u64, u64)> = legs
             .iter()
             .map(|(protocol_system, token_in, token_out)| {
-                (*protocol_system, make_address(*token_in), make_address(*token_out))
+                (*protocol_system, *token_in, *token_out, 1000, 1000)
             })
             .collect();
-        make_route_quote_for_tokens(&legs)
+        make_priced_route_quote(&legs, 1000)
     }
 
-    fn make_route_quote_for_tokens(legs: &[(&str, Address, Address)]) -> OrderQuote {
+    /// Builds a zero-gas Success quote whose route has one swap per
+    /// `(protocol_system, token_in, token_out, amount_in, amount_out)` leg.
+    fn make_priced_route_quote(legs: &[(&str, u8, u8, u64, u64)], amount_out: u64) -> OrderQuote {
+        let legs: Vec<(&str, Address, Address, u64, u64)> = legs
+            .iter()
+            .map(|(protocol_system, token_in, token_out, leg_in, leg_out)| {
+                (
+                    *protocol_system,
+                    make_address(*token_in),
+                    make_address(*token_out),
+                    *leg_in,
+                    *leg_out,
+                )
+            })
+            .collect();
+        make_route_quote_for_tokens(&legs, amount_out)
+    }
+
+    fn make_route_quote_for_tokens(
+        legs: &[(&str, Address, Address, u64, u64)],
+        amount_out: u64,
+    ) -> OrderQuote {
         let make_token = |addr: &Address| Token {
             address: addr.clone(),
             symbol: "T".to_string(),
@@ -3851,7 +4048,7 @@ mod tests {
         };
         let mut tokens = FxHashMap::default();
         let mut swaps = Vec::new();
-        for (protocol_system, tin, tout) in legs {
+        for (protocol_system, tin, tout, leg_in, leg_out) in legs {
             let (tin, tout) = (tin.clone(), tout.clone());
             let tin_token = make_token(&tin);
             let tout_token = make_token(&tout);
@@ -3868,8 +4065,8 @@ mod tests {
                 protocol_system.to_string(),
                 tin.clone(),
                 tout.clone(),
-                BigUint::from(1000u64),
-                BigUint::from(1000u64),
+                BigUint::from(*leg_in),
+                BigUint::from(*leg_out),
                 BigUint::from(50_000u64),
                 comp,
                 Box::new(MockProtocolSim::default()),
@@ -3881,9 +4078,9 @@ mod tests {
             "test-order".to_string(),
             QuoteStatus::Success,
             BigUint::from(1000u64),
-            BigUint::from(1000u64),
+            BigUint::from(amount_out),
             BigUint::from(100_000u64),
-            BigUint::from(1000u64),
+            BigUint::from(amount_out),
             BlockInfo::new(1, "0x123".to_string(), 1000),
             "test".to_string(),
             Bytes::from(make_address(0xAA).as_ref()),
@@ -3893,12 +4090,27 @@ mod tests {
         .with_route(Route::new(swaps, tokens).expect("non-empty route"))
     }
 
-    /// Route-shape validation: exactly one exclusive leg, terminal in its path.
+    /// Route-shape validation: exactly one exclusive leg, whose output reaches the output token.
     #[rstest]
     #[case::terminal_exclusive_leg(
         &[("uniswap_v2", 0x01, 0x02), ("vm:exclusive", 0x02, 0x03)], true)]
-    #[case::mid_route_exclusive_leg(
-        &[("vm:exclusive", 0x01, 0x02), ("uniswap_v2", 0x02, 0x03)], false)]
+    #[case::first_hop_exclusive_leg(
+        &[("vm:exclusive", 0x01, 0x02), ("uniswap_v2", 0x02, 0x03)], true)]
+    #[case::exclusive_leg_before_split(
+        &[("vm:exclusive", 0x01, 0x02), ("uniswap_v2", 0x02, 0x03), ("curve", 0x02, 0x03)],
+        true)]
+    // The leg's output 0x08 is not taken by any later swap.
+    #[case::exclusive_leg_output_unused(
+        &[("vm:exclusive", 0x01, 0x08), ("uniswap_v2", 0x01, 0x02)], false)]
+    // 0x02 -> 0x03 -> 0x02 loops back to the leg's output token.
+    #[case::loop_after_exclusive_leg(
+        &[
+            ("vm:exclusive", 0x01, 0x02),
+            ("uniswap_v2", 0x02, 0x03),
+            ("uniswap_v2", 0x03, 0x02),
+            ("curve", 0x02, 0x04),
+        ],
+        false)]
     // Split route in sequential representation: path 1 is a single exclusive hop 0x01→0x02;
     // path 2 is 0x01→0x03→0x02. The exclusive leg is terminal for its path because the next
     // swap starts over from 0x01.
@@ -3911,8 +4123,8 @@ mod tests {
     #[case::two_exclusive_legs(
         &[("vm:exclusive", 0x01, 0x02), ("vm:exclusive", 0x01, 0x02)], false)]
     // Diamond split: 0x01 splits into 0x01->0x02 (exclusive) and 0x01->0x03, both merging into
-    // 0x02->0x04 and 0x03->0x04. The exclusive leg feeds the merge point, not the route's output
-    // (0x04), so it's mid-path even though the next serialized swap starts a sibling branch.
+    // 0x02->0x04 and 0x03->0x04. The exclusive leg's output reaches 0x04 through 0x02->0x04,
+    // which is not the next serialized swap.
     #[case::exclusive_leg_feeding_diamond_merge(
         &[
             ("vm:exclusive", 0x01, 0x02),
@@ -3920,17 +4132,7 @@ mod tests {
             ("uniswap_v2", 0x02, 0x04),
             ("uniswap_v2", 0x03, 0x04),
         ],
-        false)]
-    // Same diamond shape, reordered so the exclusive leg's real continuation is adjacent to it —
-    // regression case for a prior bug where terminal-ness was inferred from adjacency alone.
-    #[case::exclusive_leg_feeding_diamond_merge_reordered(
-        &[
-            ("vm:exclusive", 0x01, 0x02),
-            ("uniswap_v2", 0x02, 0x04),
-            ("uniswap_v2", 0x01, 0x03),
-            ("uniswap_v2", 0x03, 0x04),
-        ],
-        false)]
+        true)]
     // Sibling branches sharing a prefix: 0x01->0x02->0x03->0x04 alongside
     // 0x01->0x02->0x05->0x04(exclusive). The exclusive leg is the terminal hop of its own branch
     // and produces the route's output token, so it's valid despite sharing 0x01->0x02 with the
@@ -3946,11 +4148,45 @@ mod tests {
         true)]
     fn test_exclusive_route_validation(#[case] legs: &[(&str, u8, u8)], #[case] expected: bool) {
         let quote = make_route_quote(legs);
-        assert_eq!(has_valid_exclusive_route(&quote, SimChain::Ethereum), expected);
+        assert_eq!(has_valid_exclusive_route(&quote), expected);
     }
 
-    /// Native token, its wrapped form, and an unrelated token. Read from the same chain config the
-    /// validator uses, so the pair cannot drift from tycho's.
+    #[rstest]
+    #[case::multiple_legs(
+        &[("vm:exclusive", 0x01, 0x02), ("vm:exclusive", 0x01, 0x02)],
+        "exclusive_route_multiple_legs_total")]
+    #[case::loop_after_leg(
+        &[
+            ("vm:exclusive", 0x01, 0x02),
+            ("uniswap_v2", 0x02, 0x03),
+            ("uniswap_v2", 0x03, 0x02),
+            ("curve", 0x02, 0x04),
+        ],
+        "exclusive_route_does_not_reach_output_total")]
+    #[case::leg_output_unused(
+        &[("vm:exclusive", 0x01, 0x08), ("uniswap_v2", 0x01, 0x02)],
+        "exclusive_route_does_not_reach_output_total")]
+    fn test_exclusive_route_validation_metrics(
+        #[case] legs: &[(&str, u8, u8)],
+        #[case] counter_name: &str,
+    ) {
+        let quote = make_route_quote(legs);
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || has_valid_exclusive_route(&quote));
+
+        assert_eq!(
+            recorded_metrics(&snapshotter),
+            vec![(
+                counter_name.to_string(),
+                vec![],
+                metrics_util::debugging::DebugValue::Counter(1)
+            )]
+        );
+    }
+
+    /// Native token, its wrapped form, and an unrelated token.
     fn wrap_tokens() -> (Address, Address, Address) {
         (
             SimChain::Ethereum
@@ -3967,57 +4203,29 @@ mod tests {
     #[test]
     fn test_exclusive_leg_wrapped_into_output() {
         let (native, wrapped, other) = wrap_tokens();
-        let quote = make_route_quote_for_tokens(&[
-            ("vm:exclusive", other, native.clone()),
-            ("uniswap_v2", native, wrapped),
-        ]);
+        let quote = make_route_quote_for_tokens(
+            &[
+                ("vm:exclusive", other, native.clone(), 1000, 1000),
+                ("uniswap_v2", native, wrapped, 1000, 1000),
+            ],
+            1000,
+        );
 
-        assert!(has_valid_exclusive_route(&quote, SimChain::Ethereum));
+        assert!(has_valid_exclusive_route(&quote));
     }
 
     #[test]
     fn test_exclusive_leg_unwrapped_into_output() {
         let (native, wrapped, other) = wrap_tokens();
-        let quote = make_route_quote_for_tokens(&[
-            ("vm:exclusive", other, wrapped.clone()),
-            ("uniswap_v2", wrapped, native),
-        ]);
+        let quote = make_route_quote_for_tokens(
+            &[
+                ("vm:exclusive", other, wrapped.clone(), 1000, 1000),
+                ("uniswap_v2", wrapped, native, 1000, 1000),
+            ],
+            1000,
+        );
 
-        assert!(has_valid_exclusive_route(&quote, SimChain::Ethereum));
-    }
-
-    #[test]
-    fn test_exclusive_leg_followed_by_non_wrap() {
-        let (native, _, other) = wrap_tokens();
-        let quote = make_route_quote_for_tokens(&[
-            ("vm:exclusive", other, native.clone()),
-            ("uniswap_v2", native, make_address(0x08)),
-        ]);
-
-        assert!(!has_valid_exclusive_route(&quote, SimChain::Ethereum));
-    }
-
-    #[test]
-    fn test_exclusive_leg_wrap_not_producing_output() {
-        let (native, wrapped, other) = wrap_tokens();
-        let quote = make_route_quote_for_tokens(&[
-            ("vm:exclusive", other, native.clone()),
-            ("uniswap_v2", native, wrapped.clone()),
-            ("uniswap_v2", wrapped, make_address(0x08)),
-        ]);
-
-        assert!(!has_valid_exclusive_route(&quote, SimChain::Ethereum));
-    }
-
-    #[test]
-    fn test_exclusive_leg_wrap_of_another_path() {
-        let (native, wrapped, other) = wrap_tokens();
-        let quote = make_route_quote_for_tokens(&[
-            ("vm:exclusive", other, make_address(0x08)),
-            ("uniswap_v2", native, wrapped),
-        ]);
-
-        assert!(!has_valid_exclusive_route(&quote, SimChain::Ethereum));
+        assert!(has_valid_exclusive_route(&quote));
     }
 
     /// A quote stating its gas cost twice, in output-token units and in wei.
@@ -4352,5 +4560,57 @@ mod tests {
         let quote = make_rate_quote(1_000, 900, 0);
 
         assert!(capture_winning_protocols(&quote).is_empty());
+    }
+
+    /// The post-processor label reaches the win counter and whichever volume metric the quote
+    /// prices into.
+    #[rstest]
+    #[case::none(&[], false, "post_processed_by=none")]
+    #[case::two(&["a", "b"], false, "post_processed_by=a+b")]
+    #[case::two_priced(&["a", "b"], true, "post_processed_by=a+b")]
+    fn test_record_win_post_processed_by_label(
+        #[case] names: &[&str],
+        #[case] priced: bool,
+        #[case] expected: &str,
+    ) {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let mut quote = success_quote(1_000);
+        if priced {
+            quote = quote.with_gas_price(BigUint::from(1u64));
+        }
+        quote.set_worker_pool("pool".to_string());
+        quote.set_post_processed_by(
+            names
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        );
+
+        record_win(&quote);
+
+        let recorded = crate::tests::metrics::recorded_metrics(&snapshotter);
+        let labels_of = |metric: &str| -> Vec<Vec<String>> {
+            recorded
+                .iter()
+                .filter(|(name, _, _)| name == metric)
+                .map(|(_, labels, _)| {
+                    let mut labels = labels.clone();
+                    labels.sort();
+                    labels
+                })
+                .collect()
+        };
+        let (volume_metric, absent_metric) = if priced {
+            ("worker_router_won_volume_gas_token", "worker_router_unpriced_won_quotes_total")
+        } else {
+            ("worker_router_unpriced_won_quotes_total", "worker_router_won_volume_gas_token")
+        };
+        let expected_labels =
+            vec![vec!["algorithm=algo".to_string(), "pool=pool".to_string(), expected.to_string()]];
+        assert_eq!(labels_of("worker_router_best_quote_pool"), expected_labels);
+        assert_eq!(labels_of(volume_metric), expected_labels);
+        assert!(labels_of(absent_metric).is_empty());
     }
 }

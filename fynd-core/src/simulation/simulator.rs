@@ -36,7 +36,7 @@ use crate::{
         token_layout::{discover_layout, DiscoveryError, TokenLayout},
     },
     solver::defaults::SIMULATION_LAYOUT_DISCOVERY_TIMEOUT,
-    OrderQuote, SimulationResult,
+    ClientFeeParams, OrderQuote, SimulationResult,
 };
 
 /// Balance and allowance every simulated account is given.
@@ -75,6 +75,13 @@ const SIMULATION_COINBASE: Address = address!("0x95222290DD7278Aa3Ddd389Cc1E1d16
 /// Nonce given to the sender, because an account that never sent a transaction reads as a
 /// simulation.
 const SIMULATION_SENDER_NONCE: u64 = 1;
+
+/// Runtime code that returns ERC-1271's magic value to every call, whatever its calldata or value:
+/// the `isValidSignature` selector `0x1626ba7e`, left-aligned in a 32-byte word.
+///
+/// `PUSH4 0x1626ba7e PUSH1 0xe0 SHL PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN`
+const ACCEPT_ANY_ERC1271_SIGNATURE_CODE: [u8; 16] =
+    alloy::primitives::hex!("631626ba7e60e01b60005260206000f3");
 
 /// Budget for the trace that recovers a revert's error.
 ///
@@ -142,6 +149,60 @@ impl SimulationEnvelope {
     }
 }
 
+/// What simulating one quote takes from the quote itself, read before any RPC call.
+struct SimulationSetup<'a> {
+    call: SimulatedCall<'a>,
+    /// The token the sender pays in, which decides how the sender is funded.
+    token_in: Address,
+    /// The address that must accept the quote's placeholder client fee signature, if any.
+    client_fee_receiver: Option<Address>,
+}
+
+impl<'a> SimulationSetup<'a> {
+    /// Reads the call, the input token and the client fee receiver off an encoded quote.
+    ///
+    /// The router skips the client fee signature check for a zero receiver, so a zero receiver
+    /// needs no override and is reported as none.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the quote cannot be simulated: it has no transaction or no route, an address is
+    /// not 20 bytes, or the client fee receiver is the router. Code at the router would replace
+    /// the router itself, and the call would return the magic value as its amount out.
+    fn for_quote(
+        quote: &'a OrderQuote,
+        client_fee: Option<&ClientFeeParams>,
+    ) -> Result<Self, String> {
+        let transaction = quote
+            .transaction()
+            .ok_or("quote has no encoded transaction")?;
+        let first_swap = quote
+            .route()
+            .ok_or("quote has no route")?
+            .swaps()
+            .first()
+            .ok_or("route has no swaps")?;
+        let call = SimulatedCall {
+            sender: crate::rpc::to_address(quote.sender(), "quote sender")?,
+            router: crate::rpc::to_address(transaction.to(), "transaction destination")?,
+            value: U256::from_be_slice(&transaction.value().to_bytes_be()),
+            data: transaction.data(),
+        };
+        let token_in = crate::rpc::to_address(first_swap.token_in(), "route token_in")?;
+        let mut client_fee_receiver = None;
+        if let Some(fee) = client_fee {
+            let receiver = crate::rpc::to_address(fee.receiver(), "client fee receiver")?;
+            if receiver == call.router {
+                return Err(format!("client fee receiver {receiver} is the router"));
+            }
+            if receiver != Address::ZERO {
+                client_fee_receiver = Some(receiver);
+            }
+        }
+        Ok(Self { call, token_in, client_fee_receiver })
+    }
+}
+
 pub(crate) enum SimulationAttempt {
     /// The simulated call completed.
     Success { amount_out: BigUint, gas_used: u64 },
@@ -179,56 +240,39 @@ impl QuoteSimulator {
     ///
     /// Records the outcome and, on success, how far the simulated amount sits from what the quote
     /// promised. Instrumenting here rather than at the call site keeps every caller measured.
-    pub(crate) async fn simulate_attempt(&self, quote: &OrderQuote) -> SimulationAttempt {
-        let attempt = self.attempt(quote).await;
+    ///
+    /// `client_fee` is the client fee params the quote was encoded with.
+    pub(crate) async fn simulate_attempt(
+        &self,
+        quote: &OrderQuote,
+        client_fee: Option<&ClientFeeParams>,
+    ) -> SimulationAttempt {
+        let attempt = self.attempt(quote, client_fee).await;
         record_outcome(quote, &attempt);
         attempt
     }
 
-    async fn attempt(&self, quote: &OrderQuote) -> SimulationAttempt {
-        let transaction = match quote.transaction() {
-            Some(value) => value,
-            None => return failure("simulation setup failed: quote has no encoded transaction"),
-        };
-        let route = match quote.route() {
-            Some(value) => value,
-            None => return failure("simulation setup failed: quote has no route"),
-        };
-        let first_swap = match route.swaps().first() {
-            Some(value) => value,
-            None => return failure("simulation setup failed: route has no swaps"),
-        };
-        let sender = match crate::rpc::to_address(quote.sender(), "quote sender") {
+    async fn attempt(
+        &self,
+        quote: &OrderQuote,
+        client_fee: Option<&ClientFeeParams>,
+    ) -> SimulationAttempt {
+        let setup = match SimulationSetup::for_quote(quote, client_fee) {
             Ok(value) => value,
             Err(error) => return failure_with(format!("simulation setup failed: {error}")),
         };
-        let router = match crate::rpc::to_address(transaction.to(), "transaction destination") {
-            Ok(value) => value,
-            Err(error) => return failure_with(format!("simulation setup failed: {error}")),
-        };
-        let token_in = match crate::rpc::to_address(first_swap.token_in(), "route token_in") {
-            Ok(value) => value,
-            Err(error) => return failure_with(format!("simulation setup failed: {error}")),
-        };
-        let overrides = match self
-            .overrides(sender, token_in, router)
+        let mut overrides = match self
+            .overrides(setup.call.sender, setup.token_in, setup.call.router)
             .await
         {
             Ok(value) => value,
             Err(reason) => return failure_with(reason),
         };
-        let value = U256::from_be_slice(
-            transaction
-                .value()
-                .to_bytes_be()
-                .as_slice(),
-        );
-        self.simulate_within_timeout(
-            SimulatedCall { sender, router, value, data: transaction.data() },
-            overrides,
-            SimulationEnvelope::for_quote(quote),
-        )
-        .await
+        if let Some(receiver) = setup.client_fee_receiver {
+            add_client_fee_receiver_override(&mut overrides, receiver);
+        }
+        self.simulate_within_timeout(setup.call, overrides, SimulationEnvelope::for_quote(quote))
+            .await
     }
 
     /// Runs one simulated call, reporting a timeout as a failure rather than waiting forever.
@@ -453,9 +497,6 @@ fn record_gas(quote: &OrderQuote, gas_used: u64, pool: &str, algorithm: &str) {
     .record(gas_used as f64);
 }
 
-fn failure(reason: &str) -> SimulationAttempt {
-    failure_with(reason.to_string())
-}
 fn failure_with(reason: String) -> SimulationAttempt {
     SimulationAttempt::Failure { reason }
 }
@@ -643,6 +684,25 @@ fn sender_override() -> AccountOverride {
 
 fn native_balance_override(sender: Address) -> StateOverride {
     StateOverride::from_iter([(sender, sender_override())])
+}
+
+/// Lets the router's client fee signature check pass for a quote the client has not signed yet.
+///
+/// The client signs `ClientFee` after quoting, over the amounts and swaps the quote returns, so
+/// the calldata carries a placeholder: the caller's signature bytes, zero-padded to 65. The router
+/// tries ECDSA first and falls back to ERC-1271 on the receiver, so code at the receiver that
+/// accepts every signature lets the rest of the call run, whatever the placeholder holds. Only the
+/// receiver's code changes, not its address, so the FeeCalculator resolves the same fee client,
+/// and so the same rates, as for the signed transaction.
+///
+/// This sets only `code` on any override the receiver already has, so a receiver that is also the
+/// sender keeps its funding. Such a sender also passes Permit2's signature check, which falls back
+/// to ERC-1271 for an owner with code, so its permit signature goes unchecked in the simulation.
+fn add_client_fee_receiver_override(overrides: &mut StateOverride, receiver: Address) {
+    overrides
+        .entry(receiver)
+        .or_default()
+        .code = Some(Bytes::from_static(&ACCEPT_ANY_ERC1271_SIGNATURE_CODE));
 }
 
 /// Funds and approves every account a route can pull the input token from.

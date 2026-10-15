@@ -1141,6 +1141,12 @@ pub struct OrderQuote {
     /// builds itself, such as the `NoRouteFound` placeholder.
     #[serde(skip)]
     worker_pool: String,
+    /// Names of the post-processors that replaced the route of this solution (internal use only).
+    ///
+    /// Empty when no post-processor replaced the route, or when the replacement failed the worker
+    /// checks.
+    #[serde(skip)]
+    post_processed_by: Vec<String>,
     /// Effective gas price (in wei) at the time the route was computed.
     #[serde_as(as = "Option<DisplayFromStr>")]
     gas_price: Option<BigUint>,
@@ -1200,6 +1206,7 @@ impl OrderQuote {
             block,
             algorithm,
             worker_pool: String::new(),
+            post_processed_by: Vec::new(),
             gas_price: None,
             transaction: None,
             fee_breakdown: None,
@@ -1353,6 +1360,19 @@ impl OrderQuote {
     /// price guard and encoding — the stages after which the winner is finally known.
     pub(crate) fn set_worker_pool(&mut self, worker_pool: String) {
         self.worker_pool = worker_pool;
+    }
+
+    /// Returns the names of the post-processors that replaced the route of this solution, in
+    /// config order.
+    pub fn post_processed_by(&self) -> &[String] {
+        &self.post_processed_by
+    }
+
+    /// Names the post-processors that replaced the route of this solution.
+    ///
+    /// Set by the worker that builds the quote.
+    pub(crate) fn set_post_processed_by(&mut self, post_processed_by: Vec<String>) {
+        self.post_processed_by = post_processed_by;
     }
 
     /// Returns the effective gas price at the time the route was computed.
@@ -1640,6 +1660,10 @@ impl RouteResult {
         self.route
     }
 
+    pub(crate) fn route_mut(&mut self) -> &mut Route {
+        &mut self.route
+    }
+
     /// Output less gas, priced in the output token.
     #[must_use]
     pub fn net_amount_out(&self) -> &BigInt {
@@ -1740,6 +1764,13 @@ impl Route {
             .iter()
             .map(|s| &s.gas_estimate)
             .fold(BigUint::ZERO, |acc, g| acc + g)
+    }
+
+    /// Whether any swap in this route carries a committed amount, which marks an exclusive leg.
+    pub fn has_exclusive_leg(&self) -> bool {
+        self.swaps
+            .iter()
+            .any(|swap| swap.committed_amount_out.is_some())
     }
 
     /// Validates that the route is well-formed.
@@ -2207,6 +2238,14 @@ impl Swap {
     pub fn with_split(mut self, split: f64) -> Self {
         self.split = split;
         self
+    }
+
+    /// Sets the token pair and the split of this swap, in place. The amounts, pool, and state
+    /// remain unchanged.
+    pub(crate) fn retarget(&mut self, token_in: Address, token_out: Address, split: f64) {
+        self.token_in = token_in;
+        self.token_out = token_out;
+        self.split = split;
     }
 
     /// Attaches the pool this pAMM leg falls back to, in place.
