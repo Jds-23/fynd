@@ -166,7 +166,8 @@ as a handle to a feed that dies.
 Each RFQ client reads its own credentials through `get_env`, so a missing one is a
 `DataFeedError::Config` at registration rather than a client that streams nothing: `BEBOP_KEY` for
 `rfq:bebop`, `HASHFLOW_USER`/`HASHFLOW_KEY` for `rfq:hashflow`, `METRIC_API_KEY` for `rfq:metric`
-(whose `METRIC_API_URL` stays optional, defaulting to Metric's public endpoint). `rfq:metric` is
+(whose `METRIC_API_URL` stays optional, defaulting to Metric's public endpoint), `NATIVE_API_KEY`
+for `rfq:native`, and `LIQUORICE_USER`/`LIQUORICE_KEY` for `rfq:liquorice`. `rfq:metric` is
 also gated on `METRIC_CHAINS`, the chains tycho-execution deploys its executor to — elsewhere the
 entry is rejected instead of pricing legs that cannot be encoded. That gate is what splits Metric
 between the two non-Tycho sources: the price level stream serves it on Ethereum

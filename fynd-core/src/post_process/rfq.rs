@@ -112,7 +112,7 @@ impl RoutePostProcessor for RfqSwapReplacer {
 /// RFQ protocols whose signed quotes support input amounts smaller than the quoted amount. The
 /// replacer uses other RFQ protocols only for swaps starting at the sell token, where the input
 /// amount matches the quoted amount exactly.
-const PARTIAL_FILL_PROTOCOLS: &[&str] = &["rfq:bebop", "rfq:hashflow"];
+const PARTIAL_FILL_PROTOCOLS: &[&str] = &["rfq:bebop", "rfq:hashflow", "rfq:native"];
 
 /// True when `protocol_system` is in [`PARTIAL_FILL_PROTOCOLS`], through its own executor or its
 /// fallback router.
@@ -1169,6 +1169,7 @@ mod tests {
     #[case::partial_fill_after_sell_token("rfq:bebop", false, &["ab", "rfq"])]
     #[case::partial_fill_via_fallback_router("fallback:rfq:bebop", false, &["ab", "rfq"])]
     #[case::partial_fill_hashflow("rfq:hashflow", false, &["ab", "rfq"])]
+    #[case::partial_fill_native("rfq:native", false, &["ab", "rfq"])]
     #[case::exact_fill_after_sell_token("rfq:metric", false, &[])]
     #[case::exact_fill_via_fallback_router("fallback:rfq:metric", false, &[])]
     #[case::exact_fill_at_sell_token("rfq:metric", true, &["rfq", "bc"])]
