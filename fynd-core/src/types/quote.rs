@@ -2665,6 +2665,18 @@ mod tests {
     }
 
     #[test]
+    fn test_with_slippage_keeps_the_other_options() {
+        let options = EncodingOptions::new(0.005)
+            .with_simulation()
+            .with_calldata_watermark(b"fee".to_vec())
+            .with_slippage(0.02);
+
+        assert_eq!(options.slippage(), 0.02);
+        assert!(options.simulate());
+        assert_eq!(options.calldata_watermark(), Some(&b"fee"[..]));
+    }
+
+    #[test]
     fn public_quote_has_no_surplus() {
         let quote = make_quote(990);
         assert_eq!(quote.surplus_amount(), None);
