@@ -214,7 +214,7 @@ async fn test_simulate_attempt_client_fee_receiver(
     ));
 
     let attempt = mocked_simulator(&asserter, TEST_TIMEOUT)
-        .simulate_attempt(&encoded_quote(), client_fee.as_ref())
+        .simulate_attempt(&encoded_quote(), client_fee.as_ref(), SimulationPurpose::QUOTE)
         .await;
 
     let SimulationAttempt::Reverted { replay, .. } = attempt else {
@@ -250,7 +250,11 @@ async fn test_simulate_attempt_unusable_client_fee_receiver(
     let asserter = Asserter::new();
 
     let attempt = mocked_simulator(&asserter, TEST_TIMEOUT)
-        .simulate_attempt(&encoded_quote(), Some(&client_fee_params(&receiver)))
+        .simulate_attempt(
+            &encoded_quote(),
+            Some(&client_fee_params(&receiver)),
+            SimulationPurpose::QUOTE,
+        )
         .await;
 
     let SimulationAttempt::Failure { reason } = attempt else {
@@ -990,6 +994,7 @@ fn test_record_outcome_success() {
                 gas_used: 120_000,
                 logs: Vec::new(),
             },
+            SimulationPurpose::QUOTE,
         );
     });
 
@@ -1048,6 +1053,7 @@ fn test_record_outcome_reverted() {
         record_outcome(
             &quote_with_fees(1_000_000),
             &SimulationAttempt::Reverted { reason: "reverted".to_string(), replay: empty_replay() },
+            SimulationPurpose::QUOTE,
         );
     });
 
@@ -1079,6 +1085,7 @@ fn test_record_outcome_failed() {
         record_outcome(
             &quote_with_fees(1_000_000),
             &SimulationAttempt::Failure { reason: "timed out".to_string() },
+            SimulationPurpose::QUOTE,
         );
     });
 

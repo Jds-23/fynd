@@ -111,6 +111,31 @@ pub(crate) struct SimulatedCall<'a> {
     pub(crate) block: BlockNumberOrTag,
 }
 
+/// Why a quote is simulated.
+///
+/// The simulation metrics carry it as the `purpose` label, so that dashboards can show client
+/// quotes apart from other simulations. Fynd simulates with [`Self::QUOTE`]. A caller that
+/// simulates quotes for its own use gives its own label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimulationPurpose(&'static str);
+
+impl SimulationPurpose {
+    /// A client asked to simulate the quote.
+    pub const QUOTE: Self = Self("quote");
+
+    /// Returns a purpose with `label` as the value of the `purpose` label.
+    ///
+    /// The label is a `&'static str`, so that the number of label values stays fixed.
+    pub const fn new(label: &'static str) -> Self {
+        Self(label)
+    }
+
+    /// Returns the value of the `purpose` label.
+    pub const fn label(self) -> &'static str {
+        self.0
+    }
+}
+
 /// The block whose state a simulation runs on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SimulationBlock {
@@ -295,19 +320,24 @@ impl QuoteSimulator {
         Ok(simulator.with_block_time(Duration::from_secs(block_time)))
     }
 
-    /// Simulates an encoded quote and reports its returned amount and gas used or a failure.
+    /// Simulates an encoded quote, and records the metrics of the result.
     ///
-    /// Records the outcome and, on success, how far the simulated amount sits from what the quote
-    /// promised. Instrumenting here rather than at the call site keeps every caller measured.
+    /// The metrics carry `purpose` as a label. For a successful simulation, they also record how
+    /// far the simulated output is from the quoted output, and the gas that the call used.
     ///
-    /// `client_fee` is the client fee params the quote was encoded with.
+    /// # Arguments
+    ///
+    /// * `quote` - The encoded quote to simulate.
+    /// * `client_fee` - The client fee params the quote was encoded with.
+    /// * `purpose` - Why the quote is simulated.
     pub(crate) async fn simulate_attempt(
         &self,
         quote: &OrderQuote,
         client_fee: Option<&ClientFeeParams>,
+        purpose: SimulationPurpose,
     ) -> SimulationAttempt {
         let attempt = self.attempt(quote, client_fee).await;
-        record_outcome(quote, &attempt);
+        record_outcome(quote, &attempt, purpose);
         attempt
     }
 
@@ -553,21 +583,24 @@ fn log_outcome(quote: &OrderQuote, outcome: &'static str, reason: &str) -> &'sta
 /// A revert and a failure are counted apart because they call for different work: a revert means
 /// the route the solver priced does not execute, while a failure means the simulation itself did
 /// not run, so it says nothing about the route. Both carry the winning pool and algorithm, so a
-/// rise in either can be traced to the solver that produced the route.
-fn record_outcome(quote: &OrderQuote, attempt: &SimulationAttempt) {
+/// rise in either can be traced to the solver that produced the route. Every metric also carries
+/// the `purpose` label.
+fn record_outcome(quote: &OrderQuote, attempt: &SimulationAttempt, purpose: SimulationPurpose) {
     let pool = quote.worker_pool().to_string();
     let algorithm = quote.algorithm().to_string();
+    let purpose = purpose.label();
     let outcome = match attempt {
         SimulationAttempt::Success { amount_out, gas_used, .. } => {
             if let Some(deviation) = deviation_bps(quote, amount_out) {
                 histogram!(
                     "quote_simulation_deviation_bps",
                     "pool" => pool.clone(),
-                    "algorithm" => algorithm.clone()
+                    "algorithm" => algorithm.clone(),
+                    "purpose" => purpose
                 )
                 .record(deviation);
             }
-            record_gas(quote, *gas_used, &pool, &algorithm);
+            record_gas(quote, *gas_used, &pool, &algorithm, purpose);
             "success"
         }
         SimulationAttempt::Reverted { reason, replay } => {
@@ -583,7 +616,8 @@ fn record_outcome(quote: &OrderQuote, attempt: &SimulationAttempt) {
         "quote_simulations_total",
         "outcome" => outcome,
         "pool" => pool,
-        "algorithm" => algorithm
+        "algorithm" => algorithm,
+        "purpose" => purpose
     )
     .increment(1);
 }
@@ -592,19 +626,27 @@ fn record_outcome(quote: &OrderQuote, attempt: &SimulationAttempt) {
 ///
 /// Both are recorded for the same successful simulations only, so the two series compare like
 /// for like. A reverted or failed call has no gas figure to set against the estimate.
-fn record_gas(quote: &OrderQuote, gas_used: u64, pool: &str, algorithm: &str) {
+fn record_gas(
+    quote: &OrderQuote,
+    gas_used: u64,
+    pool: &str,
+    algorithm: &str,
+    purpose: &'static str,
+) {
     if let Some(gas_estimate) = quote.gas_estimate().to_f64() {
         histogram!(
             "quote_simulation_gas_estimate",
             "pool" => pool.to_string(),
-            "algorithm" => algorithm.to_string()
+            "algorithm" => algorithm.to_string(),
+            "purpose" => purpose
         )
         .record(gas_estimate);
     }
     histogram!(
         "quote_simulation_gas_used",
         "pool" => pool.to_string(),
-        "algorithm" => algorithm.to_string()
+        "algorithm" => algorithm.to_string(),
+        "purpose" => purpose
     )
     .record(gas_used as f64);
 }
