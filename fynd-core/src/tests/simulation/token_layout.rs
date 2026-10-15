@@ -202,6 +202,14 @@ fn traced_account(code: Option<&str>, slots: &[B256]) -> serde_json::Value {
     }
 }
 
+fn word(value: U256) -> Bytes {
+    Bytes::from(B256::from(value).to_vec())
+}
+
+fn out_of_gas_payload() -> ErrorPayload {
+    ErrorPayload { code: -32000, message: "out of gas".into(), data: None }
+}
+
 fn sentinel_word() -> Vec<u8> {
     B256::from(PROBE_SENTINEL).to_vec()
 }
@@ -349,13 +357,128 @@ async fn test_discover_balance_falls_back_to_the_shares_view() {
     asserter.push_success(&prestate(contract, &[shares]));
     asserter.push_success(&Bytes::from(sentinel_word()));
 
-    let (storage_contract, position, _) =
+    let (storage_contract, position, encoding) =
         discover_balance(&mocked_provider(&asserter), Address::repeat_byte(9), holder)
             .await
             .expect("the shares view places the mapping");
 
     assert_eq!(storage_contract, contract);
     assert_eq!(position, solidity(0));
+    assert_eq!(encoding, BalanceEncoding::Plain);
+}
+
+#[tokio::test]
+async fn test_find_accessed_slot_takes_out_of_gas_as_a_miss() {
+    let holder = Address::repeat_byte(1);
+    let contract = Address::repeat_byte(3);
+    let mapping = balance_slot(holder, solidity(2));
+    let asserter = Asserter::new();
+    asserter.push_success(&prestate(contract, &[B256::repeat_byte(0xff), mapping]));
+    asserter.push_failure(out_of_gas_payload());
+    asserter.push_success(&Bytes::from(sentinel_word()));
+
+    let found = find_accessed_slot(&mocked_provider(&asserter), Address::repeat_byte(9), &[0x70])
+        .await
+        .expect("the second candidate answers");
+
+    assert_eq!(found, (contract, mapping));
+}
+
+#[tokio::test]
+async fn test_discover_balance_places_a_scaled_mapping() {
+    let holder = Address::repeat_byte(1);
+    let token = Address::repeat_byte(9);
+    let mapping = balance_slot(holder, solidity(1));
+    let length_slot = B256::with_last_byte(5);
+    let rate = U256::from(10_u8).pow(U256::from(51_u8));
+    let asserter = Asserter::new();
+    // `balanceOf`: the length slot runs out of gas, the mapping reads the sentinel back as zero.
+    asserter.push_success(&prestate(token, &[mapping, length_slot]));
+    asserter.push_success(&word(U256::ZERO));
+    asserter.push_failure(out_of_gas_payload());
+    // `sharesOf` does not exist: its trace reads no storage.
+    asserter.push_success(&prestate(token, &[]));
+    // The scaled probe traces `balanceOf` again and writes to the mapping only.
+    asserter.push_success(&prestate(token, &[mapping, length_slot]));
+    asserter.push_success(&word(SCALE_PROBE / rate));
+    asserter.push_success(&word(SCALE_PROBE * U256::from(2_u8) / rate));
+
+    let (storage_contract, position, encoding) =
+        discover_balance(&mocked_provider(&asserter), token, holder)
+            .await
+            .expect("the scaled probe places the mapping");
+
+    assert_eq!(storage_contract, token);
+    assert_eq!(position, solidity(1));
+    let BalanceEncoding::Scaled { rate: found } = encoding else {
+        panic!("a scaled mapping, got {encoding:?}");
+    };
+    let relative_error = found.abs_diff(rate) * U256::from(1_000_000_u32) / rate;
+    assert!(relative_error < U256::from(1_u8), "rate {found} for {rate}");
+}
+
+#[tokio::test]
+async fn test_discover_balance_reaches_a_scaled_mapping_behind_many_slots() {
+    let holder = Address::repeat_byte(1);
+    let token = Address::repeat_byte(9);
+    let mapping = balance_slot(holder, solidity(2));
+    // Decoys that sort above any hash, more of them than the cap.
+    let mut slots: Vec<B256> = Vec::new();
+    for index in 0..=MAX_SLOTS_TO_VERIFY {
+        let mut decoy = [0xff_u8; 32];
+        decoy[31] = u8::try_from(index).expect("the cap fits a byte");
+        slots.push(B256::new(decoy));
+    }
+    slots.push(mapping);
+    let rate = U256::from(1_000_u32);
+    let asserter = Asserter::new();
+    asserter.push_success(&prestate(token, &slots));
+    for _ in 0..MAX_SLOTS_TO_VERIFY {
+        asserter.push_success(&word(U256::ZERO));
+    }
+    asserter.push_success(&prestate(token, &[]));
+    asserter.push_success(&prestate(token, &slots));
+    asserter.push_success(&word(SCALE_PROBE / rate));
+    asserter.push_success(&word(SCALE_PROBE * U256::from(2_u8) / rate));
+
+    let (_, position, encoding) = discover_balance(&mocked_provider(&asserter), token, holder)
+        .await
+        .expect("the mapping is probed despite the cap");
+
+    assert_eq!(position, solidity(2));
+    assert_eq!(encoding, BalanceEncoding::Scaled { rate });
+}
+
+#[tokio::test]
+async fn test_discover_balance_refuses_a_slot_that_does_not_scale_in_proportion() {
+    let holder = Address::repeat_byte(1);
+    let token = Address::repeat_byte(9);
+    let mapping = balance_slot(holder, solidity(1));
+    let asserter = Asserter::new();
+    asserter.push_success(&prestate(token, &[mapping]));
+    asserter.push_success(&word(U256::ZERO));
+    asserter.push_success(&prestate(token, &[]));
+    asserter.push_success(&prestate(token, &[mapping]));
+    asserter.push_success(&word(U256::from(1_000_u32)));
+    asserter.push_success(&word(U256::from(1_500_u32)));
+
+    let error = discover_balance(&mocked_provider(&asserter), token, holder)
+        .await
+        .expect_err("no proportional mapping");
+
+    assert!(matches!(error, DiscoveryError::Unsupported(_)), "{error:?}");
+}
+
+#[test]
+fn test_balance_word_scales_and_caps() {
+    let layout = TokenLayout::new(Address::ZERO, solidity(0), solidity(1));
+    let funding = U256::from(10_u8).pow(U256::from(36_u8));
+
+    assert_eq!(layout.balance_word(funding), funding, "a plain slot holds the balance");
+    let scaled = layout.with_balance_encoding(BalanceEncoding::Scaled { rate: U256::from(7_u8) });
+    assert_eq!(scaled.balance_word(funding), funding * U256::from(7_u8));
+    let huge = layout.with_balance_encoding(BalanceEncoding::Scaled { rate: U256::MAX >> 8 });
+    assert_eq!(huge.balance_word(funding), MAX_SCALED_WORD, "capped instead of overflowing");
 }
 
 /// Live discovery against one chain, checked by writing the discovered slots.
