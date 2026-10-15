@@ -367,6 +367,88 @@ fn simulated_response(return_data: Vec<u8>, status: bool, gas_used: u64) -> Vec<
     }]
 }
 
+/// Answers `eth_simulateV1` with a successful call, echoing the request id, and only when the
+/// request names `block` as the state to run on.
+struct SimulatesOn {
+    block: &'static str,
+    response: serde_json::Value,
+}
+
+impl wiremock::Match for SimulatesOn {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        let Ok(body) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+            return false;
+        };
+        body["method"] == "eth_simulateV1" && body["params"][1] == self.block
+    }
+}
+
+impl wiremock::Respond for SimulatesOn {
+    fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let id = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .map(|body| body["id"].clone())
+            .unwrap_or_default();
+        wiremock::ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": self.response}))
+    }
+}
+
+#[test]
+fn test_simulator_runs_on_the_latest_block_by_default() {
+    let simulator = mocked_simulator(&Asserter::new(), TEST_TIMEOUT);
+    let quote = encoded_quote();
+
+    let setup = SimulationSetup::for_quote(&quote, None, simulator.block).expect("a valid quote");
+
+    assert_eq!(setup.call.block, BlockNumberOrTag::Latest);
+}
+
+#[test]
+fn test_setup_runs_on_the_quote_block_when_asked() {
+    let quote = encoded_quote();
+
+    let setup =
+        SimulationSetup::for_quote(&quote, None, SimulationBlock::Quote).expect("a valid quote");
+
+    assert_eq!(setup.call.block, BlockNumberOrTag::Number(quote.block().number()));
+}
+
+#[tokio::test]
+async fn test_simulation_runs_on_the_block_it_is_given() {
+    let server = wiremock::MockServer::start().await;
+    let response = serde_json::to_value(simulated_response(
+        U256::from(123_u64)
+            .to_be_bytes::<32>()
+            .to_vec(),
+        true,
+        87_654,
+    ))
+    .unwrap();
+    wiremock::Mock::given(SimulatesOn { block: "0x4d2", response: response.clone() })
+        .respond_with(SimulatesOn { block: "0x4d2", response })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = RootProvider::new_http(server.uri().parse().unwrap());
+
+    let result = simulate_with_overrides(
+        &provider,
+        SimulatedCall {
+            sender: Address::repeat_byte(1),
+            router: Address::repeat_byte(2),
+            value: U256::ZERO,
+            data: &[0x12],
+            block: BlockNumberOrTag::Number(1_234),
+        },
+        native_balance_override(Address::repeat_byte(1)),
+        test_envelope(),
+        TEST_TIMEOUT,
+    )
+    .await;
+
+    assert!(matches!(result, CallOutcome::Success { .. }), "the node was asked for block 1234");
+}
+
 #[tokio::test]
 async fn test_simulate_call_against_mocked_provider() {
     let asserter = Asserter::new();
