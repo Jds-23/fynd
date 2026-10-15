@@ -80,6 +80,7 @@ async fn test_simulated_call_returns_its_logs_undecoded() {
             router: Address::repeat_byte(2),
             value: U256::ZERO,
             data: &[0x12],
+            block: BlockNumberOrTag::Latest,
         },
         native_balance_override(Address::repeat_byte(1)),
         test_envelope(),
@@ -383,6 +384,7 @@ async fn test_simulate_call_against_mocked_provider() {
             router: Address::repeat_byte(2),
             value: U256::ZERO,
             data: &[0x12],
+            block: BlockNumberOrTag::Latest,
         },
         native_balance_override(Address::repeat_byte(1)),
         test_envelope(),
@@ -405,6 +407,7 @@ async fn test_simulated_call_rejects_non_uint256_return_data() {
             router: Address::repeat_byte(2),
             value: U256::ZERO,
             data: &[],
+            block: BlockNumberOrTag::Latest,
         },
         native_balance_override(Address::repeat_byte(1)),
         test_envelope(),
@@ -433,6 +436,7 @@ async fn test_simulated_call_decodes_revert_data_from_mocked_rpc_error() {
             router: Address::repeat_byte(2),
             value: U256::ZERO,
             data: &[],
+            block: BlockNumberOrTag::Latest,
         },
         native_balance_override(Address::repeat_byte(1)),
         test_envelope(),
@@ -575,6 +579,7 @@ async fn simulate_reverting_call(asserter: Asserter) -> SimulationAttempt {
                 router: Address::repeat_byte(2),
                 value: U256::ZERO,
                 data: &[0x12],
+                block: BlockNumberOrTag::Latest,
             },
             native_balance_override(Address::repeat_byte(1)),
             test_envelope(),
@@ -640,7 +645,13 @@ async fn test_reverted_simulation_carries_a_replay_pinned_to_its_block() {
 
     let outcome = simulate_with_overrides(
         &RootProvider::new(RpcClient::mocked(asserter)),
-        SimulatedCall { sender, router: Address::repeat_byte(2), value: U256::ZERO, data: &[0x12] },
+        SimulatedCall {
+            sender,
+            router: Address::repeat_byte(2),
+            value: U256::ZERO,
+            data: &[0x12],
+            block: BlockNumberOrTag::Latest,
+        },
         native_balance_override(sender),
         test_envelope(),
         TEST_TIMEOUT,
@@ -692,6 +703,7 @@ async fn test_simulation_times_out_when_the_node_does_not_answer() {
         &unresponsive_rpc_url().await,
         Chain::Ethereum,
         Duration::from_millis(50),
+        SimulationBlock::Latest,
     )
     .expect("build a simulator against the local listener");
 
@@ -702,6 +714,7 @@ async fn test_simulation_times_out_when_the_node_does_not_answer() {
                 router: Address::repeat_byte(2),
                 value: U256::ZERO,
                 data: &[0x12],
+                block: BlockNumberOrTag::Latest,
             },
             native_balance_override(Address::repeat_byte(1)),
             test_envelope(),
@@ -853,7 +866,13 @@ async fn test_live_accept_any_erc1271_signature_code() {
     ] {
         let outcome = simulate_with_overrides(
             &provider,
-            SimulatedCall { sender, router: receiver, value, data: &data },
+            SimulatedCall {
+                sender,
+                router: receiver,
+                value,
+                data: &data,
+                block: BlockNumberOrTag::Latest,
+            },
             overrides.clone(),
             test_envelope(),
             Duration::from_secs(10),
@@ -895,7 +914,13 @@ async fn test_live_simulate_and_trace() {
     ] {
         let outcome = simulate_with_overrides(
             &provider,
-            SimulatedCall { sender, router: usdt, value: U256::ZERO, data: &data },
+            SimulatedCall {
+                sender,
+                router: usdt,
+                value: U256::ZERO,
+                data: &data,
+                block: BlockNumberOrTag::Latest,
+            },
             native_balance_override(sender),
             test_envelope(),
             Duration::from_secs(10),

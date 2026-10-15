@@ -48,7 +48,7 @@ use crate::{
     price_guard::{
         guard::PriceGuard, provider::PriceProvider, provider_registry::PriceProviderRegistry,
     },
-    simulation::simulator::QuoteSimulator,
+    simulation::simulator::{QuoteSimulator, SimulationBlock},
     types::constants::native_token,
     worker_pool::{
         pool::{WorkerPool, WorkerPoolBuilder},
@@ -563,6 +563,7 @@ pub struct FyndBuilder {
     pools: Vec<PoolEntry>,
     price_guard_enabled: bool,
     simulation_enabled: bool,
+    simulation_block: SimulationBlock,
     price_providers: Vec<Box<dyn PriceProvider>>,
     pending_indexers: Vec<(String, Box<dyn TxDeltaIndexer>)>,
 }
@@ -605,6 +606,7 @@ impl FyndBuilder {
             pools: Vec::new(),
             price_guard_enabled: false,
             simulation_enabled: false,
+            simulation_block: SimulationBlock::Latest,
             price_providers: Vec::new(),
             pending_indexers: Vec::new(),
         }
@@ -884,6 +886,12 @@ impl FyndBuilder {
         self
     }
 
+    /// Sets the block that a quote simulation runs on. Defaults to [`SimulationBlock::Latest`].
+    pub fn simulation_block(mut self, block: SimulationBlock) -> Self {
+        self.simulation_block = block;
+        self
+    }
+
     /// Adds a named worker pool using the given [`PoolConfig`].
     ///
     /// # Errors
@@ -1150,6 +1158,7 @@ impl FyndBuilder {
                     self.rpc_url.as_str(),
                     chain,
                     defaults::SIMULATION_REQUEST_TIMEOUT,
+                    self.simulation_block,
                 )
                 .map_err(|error| SolverBuildError::QuoteSimulator(error.to_string()))?,
             )

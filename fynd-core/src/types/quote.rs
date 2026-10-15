@@ -589,7 +589,8 @@ pub struct EncodingOptions {
     /// Per-request price guard configuration. Defaults to disabled.
     #[serde(default)]
     price_guard: PriceGuardConfig,
-    /// Whether to simulate encoded transactions against the latest block. Defaults to disabled.
+    /// Whether to simulate encoded transactions, by default on the latest block. Defaults to
+    /// disabled.
     #[serde(default)]
     simulate: bool,
     /// Calldata watermark for this request, replacing the encoder's deployment-wide one. Set by
@@ -654,7 +655,7 @@ impl EncodingOptions {
         &self.transfer_type
     }
 
-    /// Enables simulation of the encoded transaction against the latest block.
+    /// Enables simulation of the encoded transaction, by default on the latest block.
     pub fn with_simulation(mut self) -> Self {
         self.simulate = true;
         self
@@ -1517,7 +1518,7 @@ pub struct EventLog {
     pub data: Bytes,
 }
 
-/// Outcome of simulating an encoded quote on the latest block.
+/// Outcome of simulating an encoded quote.
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]

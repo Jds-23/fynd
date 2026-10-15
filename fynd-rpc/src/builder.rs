@@ -362,6 +362,15 @@ impl FyndRPCBuilder {
         self
     }
 
+    /// Sets the block that a quote simulation runs on. Defaults to
+    /// [`SimulationBlock::Latest`](fynd_core::SimulationBlock::Latest).
+    pub fn simulation_block(mut self, block: fynd_core::SimulationBlock) -> Self {
+        self.fynd_builder = self
+            .fynd_builder
+            .simulation_block(block);
+        self
+    }
+
     /// Assemble all components and return a running [`FyndRPC`] server handle.
     ///
     /// Starts all worker pools and binds the HTTP listener. Returns an error if any component

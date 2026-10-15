@@ -12,7 +12,7 @@ use std::time::Duration;
 
 #[cfg(feature = "metrics")]
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
-use fynd_core::AlgorithmRegistry;
+use fynd_core::{AlgorithmRegistry, SimulationBlock};
 use fynd_rpc::{
     builder::FyndRPCBuilder,
     config::{defaults, BlocklistConfig, WorkerPoolsConfig},
@@ -388,6 +388,9 @@ async fn setup_solver(
     }
     builder = builder.price_guard_enabled(args.enable_price_guard);
     builder = builder.simulation_enabled(args.enable_simulation);
+    if args.simulate_on_quote_block {
+        builder = builder.simulation_block(SimulationBlock::Quote);
+    }
     let watermark = args
         .calldata_watermark
         .clone()

@@ -181,6 +181,11 @@ pub struct ServeArgs {
     #[arg(long)]
     pub enable_simulation: bool,
 
+    /// Simulate each quote on the block that it was priced on, instead of the latest block.
+    /// Disabled by default.
+    #[arg(long)]
+    pub simulate_on_quote_block: bool,
+
     /// Watermark appended to every encoded transaction's calldata (e.g. "fynd"), so on-chain
     /// observers can attribute router calls to this deployment. The EVM ignores calldata past
     /// the ABI-encoded arguments, so the watermark does not change execution. When unset, the

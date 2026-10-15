@@ -93,16 +93,32 @@ const SIMULATION_TRACE_TIMEOUT: Duration = Duration::from_millis(500);
 /// One token's layout, or the reason this build cannot resolve one, resolved once per token.
 type LayoutCell = Arc<OnceCell<Result<TokenLayout, String>>>;
 
-/// The call a simulation runs.
-///
-/// The four travel together and always come from the same quote, so they are passed as one rather
-/// than as four parameters a caller could pair up wrongly.
+/// The call that a simulation runs. All fields come from one quote.
 #[derive(Clone, Copy)]
 pub(crate) struct SimulatedCall<'a> {
+    /// The account that sends the call.
     pub(crate) sender: Address,
+    /// The router contract that the call goes to.
     pub(crate) router: Address,
+    /// The amount of native token that the call sends.
     pub(crate) value: U256,
+    /// The encoded router call.
     pub(crate) data: &'a [u8],
+    /// The block whose state the call runs on.
+    pub(crate) block: BlockNumberOrTag,
+}
+
+/// The block whose state a simulation runs on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SimulationBlock {
+    /// The latest block of the node.
+    #[default]
+    Latest,
+    /// The block that the quote was priced on.
+    ///
+    /// The simulated output then differs from the quote only by what the quote did not model,
+    /// and not by the blocks that came after the solve.
+    Quote,
 }
 
 /// Simulates encoded quote transactions with temporary sender funding.
@@ -115,6 +131,8 @@ pub struct QuoteSimulator {
     layout_cache: Mutex<FxHashMap<Address, LayoutCell>>,
     native_token: Address,
     request_timeout: std::time::Duration,
+    /// The block that each simulation runs on.
+    block: SimulationBlock,
 }
 
 /// The transaction envelope a simulated call runs under.
@@ -172,6 +190,7 @@ impl<'a> SimulationSetup<'a> {
     fn for_quote(
         quote: &'a OrderQuote,
         client_fee: Option<&ClientFeeParams>,
+        block: SimulationBlock,
     ) -> Result<Self, String> {
         let transaction = quote
             .transaction()
@@ -187,6 +206,10 @@ impl<'a> SimulationSetup<'a> {
             router: crate::rpc::to_address(transaction.to(), "transaction destination")?,
             value: U256::from_be_slice(&transaction.value().to_bytes_be()),
             data: transaction.data(),
+            block: match block {
+                SimulationBlock::Latest => BlockNumberOrTag::Latest,
+                SimulationBlock::Quote => BlockNumberOrTag::Number(quote.block().number()),
+            },
         };
         let token_in = crate::rpc::to_address(first_swap.token_in(), "route token_in")?;
         let mut client_fee_receiver = None;
@@ -213,7 +236,8 @@ pub(crate) enum SimulationAttempt {
 }
 
 impl QuoteSimulator {
-    /// Creates a simulator that sends requests to `rpc_url` for `chain`.
+    /// Creates a simulator that sends requests to `rpc_url` for `chain`, and runs each simulation
+    /// on `block`.
     ///
     /// # Errors
     ///
@@ -222,6 +246,7 @@ impl QuoteSimulator {
         rpc_url: &str,
         chain: Chain,
         request_timeout: std::time::Duration,
+        block: SimulationBlock,
     ) -> Result<Self, String> {
         let url = rpc_url
             .parse()
@@ -233,7 +258,8 @@ impl QuoteSimulator {
             ProviderBuilder::default().connect_http(url),
             Address::from_slice(native_token.address.as_ref()),
             request_timeout,
-        ))
+        )
+        .with_block(block))
     }
 
     /// Simulates an encoded quote and reports its returned amount and gas used or a failure.
@@ -257,7 +283,7 @@ impl QuoteSimulator {
         quote: &OrderQuote,
         client_fee: Option<&ClientFeeParams>,
     ) -> SimulationAttempt {
-        let setup = match SimulationSetup::for_quote(quote, client_fee) {
+        let setup = match SimulationSetup::for_quote(quote, client_fee, self.block) {
             Ok(value) => value,
             Err(error) => return failure_with(format!("simulation setup failed: {error}")),
         };
@@ -275,7 +301,8 @@ impl QuoteSimulator {
             .await
     }
 
-    /// Runs one simulated call, reporting a timeout as a failure rather than waiting forever.
+    /// Runs one simulated call on `call.block`, reporting a timeout as a failure rather than
+    /// waiting forever.
     pub(crate) async fn simulate_within_timeout(
         &self,
         call: SimulatedCall<'_>,
@@ -302,6 +329,12 @@ impl QuoteSimulator {
         }
     }
 
+    /// Returns this simulator with `block` as the block that each simulation runs on.
+    pub(crate) fn with_block(mut self, block: SimulationBlock) -> Self {
+        self.block = block;
+        self
+    }
+
     pub(crate) fn with_provider(
         provider: RootProvider<Ethereum>,
         native_token: Address,
@@ -312,6 +345,7 @@ impl QuoteSimulator {
             layout_cache: Mutex::new(FxHashMap::default()),
             native_token,
             request_timeout,
+            block: SimulationBlock::Latest,
         }
     }
 
@@ -500,11 +534,11 @@ fn failure_with(reason: String) -> SimulationAttempt {
     SimulationAttempt::Failure { reason }
 }
 
-/// Block environment for a simulated call.
+/// Returns the block fields that the simulation sets itself.
 ///
-/// `eth_simulateV1` builds on the real head, so the block number, timestamp, base fee, chain id and
-/// the ancestor hashes `blockhash` reads are already the ones the next block will carry. What it
-/// leaves at zero is what a pool can read to recognise a simulation, so those are set here.
+/// `eth_simulateV1` takes the other block fields from the block that it runs on. It leaves the
+/// coinbase and `prevrandao` at zero, and a pool can read these to detect a simulation. This sets
+/// them, and the block gas limit, to realistic values.
 fn block_overrides() -> BlockOverrides {
     BlockOverrides {
         coinbase: Some(SIMULATION_COINBASE),
@@ -514,12 +548,11 @@ fn block_overrides() -> BlockOverrides {
     }
 }
 
-/// The same environment, reporting the height and clock a simulated block actually carried.
+/// Returns `environment` with the block number and the timestamp that the simulated block used.
 ///
-/// `eth_simulateV1` numbers its own block on top of the head, so the number cannot be set in
-/// advance: a block landing between the solve and the simulation makes any prediction collide
-/// with the head, which the node refuses outright. It reports what it used, so the trace is
-/// pinned to that rather than to a guess.
+/// The trace of a revert must run in the same block environment as the simulation.
+/// `eth_simulateV1` picks the number of its block itself, so the caller takes `number` and
+/// `timestamp` from its response.
 fn executed_in(environment: BlockOverrides, number: u64, timestamp: u64) -> BlockOverrides {
     BlockOverrides { number: Some(U256::from(number)), time: Some(timestamp), ..environment }
 }
@@ -550,7 +583,14 @@ async fn simulate_with_overrides(
     // than regenerated.
     let environment = block_overrides();
     let payload = simulate_payload(call.clone(), overrides.clone(), environment.clone());
-    let response = match timeout(request_timeout, provider.simulate(&payload)).await {
+    let response = match timeout(
+        request_timeout,
+        provider
+            .simulate(&payload)
+            .block_id(simulated.block.into()),
+    )
+    .await
+    {
         Ok(Ok(value)) => value,
         Ok(Err(error)) => {
             return CallOutcome::Failure(format!(
@@ -592,7 +632,7 @@ async fn simulate_with_overrides(
         // produced it.
         let traced = timeout(
             SIMULATION_TRACE_TIMEOUT,
-            traced_revert_reason(provider, call, overrides, executed),
+            traced_revert_reason(provider, call, simulated.block, overrides, executed),
         )
         .await
         .ok()
@@ -762,6 +802,7 @@ fn token_overrides(
 async fn traced_revert_reason(
     provider: &RootProvider<Ethereum>,
     call: TransactionRequest,
+    block: BlockNumberOrTag,
     overrides: StateOverride,
     environment: BlockOverrides,
 ) -> Option<String> {
@@ -777,7 +818,7 @@ async fn traced_revert_reason(
         .with_block_overrides(environment);
 
     match provider
-        .debug_trace_call_callframe(call, BlockNumberOrTag::Latest.into(), options)
+        .debug_trace_call_callframe(call, block.into(), options)
         .await
     {
         Ok(frame) => revert::reason_from_frame(&frame),
