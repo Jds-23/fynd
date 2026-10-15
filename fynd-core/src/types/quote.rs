@@ -2591,6 +2591,68 @@ mod tests {
         assert_eq!(quote.committed_amount_out(), Some(&committed));
     }
 
+    fn make_executable_quote() -> OrderQuote {
+        let mut quote = make_quote(990)
+            .with_route(make_route(vec![(0x01, 0x02)]))
+            .with_price_impact_bps(5)
+            .with_surplus(SurplusInfo::new(BigUint::from(15u64), BigUint::from(975u64)));
+        quote.set_transaction(Transaction::new(Bytes::default(), BigUint::ZERO, vec![1, 2, 3]));
+        quote.set_simulation_result(SimulationResult::Failure { reason: "test".to_string() });
+        quote
+    }
+
+    #[test]
+    fn test_retract_leaves_only_the_status_and_the_input() {
+        let mut quote = make_executable_quote();
+        let amount_in = quote.amount_in().clone();
+
+        quote.retract(QuoteStatus::NoRouteFound);
+
+        assert_eq!(quote.status(), QuoteStatus::NoRouteFound);
+        assert!(quote.route().is_none());
+        assert!(quote.transaction().is_none());
+        assert!(quote.fee_breakdown().is_none());
+        assert!(quote.simulation_result().is_none());
+        assert!(quote.surplus_amount().is_none());
+        assert!(quote.price_impact_bps().is_none());
+        assert_eq!(*quote.amount_out(), BigUint::ZERO);
+        assert_eq!(*quote.amount_out_net_gas(), BigUint::ZERO);
+        assert_eq!(*quote.gas_estimate(), BigUint::ZERO);
+        assert_eq!(*quote.amount_in(), amount_in);
+    }
+
+    #[test]
+    fn test_set_amount_in_drops_what_was_encoded_for_the_old_amount() {
+        let mut quote = make_executable_quote();
+
+        quote.set_amount_in(BigUint::from(1_053u64));
+
+        assert_eq!(*quote.amount_in(), BigUint::from(1_053u64));
+        assert!(quote.transaction().is_none(), "the calldata pulled the old amount");
+        assert!(quote.simulation_result().is_none());
+        assert!(quote.route().is_some(), "the route still holds");
+    }
+
+    #[test]
+    fn test_set_amount_out_moves_the_net_output_with_it() {
+        // 990 out, 40 of it spent on gas.
+        let mut quote = make_executable_quote();
+        quote.set_amount_out_net_gas(BigUint::from(950u64));
+
+        quote.set_amount_out(BigUint::from(970u64));
+        assert_eq!(*quote.amount_out(), BigUint::from(970u64));
+        assert_eq!(*quote.amount_out_net_gas(), BigUint::from(930u64));
+        assert!(quote.transaction().is_some(), "the calldata is the caller's to keep");
+
+        quote.set_amount_out(BigUint::from(990u64));
+        assert_eq!(*quote.amount_out_net_gas(), BigUint::from(950u64));
+
+        quote.set_amount_out(BigUint::from(10u64));
+        assert_eq!(*quote.amount_out_net_gas(), BigUint::ZERO, "gas exceeds the output");
+        quote.set_amount_out(BigUint::from(20u64));
+        assert_eq!(*quote.amount_out_net_gas(), BigUint::ZERO, "by an amount no longer known");
+    }
+
     #[test]
     fn public_quote_has_no_surplus() {
         let quote = make_quote(990);
