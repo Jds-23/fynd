@@ -1401,6 +1401,22 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::native_off_executor_chains(Chain::Polygon, "rfq:native")]
+    #[case::native_via_fallback_router(Chain::Ethereum, "fallback:rfq:native")]
+    #[case::liquorice_off_ethereum(Chain::Base, "rfq:liquorice")]
+    #[case::liquorice_via_fallback_router(Chain::Ethereum, "fallback:rfq:liquorice")]
+    fn test_register_rfq_without_executor(#[case] chain: Chain, #[case] entry: &str) {
+        let Err(err) = register_rfq_entries(chain, &[entry]) else {
+            panic!("expected {entry} to be rejected on {chain}");
+        };
+        assert!(
+            err.to_string()
+                .contains(&format!("{entry} has no executor on {chain}")),
+            "got {err}"
+        );
+    }
+
+    #[rstest::rstest]
     #[case::metric(&["rfq:metric", "fallback:rfq:metric"])]
     #[case::bebop(&["fallback:rfq:bebop", "rfq:bebop"])]
     fn test_register_rfq_both_variants(#[case] entries: &[&str]) {
