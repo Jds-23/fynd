@@ -349,7 +349,7 @@ async fn test_discover_balance_falls_back_to_the_shares_view() {
     asserter.push_success(&prestate(contract, &[shares]));
     asserter.push_success(&Bytes::from(sentinel_word()));
 
-    let (storage_contract, position) =
+    let (storage_contract, position, _) =
         discover_balance(&mocked_provider(&asserter), Address::repeat_byte(9), holder)
             .await
             .expect("the shares view places the mapping");
