@@ -95,6 +95,19 @@ impl FyndRPCBuilder {
         self
     }
 
+    /// Runs `computation` on each market update, together with the built-in derived computations.
+    ///
+    /// See [`FyndBuilder::with_computation`](fynd_core::FyndBuilder::with_computation).
+    pub fn with_computation<C: fynd_core::derived::DerivedComputation>(
+        mut self,
+        computation: C,
+    ) -> Self {
+        self.fynd_builder = self
+            .fynd_builder
+            .with_computation(computation);
+        self
+    }
+
     /// Serves the post-processors a pool lists by name. A name that `post_processors` does not
     /// hold fails the build.
     ///

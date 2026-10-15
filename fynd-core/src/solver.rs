@@ -33,7 +33,10 @@ use tycho_simulation::{
 
 use crate::{
     algorithm::{AlgorithmConfig, AlgorithmError, AlgorithmRegistry},
-    derived::{ComputationManager, ComputationManagerConfig, SharedDerivedDataRef},
+    derived::{
+        registry::ErasedComputation, ComputationManager, ComputationManagerConfig,
+        DerivedComputation, SharedDerivedDataRef,
+    },
     encoding::{encoder::Encoder, fee_fetcher::RouterFeeFetcher, router_fees::SharedRouterFees},
     feed::{
         events::{MarketEvent, MarketEventHandler},
@@ -566,6 +569,7 @@ pub struct FyndBuilder {
     simulation_block: SimulationBlock,
     price_providers: Vec<Box<dyn PriceProvider>>,
     pending_indexers: Vec<(String, Box<dyn TxDeltaIndexer>)>,
+    computations: Vec<Box<dyn ErasedComputation>>,
 }
 
 impl FyndBuilder {
@@ -609,6 +613,7 @@ impl FyndBuilder {
             simulation_block: SimulationBlock::Latest,
             price_providers: Vec::new(),
             pending_indexers: Vec::new(),
+            computations: Vec::new(),
         }
     }
 
@@ -817,6 +822,19 @@ impl FyndBuilder {
         self
     }
 
+    /// Runs `computation` on each market update, together with the built-in derived computations.
+    ///
+    /// The computation reads the market and the derived data store, and its output goes into the
+    /// store under its [`ID`](DerivedComputation::ID). A deployment can keep its own view of the
+    /// market current this way.
+    ///
+    /// The build fails when a built-in computation or an earlier call already uses the same ID.
+    pub fn with_computation<C: DerivedComputation>(mut self, computation: C) -> Self {
+        self.computations
+            .push(Box::new(computation));
+        self
+    }
+
     /// Serves the post-processors a pool lists by name.
     ///
     /// A pool lists post-processor names; this hands the builder the ones the caller registered.
@@ -1012,9 +1030,14 @@ impl FyndBuilder {
         }
         // ComputationManager::new returns a broadcast receiver that we don't need here —
         // workers subscribe via computation_manager.event_sender() below.
-        let (computation_manager, _) =
+        let (mut computation_manager, _) =
             ComputationManager::new(computation_config, market_data.clone())
                 .map_err(|e| SolverBuildError::ComputationManager(e.to_string()))?;
+        for computation in self.computations {
+            computation_manager
+                .register_boxed(computation)
+                .map_err(|e| SolverBuildError::ComputationManager(e.to_string()))?;
+        }
 
         let derived_data: SharedDerivedDataRef = computation_manager.store();
         let derived_event_tx = computation_manager.event_sender();

@@ -308,15 +308,28 @@ impl ComputationManager {
         &mut self,
         computation: C,
     ) -> Result<(), ComputationError> {
+        self.register_boxed(Box::new(computation))
+    }
+
+    /// Registers a computation that a caller boxed, like [`register`](Self::register).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ComputationError::DuplicateComputationId`] if a computation with the same id is
+    /// already registered.
+    pub(crate) fn register_boxed(
+        &mut self,
+        computation: Box<dyn ErasedComputation>,
+    ) -> Result<(), ComputationError> {
+        let id = computation.id();
         if self
             .computations
             .iter()
-            .any(|existing| existing.id() == C::ID)
+            .any(|existing| existing.id() == id)
         {
-            return Err(ComputationError::DuplicateComputationId(C::ID));
+            return Err(ComputationError::DuplicateComputationId(id));
         }
-        self.computations
-            .push(Box::new(computation));
+        self.computations.push(computation);
         Ok(())
     }
 
