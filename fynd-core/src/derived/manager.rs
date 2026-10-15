@@ -1099,6 +1099,35 @@ mod tests {
         assert!(matches!(result, Err(ComputationError::DuplicateComputationId("counter"))));
     }
 
+    /// A computation that takes the id of a built-in one.
+    struct ShadowsSpotPrices;
+
+    #[async_trait::async_trait]
+    impl DerivedComputation for ShadowsSpotPrices {
+        type Output = CounterOutput;
+        const ID: ComputationId = SpotPriceComputation::ID;
+
+        async fn compute(
+            &self,
+            _market: &MarketData,
+            _store: &SharedDerivedDataRef,
+            _changed: &ChangedComponents,
+        ) -> Result<ComputationOutput<Self::Output>, ComputationError> {
+            Ok(ComputationOutput::success(CounterOutput(0)))
+        }
+    }
+
+    #[test]
+    fn registering_a_boxed_computation_with_a_builtin_id_is_rejected() {
+        let config = ComputationManagerConfig::new().with_gas_token(token(1, "ETH").address);
+        let (mut manager, _event_rx) =
+            ComputationManager::new(config, market_with_block()).unwrap();
+
+        let result = manager.register_boxed(Box::new(ShadowsSpotPrices));
+
+        assert!(matches!(result, Err(ComputationError::DuplicateComputationId("spot_prices"))));
+    }
+
     // --- exact event sequences (characterization) ---------------------------------
 
     /// Reduces an event stream to `(kind, computation_id)` pairs for exact comparison.
