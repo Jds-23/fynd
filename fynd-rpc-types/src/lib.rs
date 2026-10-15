@@ -2325,6 +2325,28 @@ mod conversions {
         }
 
         #[test]
+        fn test_core_revert_reaches_the_wire_as_a_failure() {
+            let core = fynd_core::SimulationResult::Reverted { reason: "K".to_string() };
+            let wire = SimulationResult::from(core);
+            assert!(matches!(wire, SimulationResult::Failure { reason } if reason == "K"));
+        }
+
+        #[test]
+        fn test_core_success_drops_its_logs_on_the_wire() {
+            let core = fynd_core::SimulationResult::Success {
+                amount_out: BigUint::from(990_u64),
+                gas_used: 1,
+                logs: vec![fynd_core::EventLog {
+                    address: tycho_simulation::tycho_common::Bytes::from([0xCC_u8; 20]),
+                    topics: vec![tycho_simulation::tycho_common::Bytes::from([0xAA_u8; 32])],
+                    data: tycho_simulation::tycho_common::Bytes::from([0xBB_u8; 32]),
+                }],
+            };
+            let json = serde_json::to_string(&SimulationResult::from(core)).unwrap();
+            assert_eq!(json, r#"{"status":"success","amount_out":"990","gas_used":1}"#);
+        }
+
+        #[test]
         fn test_quote_status_from_core() {
             let cases = [
                 (fynd_core::QuoteStatus::Success, QuoteStatus::Success),

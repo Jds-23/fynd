@@ -49,6 +49,61 @@ fn test_revert_reports_no_gas() {
 }
 
 #[test]
+fn test_failure_stays_apart_from_a_revert() {
+    let result = SimulationAttempt::Failure { reason: "timed out".to_string() }.into_result();
+    assert!(matches!(result, SimulationResult::Failure { reason } if reason == "timed out"));
+}
+
+#[tokio::test]
+async fn test_simulated_call_returns_its_logs_undecoded() {
+    let emitter = Address::repeat_byte(0xCC);
+    let topics = vec![B256::repeat_byte(0x11), B256::repeat_byte(0x22)];
+    let data = Bytes::from(vec![0x33; 64]);
+    let mut response = simulated_response(
+        U256::from(123_u64)
+            .to_be_bytes::<32>()
+            .to_vec(),
+        true,
+        87_654,
+    );
+    response[0].calls[0].logs = vec![alloy::rpc::types::Log {
+        inner: alloy::primitives::Log::new_unchecked(emitter, topics.clone(), data.clone()),
+        ..Default::default()
+    }];
+    let asserter = Asserter::new();
+    asserter.push_success(&response);
+
+    let result = simulate_with_overrides(
+        &RootProvider::new(RpcClient::mocked(asserter)),
+        SimulatedCall {
+            sender: Address::repeat_byte(1),
+            router: Address::repeat_byte(2),
+            value: U256::ZERO,
+            data: &[0x12],
+        },
+        native_balance_override(Address::repeat_byte(1)),
+        test_envelope(),
+        TEST_TIMEOUT,
+    )
+    .await;
+
+    let CallOutcome::Success { logs, .. } = result else {
+        panic!("the call succeeded");
+    };
+    assert_eq!(
+        logs,
+        vec![EventLog {
+            address: emitter.to_vec().into(),
+            topics: topics
+                .iter()
+                .map(|topic| topic.to_vec().into())
+                .collect(),
+            data: data.to_vec().into(),
+        }]
+    );
+}
+
+#[test]
 fn test_token_overrides_fund_both_holders_and_both_spenders() {
     let sender = Address::repeat_byte(1);
     let router = Address::repeat_byte(2);
