@@ -1276,10 +1276,65 @@ impl OrderQuote {
         self.gas_estimate = gas_estimate;
     }
 
-    /// Overrides the output amount (used by `combine_with_surplus` to pin to the committed
-    /// reference).
-    pub(crate) fn set_amount_out(&mut self, value: BigUint) {
+    /// Sets the input amount.
+    ///
+    /// Clears the transaction, the fee breakdown and the simulation result, because they were built
+    /// for the previous amount. Encode the quote again after this call.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The new input amount, in the smallest unit of the input token.
+    pub fn set_amount_in(&mut self, value: BigUint) {
+        self.amount_in = value;
+        self.transaction = None;
+        self.fee_breakdown = None;
+        self.simulation_result = None;
+    }
+
+    /// Sets the output amount, and changes `amount_out_net_gas` by the same difference.
+    ///
+    /// When `amount_out_net_gas` is zero, it stays zero. The transaction and the fee breakdown do
+    /// not change, so the caller must keep them consistent with the new amount.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The new output amount, in the smallest unit of the output token.
+    pub fn set_amount_out(&mut self, value: BigUint) {
+        if value >= self.amount_out {
+            if self.amount_out_net_gas > BigUint::ZERO {
+                self.amount_out_net_gas += &value - &self.amount_out;
+            }
+        } else {
+            let lost = &self.amount_out - &value;
+            self.amount_out_net_gas = if self.amount_out_net_gas > lost {
+                &self.amount_out_net_gas - lost
+            } else {
+                BigUint::ZERO
+            };
+        }
         self.amount_out = value;
+    }
+
+    /// Changes a solved quote into a quote without a route.
+    ///
+    /// Sets the status to `status`. Clears the route, the transaction, the fee breakdown, the
+    /// simulation result and the surplus, and sets the output amounts and the gas to zero. The
+    /// input amount does not change.
+    ///
+    /// # Arguments
+    ///
+    /// * `status` - The status to report, for example [`QuoteStatus::NoRouteFound`].
+    pub fn retract(&mut self, status: QuoteStatus) {
+        self.status = status;
+        self.route = None;
+        self.transaction = None;
+        self.fee_breakdown = None;
+        self.simulation_result = None;
+        self.surplus = None;
+        self.price_impact_bps = None;
+        self.amount_out = BigUint::ZERO;
+        self.amount_out_net_gas = BigUint::ZERO;
+        self.gas_estimate = BigUint::ZERO;
     }
 
     /// Overrides the gas-adjusted net output (used by gas refinement and surplus overlay).
