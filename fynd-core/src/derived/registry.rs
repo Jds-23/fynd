@@ -15,7 +15,8 @@
 //! 1. Implement [`DerivedComputation`] for your type, declaring
 //!    [`requirements`](DerivedComputation::requirements) for any upstream computations it reads and
 //!    [`persist`](DerivedComputation::persist) if it needs storage beyond the default slot.
-//! 2. Register it with `ComputationManager::register`.
+//! 2. Register it with `ComputationManager::register`. Code outside this crate registers it with
+//!    `FyndBuilder::with_computation`.
 //!
 //! The manager orders it by its requirements and runs it each block; this module
 //! needs no change.

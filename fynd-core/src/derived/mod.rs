@@ -56,15 +56,21 @@ pub(crate) mod computations;
 pub(crate) mod error;
 pub(crate) mod events;
 mod manager;
-mod registry;
+pub(crate) mod registry;
 mod store;
 pub(crate) mod tracker;
 /// Derived values an algorithm reads: token gas prices, pool depths, spot prices.
 pub mod types;
 
-// Only export the public API: manager, config, store, shared reference type, and the
-// map aliases the store getters already expose in their signatures
-pub use computation::FailedItemError;
-pub use manager::{ComputationManager, ComputationManagerConfig, SharedDerivedDataRef};
+// Only export the public API: manager, config, store, shared reference type, the map aliases
+// the store getters already expose in their signatures, and what a caller needs to implement a
+// computation for `FyndBuilder::with_computation`.
+pub use computation::{
+    ComputationId, ComputationOutput, DerivedComputation, FailedItem, FailedItemError,
+};
+pub use error::ComputationError;
+pub use manager::{
+    ChangedComponents, ComputationManager, ComputationManagerConfig, SharedDerivedDataRef,
+};
 pub use store::{ComputationStatus, DerivedData};
 pub use types::{ComponentDepths, TokenGasPrices};
