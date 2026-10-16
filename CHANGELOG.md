@@ -1,4 +1,12 @@
 
+## [0.112.4](https://github.com/propeller-heads/fynd/compare/0.112.3...0.112.4) (2026-10-15)
+
+### Features
+
+* **core:** let rfq_swap_replacer fill Native quotes partially ([48eeb15](https://github.com/propeller-heads/fynd/commit/48eeb156ef8554ee6167387b5e58daf7f1cedb2d))
+* **core:** add the Native and Liquorice RFQs ([7c222a1](https://github.com/propeller-heads/fynd/commit/7c222a1e485ebdfd3959814acd4e76a6654b598f))
+
+
 ## [0.112.3](https://github.com/propeller-heads/fynd/compare/0.112.2...0.112.3) (2026-10-14)
 
 ### Features
