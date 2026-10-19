@@ -4,7 +4,7 @@ use tokio_stream::Stream;
 use tracing::{info, warn};
 use tycho_execution::encoding::evm::{
     swap_encoder::swap_encoder_registry::SwapEncoderRegistry, BEBOP_FALLBACK_PROTOCOL_SYSTEM,
-    HASHFLOW_FALLBACK_PROTOCOL_SYSTEM, METRIC_FALLBACK_PROTOCOL_SYSTEM,
+    HASHFLOW_FALLBACK_PROTOCOL_SYSTEM,
 };
 use tycho_simulation::{
     evm::{
@@ -142,13 +142,13 @@ fn uniswap_v4_hook_filter(component: &ComponentWithState) -> bool {
 /// elsewhere.
 const PRICE_LEVEL_STREAM_CHAIN: Chain = Chain::Ethereum;
 
-/// The chains Metric's executor is deployed on.
+/// The chains Fynd serves Metric on through its RFQ client.
 ///
-/// Tracks tycho-execution's `executor_addresses.json`. A Metric leg on any other chain would price
-/// from the RFQ stream and then fail to encode, so the entry is rejected at registration instead.
-/// A `fallback:rfq:metric` entry must also pass this check, because `MetricFallbackRouter` calls
-/// the Metric pools that `MetricExecutor` calls.
-const METRIC_CHAINS: &[Chain] = &[Chain::Base, Chain::Robinhood];
+/// An `rfq:metric` or `fallback:rfq:metric` entry on any other chain is rejected at registration.
+/// Each entry must also have its own executor in tycho-execution's `executor_addresses.json`, or
+/// its legs would price from the RFQ stream and then fail to encode: BSC has only the fallback
+/// executor.
+const METRIC_CHAINS: &[Chain] = &[Chain::Base, Chain::Robinhood, Chain::Bsc];
 
 /// Whether a `--protocols` entry names a Tycho protocol system.
 ///
@@ -591,12 +591,9 @@ pub(crate) fn register_rfq(
                     .add_client::<HashflowState>("hashflow", Box::new(hashflow_client));
             }
             "rfq:metric" => {
-                if let RfqEntry::ViaFallbackRouter(_) = rfq_entry {
-                    require_executor(chain, METRIC_FALLBACK_PROTOCOL_SYSTEM)?;
-                }
                 if !METRIC_CHAINS.contains(&chain) {
                     return Err(DataFeedError::Config(format!(
-                        "{protocol} is only deployed on {}, but this feed runs on {chain}",
+                        "{protocol} is only served on {}, but this feed runs on {chain}",
                         METRIC_CHAINS
                             .iter()
                             .map(|chain| chain.to_string())
@@ -604,6 +601,7 @@ pub(crate) fn register_rfq(
                             .join(", ")
                     )));
                 }
+                require_executor(chain, protocol)?;
                 let api_key = get_env("METRIC_API_KEY")?;
                 info!("Adding {protocol} RFQ client...");
                 let mut metric_builder = MetricClientBuilder::new(chain)
@@ -1376,14 +1374,15 @@ mod tests {
         assert_eq!(is_tycho_system(entry), expected.is_none());
     }
 
+    /// BSC has a Metric fallback executor but no direct one.
     #[test]
-    fn test_register_rfq_fallback_router_without_executor() {
-        let Err(err) = register_rfq_entries(Chain::Arbitrum, &["fallback:rfq:metric"]) else {
-            panic!("expected fallback:rfq:metric to be rejected on arbitrum");
+    fn test_register_rfq_metric_without_executor() {
+        let Err(err) = register_rfq_entries(Chain::Bsc, &["rfq:metric"]) else {
+            panic!("expected rfq:metric to be rejected on bsc");
         };
         assert!(
             err.to_string()
-                .contains("fallback:rfq:metric has no executor on arbitrum"),
+                .contains("rfq:metric has no executor on bsc"),
             "got {err}"
         );
     }
@@ -1433,11 +1432,11 @@ mod tests {
     #[test]
     fn test_register_rfq_metric_off_supported_chains() {
         let Err(err) = register_rfq_entries(Chain::Ethereum, &["rfq:metric"]) else {
-            panic!("expected rfq:metric to be rejected where Metric has no executor");
+            panic!("expected rfq:metric to be rejected where Fynd does not serve Metric");
         };
         assert!(
             err.to_string()
-                .contains("only deployed on base, robinhood"),
+                .contains("only served on base, robinhood, bsc"),
             "got {err}"
         );
     }
@@ -1445,6 +1444,7 @@ mod tests {
     #[rstest::rstest]
     #[case::base(Chain::Base, "rfq:metric")]
     #[case::robinhood_via_fallback_router(Chain::Robinhood, "fallback:rfq:metric")]
+    #[case::bsc_via_fallback_router(Chain::Bsc, "fallback:rfq:metric")]
     fn test_register_rfq_metric_requires_api_key(#[case] chain: Chain, #[case] entry: &str) {
         env::remove_var("METRIC_API_KEY");
         let Err(err) = register_rfq_entries(chain, &[entry]) else {
