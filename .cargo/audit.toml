@@ -1,7 +1,19 @@
 [advisories]
 # RUSTSEC-2025-0055: tracing-subscriber ^0.2 log poisoning via ANSI escapes
-# Dep chain: tycho-simulation <- revm <- ark-bn254 <- ark-r1cs-std <- ark-relations <- tracing-subscriber ^0.2
-# We need ark to update their dependencies to fix this.
+# Dep chain: tycho-simulation <- revm 29 <- revm-precompile 27 <- ark-bn254 0.5 <- ark-r1cs-std
+# <- ark-relations 0.5 <- tracing-subscriber ^0.2. ark-r1cs-std is behind ark-bn254's off-by-default
+# r1cs feature, so tracing-subscriber 0.2 is in Cargo.lock but never compiled. ark 0.6 uses
+# tracing-subscriber 0.3 and revm-precompile 42+ uses ark 0.6; drop this once tycho-simulation
+# moves off revm 29.
+#
+# RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369: zip <9.0.0 extract() follows symlinks
+# and keeps SUID/SGID bits. zip 3 is only a build-dependency of utoipa-swagger-ui, whose build
+# script unpacks the pinned Swagger UI release with its own loop and never calls extract().
+# utoipa-swagger-ui 10.0.1 still requires zip ^8.6. Upstream moved to zip 9 in
+# https://github.com/juhaku/utoipa/pull/1645; drop these once that is released and we upgrade.
 ignore = [
     "RUSTSEC-2025-0055",
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]
