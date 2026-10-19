@@ -95,6 +95,33 @@ impl FyndRPCBuilder {
         self
     }
 
+    /// Runs `computation` on each market update, together with the built-in derived computations.
+    ///
+    /// See [`FyndBuilder::with_computation`](fynd_core::FyndBuilder::with_computation).
+    pub fn with_computation<C: fynd_core::derived::DerivedComputation>(
+        mut self,
+        computation: C,
+    ) -> Self {
+        self.fynd_builder = self
+            .fynd_builder
+            .with_computation(computation);
+        self
+    }
+
+    /// Serves the post-processors a pool lists by name. A name that `post_processors` does not
+    /// hold fails the build.
+    ///
+    /// See [`FyndBuilder::with_post_processors`](fynd_core::FyndBuilder::with_post_processors).
+    pub fn with_post_processors(
+        mut self,
+        post_processors: fynd_core::PostProcessorRegistry,
+    ) -> Self {
+        self.fynd_builder = self
+            .fynd_builder
+            .with_post_processors(post_processors);
+        self
+    }
+
     /// Sets the HTTP host (default: "0.0.0.0").
     pub fn http_host(mut self, host: String) -> Self {
         self.http_host = host;
@@ -165,6 +192,15 @@ impl FyndRPCBuilder {
         self.fynd_builder = self
             .fynd_builder
             .worker_router_min_responses(min);
+        self
+    }
+
+    /// Sets how long encoding retries may take, counted from when the best candidates were
+    /// encoded (default: 5ms). `Duration::ZERO` turns retrying off.
+    pub fn encoding_retry_budget(mut self, budget: Duration) -> Self {
+        self.fynd_builder = self
+            .fynd_builder
+            .encoding_retry_budget(budget);
         self
     }
 
@@ -336,6 +372,15 @@ impl FyndRPCBuilder {
         self.fynd_builder = self
             .fynd_builder
             .simulation_enabled(enabled);
+        self
+    }
+
+    /// Sets the block that a quote simulation runs on. Defaults to
+    /// [`SimulationBlock::Latest`](fynd_core::SimulationBlock::Latest).
+    pub fn simulation_block(mut self, block: fynd_core::SimulationBlock) -> Self {
+        self.fynd_builder = self
+            .fynd_builder
+            .simulation_block(block);
         self
     }
 

@@ -7,19 +7,20 @@ applications.
 
 | Module                | Description                                                                                                                                                                        |
 |-----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `algorithm/`          | `Algorithm` trait + built-in `MostLiquidAlgorithm`, `BellmanFordAlgorithm`, `PathFrankWolfeAlgorithm`, `WaterFillAlgorithm`. Pluggable via associated graph types. `AlgorithmConfig` shared by built-ins |
+| `algorithm/`          | `Algorithm` trait + built-in `MostLiquidAlgorithm`, `BellmanFordAlgorithm`, `PathFrankWolfeAlgorithm`, `WaterFillAlgorithm`. Pluggable via associated graph types. `AlgorithmConfig` shared by built-ins. `AlgorithmRegistry` (`registry.rs`) maps pool-config algorithm names to custom algorithms; built-in names live in `worker_pool/registry.rs` (`AlgorithmSpawner`, `AVAILABLE_ALGORITHMS`) |
 | `solver.rs`           | `FyndBuilder` assembles the full pipeline (feed + gas + computations + pools + encoder + router). `Solver` runs it                                                                 |
-| `worker_pool/`        | `WorkerPool` manages dedicated OS threads. `SolverWorker` runs a prioritized select loop (shutdown > market events > derived events > tasks). `TaskQueue` is `async_channel`-based. Two rules keep components out of one worker's graph: `should_drop_component` (a free function here) for exclusive components in a `PublicOnly` pool and for the pool's `exclude_protocols`, and `fallback::manager::PammManager` for pAMMs the market does not back. The first holds for the worker's life; the pAMM rule expires, so `PammManager::apply_pamm_admission` re-decides it per market event, in both directions, on `propamm_admissions_total{outcome=admitted|withheld|evicted,pool}`. `price_impact` runs after route finding: it computes `price_impact_bps` from the route token map and each swap's reported spot price, supports linear and split routes, and reads no shared `MarketState`. On failure the worker omits the field, logs at debug, and increments `worker_pool_price_impact_calculations_total{pool,outcome}` |
+| `worker_pool/`        | `WorkerPool` manages dedicated OS threads. `SolverWorker` runs a prioritized select loop (shutdown > market events > derived events > tasks). `TaskQueue` is `async_channel`-based. Two rules govern component admission to a worker's graph: the free function `should_drop_component` excludes exclusive components in a `PublicOnly` pool and the pool's `exclude_protocols`; `fallback::manager::PammManager` excludes pAMMs the market does not back. The algorithm's graph and fallback pricing also exclude `algorithm_exclude_protocols`. Post-processors still see those components and receive market events filtered only by the pool rule. The first holds for the worker's life; the pAMM rule expires, so `PammManager::apply_pamm_admission` re-decides it per market event, in both directions, on `propamm_admissions_total{outcome=admitted|withheld|evicted,pool}`. `price_impact` runs after route finding: it computes `price_impact_bps` from the route token map and each swap's reported spot price, supports linear and split routes, and reads no shared `MarketState`. On failure the worker omits the field, logs at debug, and increments `worker_pool_price_impact_calculations_total{pool,outcome}` |
 | `worker_pool_router/` | `WorkerPoolRouter` allocates the worker pools that serve each order (`allocation`: `OrderClass` matched by `SolverPoolHandle::serves`), fans out to those, drops candidates whose pAMM fallback misses `min_amount_out`, ranks the rest by `amount_out_net_gas` descending; price guard (if enabled) validates in rank order; optionally encodes |
-| `feed/`               | `TychoFeed` (WebSocket → MarketState), `GasPriceFetcher`, `MarketEvent` broadcasting, `ProtocolRegistry`. `component_filter` drops components from one worker's graph topology and incoming events; `exclusivity` classifies exclusive components |
-| `derived/`            | `ComputationManager` runs `SpotPriceComputation` and `TokenGasPriceComputation` in one stage, then `ComponentDepthComputation`, every block. `ReadinessTracker` gates workers until data is fresh |
-| `graph/`              | `pub` — `GraphManager` trait (initialize + incremental update), `PetgraphStableDiGraphManager`, `StableDiGraph` (re-exported), `EdgeWeightUpdaterWithDerived`, `Path` type           |
-| `fallback/`           | Picks the pool each `fallback:` leg falls back to and prices the route through it. Tycho's `TychoFallbackRouter` retries a failed pAMM leg on a fallback pool the encoder names, so the solver chooses it: `FallbackPoolIndex` indexes candidate pools by pair, admitting a component whose protocol system tycho-execution's `FallbackProtocol::from_protocol_system` maps to a protocol `supported_on` the component's chain (none on a chain with no router, so its pAMMs are all withheld), and never a hooked Uniswap V4 pool; `price_through_fallbacks` runs `select_fallback` on every pAMM leg, taking the candidate pool with the best simulated amount out that the request's route filter does not exclude, stamps it on the `Swap` as a `FallbackLeg`, and replays the route through those fallbacks in the same pass. `WorkerPoolRouter` drops the route candidate before ranking when that amount cannot clear `min_amount_out`, which keeps describing the pAMM quote and the user's slippage. Selection and replay share one `FallbackError`, whose `rejection()` gives the `RouteRejection` the worker reports. `PammManager` (`manager.rs`) owns one worker's pAMM state — the fallback pool index and where each pAMM stands: `withhold_from_graph` decides them all for a new graph, `apply_pamm_admission` re-decides them per event as candidate pools arrive and leave |
+| `feed/`               | `TychoFeed` (WebSocket → MarketState), `GasPriceFetcher`, `MarketEvent` broadcasting, `protocol_registry` (free functions that parse and register `--protocols` entries), `metrics_sampler` (exports per-protocol market gauges on a timer). `component_filter` drops components from one worker's graph topology and incoming events; `exclusivity` classifies exclusive components |
+| `derived/`            | `ComputationManager` runs `SpotPriceComputation` and `TokenGasPriceComputation` in one stage, then `ComponentDepthComputation`, every block. `ReadinessTracker` gates workers until data is fresh. `FyndBuilder::with_computation` registers a caller's `DerivedComputation` (via `ComputationManager::register_boxed`) to run after the built-ins; a duplicate `ComputationId` fails the build, and readiness waits only on the built-ins |
+| `graph/`              | `pub` — `GraphManager` trait (initialize + incremental update), `PetgraphStableDiGraphManager`, `StableDiGraph` (re-exported), `TopologyGraph` / `TopologyGraphManager` (`token_graph.rs`, the graph `MostLiquidAlgorithm` and `WaterFillAlgorithm` use), `EdgeWeightUpdaterWithDerived`, `Path` type |
+| `fallback/`           | Picks the pool each `fallback:` leg falls back to and prices the route through it. A `fallback:` leg is a pAMM leg or a `fallback:rfq:` RFQ leg, and the module calls both "pAMM". Tycho's `TychoFallbackRouter` (or `MetricFallbackRouter` / `BebopFallbackRouter` / `HashflowFallbackRouter` for an RFQ leg) retries a failed leg on a fallback pool the encoder names, so the solver chooses it: `FallbackPoolIndex` indexes candidate pools by pair, admitting a component whose protocol system tycho-execution's `FallbackProtocol::from_protocol_system` maps to a protocol `supported_on` the component's chain (none on a chain with no router, so its pAMMs are all withheld), and never a hooked Uniswap V4 pool; `price_through_fallbacks` runs `select_fallback` on every pAMM leg, taking the candidate pool with the best simulated amount out that the request's route filter does not exclude, stamps it on the `Swap` as a `FallbackLeg`, and replays the route through those fallbacks in the same pass. `WorkerPoolRouter` drops the route candidate before ranking when that amount cannot clear `min_amount_out`, which keeps describing the pAMM quote and the user's slippage. Selection and replay share one `FallbackError`, whose `rejection()` gives the `RouteRejection` the worker reports. `PammManager` (`manager.rs`) owns one worker's pAMM state — the fallback pool index and where each pAMM stands: `withhold_from_graph` decides them all for a new graph, `apply_pamm_admission` re-decides them per event as candidate pools arrive and leave |
 | `price_guard/`        | Price guard: external price validation for quotes. Sub-modules: `guard` (validation logic), `binance_ws` (Binance WebSocket price provider), `hyperliquid` (Hyperliquid oracle provider), `provider_registry`, `config`, `utils` |
-| `simulation/`         | Encoded-quote simulation, switched on per deployment with `--enable-simulation`. `token_layout` — the storage slots a token keys its balances and allowances on, found by tracing the reads its own view functions make, so a non-standard layout (USDT, stETH shares, a proxy holding state elsewhere) can still be funded; the tool crates use it too. `simulator` — runs the quote under `eth_simulateV1` with those overrides, caching one layout per token. `revert` — names the error a reverting call carries, replaying it under the call tracer when `eth_simulateV1` drops the payload. `deviation` — the quote-versus-simulation bps figure, shared by the log and the metric |
+| `simulation/`         | Encoded-quote simulation, switched on per deployment with `--enable-simulation`. `token_layout` — the storage slots a token keys its balances and allowances on, found by tracing the reads its own view functions make, so a non-standard layout (USDT, stETH shares, a proxy holding state elsewhere, a namespaced mapping such as Base's B20, Solady's seeded keys) can still be funded; a reflection token's balance is stored scaled (`BalanceEncoding::Scaled`, written through `TokenLayout::balance_word`); the tool crates use it too. `simulator` — runs the quote under `eth_simulateV1` with those overrides, caching one layout per token. `SimulationBlock` (crate root; `FyndBuilder::simulation_block`, CLI `--simulate-on-quote-block`) picks the latest block (default) or the quote's own block, which is retried for up to two block times while the node lacks it and otherwise yields `SimulationResult::BlockUnavailable`. The core `SimulationResult` (`#[non_exhaustive]`) is `Success`, `Reverted`, `Failure` or `BlockUnavailable`; on the wire the last three are `failure`. `SimulationPurpose` labels the simulation metrics (`purpose`). A quote requested with client fee params carries a placeholder client fee signature, because the client signs after quoting. The simulator gives the client fee receiver code that accepts any ERC-1271 signature. A revert logs the full `eth_simulateV1` payload, pinned to the block it ran in, under the opt-in `fynd::simulation_replay` debug target, so the call can be rerun off-line. `revert` — names the error a reverting call carries, replaying it under the call tracer when `eth_simulateV1` drops the payload. `deviation` — the quote-versus-simulation bps figure, shared by the log and the metric |
 | `rpc.rs`              | private — `eth_call` and Tycho-address-to-alloy-address helpers used by `encoding::fee_fetcher` |
-| `replay.rs`           | `replay_route(&Route, &MarketState)` — re-execute an already-built route against a (possibly newer) market state, honoring split fractions and shared-pool depletion. Used by `hindsight` to measure quote-to-execution slippage |
+| `replay.rs`           | `replay_route(&Route, &MarketState)` — re-execute an already-built route against a (possibly newer) market state, honoring split fractions and shared-pool depletion. Exported for embedders that measure quote-to-execution slippage; in this crate `fallback/` and `algorithm/split_primitives.rs` use it. `simulate_swaps` (crate-private) runs a swap list on caller-chosen token and state lookups and returns `SimulatedRoute`, with the amount in, amount out and gas of each swap; `RfqSwapReplacer` uses it |
 | `encoding/`           | `Encoder` wraps `tycho-execution` to produce ABI-encoded calldata (singleSwap, sequentialSwap, Permit2 variants). Each order encodes on its own blocking task, `MAX_CONCURRENT_ENCODES` (32, the same cap `tycho-execution` applies to a batch) at a time, so one order's failure (an RFQ leg whose signed quote does not arrive, say) marks that order `QuoteStatus::EncodingFailed` and leaves every other order's calldata in place. A failure that belongs to one order never fails the call, as with `NoRouteFound` and `PriceCheckFailed`. Optional calldata watermark (`with_calldata_watermark`) appends attribution bytes the EVM ignores; a per-request `EncodingOptions::with_calldata_watermark` (serde-skipped, set by the serving layer) replaces it for that request. Computes `FeeBreakdown` mirroring on-chain `FeeCalculator` logic. `RouterFees`/`SharedRouterFees` hold default + per-client fee rates; `RouterFeeFetcher` refreshes them from the FeeCalculator contract every 5 min. `DisableSlippageTakingSigner` (`disable_slippage_taking.rs`, crate-internal, key from `DISABLE_SLIPPAGE_TAKING_SIGNER_KEY`) signs zero-fee `ClientFee` params when `EncodingOptions::disable_slippage_taking` is set, so the FeeCalculator applies its address's positive-slippage exemption; that also makes the signer the request's fee client (displacing the `tx.origin`/sender fallback in `Encoder::fee_client`) and stamps a `DEFAULT_DEADLINE_WINDOW_SECS` deadline the unsigned path did not have. `DEFAULT_DEADLINE_WINDOW_SECS` (120s, `mod.rs`) is shared with `exclusive_swap.rs`, so a quote carrying both signatures has one expiry |
+| `post_process/`       | `RoutePostProcessor` trait and `PostProcessorRegistry`. A pool config lists post-processor names in `post_processors`; `FyndBuilder::with_post_processors` supplies the registry, and `FyndBuilder` resolves the names, so an unknown name fails the build with `SolverBuildError::UnknownPostProcessor`. Each worker builds its own instances once, on its thread, and holds them in `PostProcessors` (`pipeline.rs`), which runs them. The worker calls `initialize` in `initialize_graph`, passes every filtered market event to `handle_event` after the graph manager, and in `quote` checks the algorithm's route first (route validation and the route filter, as without post-processors), then runs them in config order on it. `PostProcessRequest::drops_component` gives them the pool's drop rule. A post-processor still running at the post-process deadline, 10 ms (`POST_PROCESS_DEADLINE_MARGIN`) before the task deadline, is cut off, and the worker keeps its input route, so that route still reaches the router in time. A post-processor reads the route by reference and returns `None` to keep it. A processed route that fails route validation, the request route filter, or the worker checks (it uses a component the pool drops, for a sell order has `net_amount_out` above its amount out, or has a `fallback:` leg that fallback pricing rejects) is logged at warn, counted in `worker_pool_post_processed_route_rejected_total{pool}`, and the quote uses the algorithm's route. `rfq_swap_replacer` (`rfq.rs`, crate-private `RfqSwapReplacer`) is built in. It replaces one swap or one segment of a sell order's route with a single RFQ swap when that raises the net amount out; only `PARTIAL_FILL_PROTOCOLS` (`rfq:bebop`, `rfq:hashflow`, `rfq:native`, also under `fallback:`) may replace swaps after the first, other RFQs only swaps starting at the sell token. `PostProcessorRegistry::resolve` finds it by name, and `with_post_processor` refuses that name. Each run records `worker_pool_post_processor_duration_seconds{pool,post_processor}` and `worker_pool_post_processor_outcomes_total{pool,post_processor,outcome}`, where `outcome` is `replaced`, `kept`, `timed_out` or `skipped` (the post-process deadline passed before it started). A replacement also records `worker_pool_post_processor_gain_bps{pool,post_processor}`, the gain in `net_amount_out` over the route the post-processor received, in bps (not recorded when that net is not positive; it counts a route that the worker checks later reject). `PostProcessors::run` returns a `ProcessedRoute` with the names of the post-processors that replaced the route; the worker puts them on the quote as `OrderQuote::post_processed_by` (empty when the checks reject the route; internal, not on the wire), and the router adds them as the `post_processed_by` label (names joined by `+`, or `none`) to `worker_router_best_quote_pool`, `worker_router_won_volume_gas_token` and `worker_router_unpriced_won_quotes_total` |
 | `types/`              | Core types: `Order`, `Route`, `Swap`, `Quote`, `QuoteRequest`, `BlockInfo`, `EncodingOptions`, `FeeBreakdown`, error types. `RouteExclusionFilter` is the liquidity a request excludes from a route (pools, protocol systems, tokens), empty by default. `MarketState::resolve_route_filter` turns it into the `RouteExclusions` a graph query and an algorithm read, with each protocol system replaced by the pools `MarketState::components_by_protocol` holds for it                                                         |
 
 ## Key Traits
@@ -40,8 +41,11 @@ pub trait Algorithm: Send + Sync {
 ### `GraphManager` (`graph/mod.rs`)
 
 ```rust
-pub trait GraphManager<G>: Send + Sync {
-    fn initialize_graph(&mut self, components: &HashMap<ComponentId, Vec<Address>>);
+pub trait GraphManager<G>: Send + Sync
+where
+    G: Send + Sync,
+{
+    fn initialize_graph(&mut self, components: &FxHashMap<ComponentId, Vec<Address>>);
     fn graph(&self) -> &G;
 }
 ```
@@ -62,7 +66,8 @@ Returns a `Solver` that can `quote()` directly. For standalone (non-HTTP) use.
 Price guard methods: `price_guard_enabled(bool)`, `register_price_provider(Box<dyn PriceProvider>)`,
 `add_default_price_providers()` (registers Binance WS + Hyperliquid providers).
 Simulation is deployment-gated with `simulation_enabled(bool)` and attached to the router with
-`WorkerPoolRouter::with_simulator`.
+`WorkerPoolRouter::with_simulator`; `simulation_block(SimulationBlock)` picks the block it runs on.
+`with_computation(C)` adds a caller's `DerivedComputation` (see `derived/` above).
 
 Additional builder methods: `partial_blocks(bool)` (enable flashblock/partial-block updates),
 `with_pending_indexer(...)` (attach a pending-block indexer), `build_with_pending()` (build with
@@ -105,8 +110,10 @@ recorded with `tools/record-market`. See `tests/integration/README.md`.
 
 1. `TychoFeed` writes new state into `MarketState` (via `MarketData`, `Arc<RwLock<>>`)
 2. Broadcasts `MarketEvent` → workers update local graph via `GraphManager`
-3. Signals `GasPriceFetcher`
-4. Triggers `ComputationManager` → `DerivedData` → workers update edge weights
+3. Triggers `ComputationManager` → `DerivedData` → workers update edge weights
+
+`GasPriceFetcher` runs independently on its own timer (`--gas-refresh-interval-secs`) and writes
+the gas price into `MarketState`.
 
 **Solving** (`Solver::quote(request)`):
 
@@ -116,14 +123,28 @@ recorded with `tools/record-market`. See `tests/integration/README.md`.
 1. `WorkerPoolRouter` fans out to the allocated pools in parallel
 2. Each pool dispatches to a `SolverWorker`, which resolves the request's `RouteExclusionFilter` against the
    market and hands the result to `Algorithm::find_best_route` → `RouteResult`. An algorithm takes
-   the request apart with the consuming `SolveRequest::into_parts` method; a route search reads its own
+   the request apart with the consuming `SolveRequest::into_parts` method (returns `SolveParts`); a route search reads its own
    `GraphQueryFilter` bounds and the request's `RouteExclusions` through one `RouteSearch`
-3. Selects best by `amount_out_net_gas` → optional `Encoder` → optional simulation → `Quote`
+3. Selects best by `amount_out_net_gas` → optional `Encoder` → optional simulation → `Quote`.
+   When an order's best candidate fails to encode, the next successful candidate without an RFQ
+   leg is encoded instead, until one encodes, none remain, or the encoding retry budget (5ms by
+   default, `WorkerPoolRouterConfig::with_encoding_retry_budget`) has passed since the first
+   encode. A retry still encoding then is given up; the best candidates have no time limit.
+   `encoding_retry_successes_total{best_route=rfq|other}` counts the orders a retry rescued. An RFQ
+   leg fails to encode when the maker signs further below its price levels than the user's slippage,
+   since the route is then likely to revert on-chain: `Encoder` sets the slippage as each swap's
+   `max_signed_quote_shortfall_bps`, tycho-execution returns a `RecoverableError` reading "… bps
+   below its price levels …", and `rfq_slippage_rejections_total{protocol,route_shape}` counts it.
+   The check is per leg, exact for a `single_hop` route and stricter than needed for `multi_hop` and
+   `split` ones.
 
 Steps 0-2 are exposed as the public `WorkerPoolRouter::solve`, returning every order's ranked
 candidates as `RankedQuotes`; step 3 splits into the public `encode_quotes`,
 `WorkerPoolRouter::simulate_quotes` and `finalize_quote`, for embedders that need more than the
-single best route per order.
+single best route per order. `simulate_quotes_for` is `simulate_quotes` with the caller's own
+`SimulationPurpose` metric label. Between stages, `OrderQuote::set_amount_in` (clears the
+transaction, fee breakdown and simulation result, so encode again), `set_amount_out` and
+`retract(status)` adjust a quote, and `EncodingOptions::with_slippage` changes the slippage.
 
 An embedder that composes those stages runs all four, in that order. `simulate_quotes` takes the
 same `EncodingOptions` as `encode_quotes` and returns the quotes untouched when they do not ask
@@ -133,15 +154,16 @@ reason.
 
 ## Non-Tycho Liquidity Sources
 
-Two kinds of `--protocols` entry name a stream other than Tycho's, each with its own endpoint and
+Three kinds of `--protocols` entry name a stream other than Tycho's, each with its own endpoint and
 its own registration function in `feed/protocol_registry.rs`:
 
 | Entry | Registered by | Stream |
 |---|---|---|
 | `rfq:<protocol>` | `register_rfq` | RFQ client, driven by a supervised task writing into an mpsc channel |
+| `fallback:rfq:<protocol>` | `register_rfq` | The same RFQ client, labelling its components `fallback:rfq:<protocol>` so they execute through that protocol's fallback router (`MetricFallbackRouter`, `BebopFallbackRouter`, `HashflowFallbackRouter`) |
 | `pricelevelstream:<venue>` | `open_price_level_stream` | Titan pAMM price level WebSocket, an `impl Stream<Item = Update>` polled directly (it reconnects on its own, so there is no task to supervise) |
 
-`register_exchanges` skips both prefixes, and `has_tycho_protocols` / `has_rfq_protocols` tell
+`register_exchanges` skips all three prefixes, and `has_tycho_protocols` / `has_rfq_protocols` tell
 `TychoFeed` which sources to open. `is_tycho_system` is the per-entry form of the first, used by
 `register_exchanges` to skip these entries and exported so `fynd_rpc::protocols` can leave them out
 of its Tycho availability check. Both feed loops (`run` and `run_with_pending`, the latter
@@ -153,14 +175,22 @@ as a handle to a feed that dies.
 Each RFQ client reads its own credentials through `get_env`, so a missing one is a
 `DataFeedError::Config` at registration rather than a client that streams nothing: `BEBOP_KEY` for
 `rfq:bebop`, `HASHFLOW_USER`/`HASHFLOW_KEY` for `rfq:hashflow`, `METRIC_API_KEY` for `rfq:metric`
-(whose `METRIC_API_URL` stays optional, defaulting to Metric's public endpoint). `rfq:metric` is
+(whose `METRIC_API_URL` stays optional, defaulting to Metric's public endpoint), `NATIVE_API_KEY`
+for `rfq:native`, and `LIQUORICE_USER`/`LIQUORICE_KEY` for `rfq:liquorice`. `rfq:metric` is
 also gated on `METRIC_CHAINS`, the chains tycho-execution deploys its executor to — elsewhere the
 entry is rejected instead of pricing legs that cannot be encoded. That gate is what splits Metric
 between the two non-Tycho sources: the price level stream serves it on Ethereum
 (`pricelevelstream:metric`, executing through the `TychoFallbackRouter`) and `rfq:metric` serves it
 on the chains `METRIC_CHAINS` names (executing through `MetricExecutor`). `METRIC_CHAINS` and
-`PRICE_LEVEL_STREAM_CHAIN` are disjoint, so no deployment can stream the same Metric inventory
-twice.
+`PRICE_LEVEL_STREAM_CHAIN` are disjoint, so the price level stream and the RFQ clients never
+stream the same Metric inventory twice.
+
+A `fallback:rfq:` entry (`fallback:rfq:metric`, `fallback:rfq:bebop`, `fallback:rfq:hashflow`) is
+rejected at registration unless tycho-execution's default `executor_addresses.json` lists that exact
+protocol system for the chain. `fallback:rfq:metric` must also pass the `METRIC_CHAINS` gate. A list that names one RFQ protocol both
+with and without `fallback:` is rejected too: both clients would emit the same component ids under
+different labels. The components are in the `fallback:` family, so the fallback module gives
+their legs a fallback pool like a pAMM's, and a `fallback:` exclusion removes them.
 
 Price level venues must be one of tycho-simulation's `default_served_pamms` — an unrecognised name
 is a `DataFeedError::Config`, not a warning, because these entries are always hand-written. The
@@ -218,6 +248,22 @@ After public ranking, `combine_with_surplus` overlays any `IncludeExclusive`-sco
 beats the committed amount and records the difference as `SurplusInfo`
 (`OrderQuote::surplus_amount()`, `committed_amount_out()`, `Swap::committed_amount_out()`). All are
 `#[serde(skip)]` — internal, not on the wire.
+
+The one exclusive leg can sit at any hop of the route (`has_valid_exclusive_route`). When pools
+follow it, `pin_commitment` converts the surplus into the leg's token at the average price of those
+pools (`leg_route_output`): the route output the leg's output produces, divided by the leg's
+output. The conversion runs no simulation. On split and merging routes the leg gets the share of
+its token's route output that its own output makes up. The user gets at least the committed amount
+when the pools after the leg give less per unit as their input grows, which holds for AMM pools.
+After a hook pool, a market-maker quote with a minimum order size, or a fixed-rate pool (rounding),
+the user can get slightly less; the router's `min_amount_out` bounds that loss by the request's
+slippage.
+
+Two counters report the exclusive candidates `has_valid_exclusive_route` rejects:
+`exclusive_route_multiple_legs_total` (more than one exclusive leg) and
+`exclusive_route_does_not_reach_output_total` (the leg's output never reaches the output token, or
+the swaps after it loop back to a token already on their path). A route with no exclusive leg is
+not counted.
 
 Two gauges report what the overlay is worth, in whole gas tokens: `exclusive_fee_amount` (LP fee
 capture) and `exclusive_user_savings_amount` (user improvement over the public reference).

@@ -8,6 +8,8 @@
 //! with `probe_amount` of the gas token to find each selected token's best buy route and bought
 //! amount. A reverse sell swaps that amount back along the buy route. Both include fees and
 //! slippage. Gas-aware scoring is off because it reads the prices this computation produces.
+//! Pricing leaves out pAMMs: a pAMM's quote ladder can pay almost nothing back at the probe size
+//! for a block, and its spot prices do not show it.
 //!
 //! The price is the arithmetic mean of the buy and sell rates, kept as an exact fraction.
 //! Both rates are in token units per gas token unit: the bought amount divided by `probe_amount`
@@ -34,8 +36,10 @@
 //! If the second buy pass finishes without reaching a token, or its reverse sell flags another
 //! pool, a sell solve uses the amount the first buy pass bought. Missing simulation state or
 //! token metadata also requires a sell solve, using the route that lacked it and its bought
-//! amount; it does not flag a pool. Any buy pass timeout, including the second buy pass without
-//! flagged pools, leaves tokens it did not reach unattempted.
+//! amount; it does not flag a pool. So does a reverse sell that returns less than
+//! `min_sell_out_bps` of `probe_amount`: a hop on the route pays far too little back, and the
+//! sell solve finds a route that does not use it. Any buy pass timeout, including the second buy
+//! pass without flagged pools, leaves tokens it did not reach unattempted.
 //!
 //! A sell solve searches for a route back to the gas token. It can use flagged pools because it
 //! ranks routes by simulated output. A token needs a nonzero sell result to get a price: a buy
@@ -55,6 +59,10 @@
 //! pools. A change to these dependencies makes the token eligible for a new price. A rival pool
 //! is not a dependency, so an improved rival route changes the price only after another change or
 //! after the price is stale.
+//!
+//! `PassHistory` keeps each stored price's pools in swap order, the bought amount, and the gas
+//! token amount the sell returned. A pass that moves a stored price by `TOKEN_PRICE_JUMP_WARN_BPS`
+//! (default 10%) or more logs a warning with the old and new routes and amounts.
 //!
 //! An attempted token that cannot be priced loses its old price and dependencies. Tokens with
 //! no buy route count as unreachable; tokens with no sell route produce failed items.
@@ -106,7 +114,6 @@
 //! # Seeding prices
 //!
 //! Seeding rebuilds the price and dependency maps at startup or when either map is missing.
-//! `ChangedComponents::is_full_recompute` also forces seeding and restarts the interval.
 //! Seeding selects every market token except the gas token without a token count cap because
 //! `derived_data_ready` does not wait for every token to have a price. The sell solve cap and
 //! deadline still apply. Unattempted tokens keep their previous price and dependencies.
@@ -114,13 +121,13 @@
 
 use std::{
     ops::RangeInclusive,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, LazyLock, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use num_bigint::BigUint;
-use num_traits::Zero;
+use num_traits::{ToPrimitive, Zero};
 use petgraph::graph::NodeIndex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, instrument, trace, warn, Span};
@@ -145,7 +152,8 @@ use crate::{
         store::DerivedData,
         types::{TokenGasPrices, TokenPriceEntry, TokenPricesWithDeps},
     },
-    feed::market_data::MarketData,
+    fallback::is_pamm,
+    feed::{component_filter::remove_components, market_data::MarketData},
     graph::{GraphManager, PetgraphStableDiGraphManager},
     types::{ComponentId, Order, OrderSide, RouteExclusions},
 };
@@ -196,8 +204,8 @@ struct PricingPassState<'a> {
 
 /// The pricing result for one token in a pricing pass.
 enum TokenPricingOutcome {
-    /// The token's price and the components used to compute it.
-    Priced(TokenPriceEntry),
+    /// The token's price, the components used to compute it, and the route behind it.
+    Priced(PricedToken),
     /// The error from a sell solve that produces no price.
     Failed(FailedItemError),
     /// Pricing is incomplete; the token keeps its previous price, dependencies, and stamp.
@@ -232,6 +240,8 @@ enum ReverseSellOutcome {
     FlaggedPool(ComponentId, PoolFlagReason),
     /// A hop lacks simulation state or token metadata; this does not flag the pool.
     MissingHopData,
+    /// The reverse sell returned less than `min_sell_out_bps` of the probe amount.
+    LowSellOut,
 }
 
 /// The reason a reverse sell flags a pool.
@@ -247,21 +257,128 @@ enum PoolFlagReason {
     ZeroOutput,
 }
 
-/// Returns the components of every hop of `buy_leg`.
-fn collect_route_components(buy_leg: &ReachedToken) -> FxHashSet<ComponentId> {
-    buy_leg
+/// A token's price with the route behind it.
+struct PricedToken {
+    /// The stored price and its dependencies.
+    entry: TokenPriceEntry,
+    /// The pools and amounts that produced the price.
+    route: PriceRoute,
+}
+
+/// The pools and amounts behind a token's price, kept for the price jump warning.
+#[derive(Debug, Clone)]
+struct PriceRoute {
+    /// The components of the routes that priced the token, in swap order: the buy route, then
+    /// the sell route of a sell solve.
+    components: Vec<ComponentId>,
+    /// The amount of the token that the buy route bought with the probe amount of gas token.
+    buy_amount_out: BigUint,
+    /// The gas token amount that selling `buy_amount_out` back returned.
+    sell_amount_out: BigUint,
+}
+
+/// Builds the price of a token priced from `buy_leg` and the gas token amount `sell_out` that
+/// selling its bought amount back returned. The buy route's components are its dependencies.
+fn build_priced_token(price: Price, buy_leg: &ReachedToken, sell_out: BigUint) -> PricedToken {
+    let components: Vec<ComponentId> = buy_leg
         .hops
         .iter()
         .map(|(_, _, component_id)| component_id.clone())
-        .collect()
+        .collect();
+    let entry = TokenPriceEntry { price, path_components: components.iter().cloned().collect() };
+    let route = PriceRoute {
+        components,
+        buy_amount_out: buy_leg.amount_out.clone(),
+        sell_amount_out: sell_out,
+    };
+    PricedToken { entry, route }
 }
 
 /// Prices a token at the sell rate alone: the amount sold divided by the gas token amount
 /// returned. Stores the buy route's components as its dependencies.
-fn build_sell_rate_entry(buy_leg: &ReachedToken, sell_out: BigUint) -> TokenPriceEntry {
-    let path_components = collect_route_components(buy_leg);
-    let sell_rate = Price { numerator: buy_leg.amount_out.clone(), denominator: sell_out };
-    TokenPriceEntry { price: sell_rate, path_components }
+fn build_sell_rate_entry(buy_leg: &ReachedToken, sell_out: BigUint) -> PricedToken {
+    let sell_rate = Price { numerator: buy_leg.amount_out.clone(), denominator: sell_out.clone() };
+    build_priced_token(sell_rate, buy_leg, sell_out)
+}
+
+/// Environment variable that sets how far a token's price may move in one pricing pass before
+/// the pass logs a warning, in basis points of the smaller price.
+const PRICE_JUMP_WARN_BPS_ENV: &str = "TOKEN_PRICE_JUMP_WARN_BPS";
+
+/// Default price move that logs a warning: 10%.
+const DEFAULT_PRICE_JUMP_WARN_BPS: u32 = 1_000;
+
+/// How far a token's price may move in one pricing pass before the pass logs a warning, as the
+/// ratio of the larger price to the smaller. Read once from `PRICE_JUMP_WARN_BPS_ENV`.
+static PRICE_JUMP_WARN_RATIO: LazyLock<f64> =
+    LazyLock::new(|| 1.0 + f64::from(price_jump_warn_bps_from_env()) / f64::from(BPS_DENOMINATOR));
+
+/// Reads the warning threshold from `PRICE_JUMP_WARN_BPS_ENV`, falling back to
+/// `DEFAULT_PRICE_JUMP_WARN_BPS` when the variable is unset or not a whole number.
+fn price_jump_warn_bps_from_env() -> u32 {
+    let Ok(raw) = std::env::var(PRICE_JUMP_WARN_BPS_ENV) else {
+        return DEFAULT_PRICE_JUMP_WARN_BPS;
+    };
+    match raw.trim().parse::<u32>() {
+        Ok(bps) => bps,
+        Err(_) => {
+            warn!(
+                value = %raw,
+                default_bps = DEFAULT_PRICE_JUMP_WARN_BPS,
+                "{PRICE_JUMP_WARN_BPS_ENV} must be a whole number of basis points; using the \
+                 default"
+            );
+            DEFAULT_PRICE_JUMP_WARN_BPS
+        }
+    }
+}
+
+/// Returns `new / stored` when the price moved by `PRICE_JUMP_WARN_RATIO` or more in either
+/// direction, else `None`. A zero price never counts as a jump.
+fn price_jump_ratio(stored: &Price, new: &Price) -> Option<f64> {
+    let ratio = price_to_f64(new)? / price_to_f64(stored)?;
+    let warn_ratio = *PRICE_JUMP_WARN_RATIO;
+    (ratio >= warn_ratio || ratio.recip() >= warn_ratio).then_some(ratio)
+}
+
+/// Logs a warning with both routes and their amounts for each price in `solved` that moved by
+/// `PRICE_JUMP_WARN_RATIO` or more from its price in `stored`. A token with no stored price or
+/// no stored route is skipped.
+fn warn_on_price_jumps(
+    stored: &TokenPricesWithDeps,
+    stored_routes: &FxHashMap<Address, PriceRoute>,
+    solved: &PricingPassOutcome,
+) {
+    for (token, new) in &solved.prices {
+        let (Some(stored), Some(stored_route), Some(new_route)) =
+            (stored.get(token), stored_routes.get(token), solved.routes.get(token))
+        else {
+            continue;
+        };
+        let Some(ratio) = price_jump_ratio(&stored.price, &new.price) else {
+            continue;
+        };
+        warn!(
+            %token,
+            block = solved.block,
+            ratio,
+            stored_price = price_to_f64(&stored.price),
+            new_price = price_to_f64(&new.price),
+            stored_route = ?stored_route.components,
+            new_route = ?new_route.components,
+            stored_buy_amount_out = %stored_route.buy_amount_out,
+            new_buy_amount_out = %new_route.buy_amount_out,
+            stored_sell_amount_out = %stored_route.sell_amount_out,
+            new_sell_amount_out = %new_route.sell_amount_out,
+            "token price jumped"
+        );
+    }
+}
+
+/// Returns `price` as a float, or `None` when it is zero or does not fit.
+fn price_to_f64(price: &Price) -> Option<f64> {
+    let value = price.numerator.to_f64()? / price.denominator.to_f64()?;
+    (value.is_finite() && value > 0.0).then_some(value)
 }
 
 /// Returns why the pool's two spot prices between `token_in` and `token_out` fail the check, or
@@ -414,7 +531,7 @@ impl<'a> PricingPassState<'a> {
                     .insert(token.clone(), buy_leg);
                 None
             }
-            ReverseSellOutcome::MissingHopData => {
+            ReverseSellOutcome::MissingHopData | ReverseSellOutcome::LowSellOut => {
                 queued
                     .for_sell_solve
                     .insert(token.clone(), SellSolveBuyLeg::Trusted(buy_leg));
@@ -537,7 +654,7 @@ impl<'a> PricingPassState<'a> {
                     for_sell_solve
                         .insert(token, SellSolveBuyLeg::ThroughFlaggedPool(flagged_route));
                 }
-                ReverseSellOutcome::MissingHopData => {
+                ReverseSellOutcome::MissingHopData | ReverseSellOutcome::LowSellOut => {
                     for_sell_solve.insert(token, SellSolveBuyLeg::Trusted(buy_leg));
                 }
             }
@@ -553,13 +670,15 @@ impl<'a> PricingPassState<'a> {
         block: u64,
     ) -> PricingPassOutcome {
         let mut prices = FxHashMap::default();
+        let mut routes = FxHashMap::default();
         let mut failed_items = Vec::new();
         let mut unattempted = FxHashSet::default();
         let mut unreachable_tokens = 0usize;
         for (token, outcome) in outcomes {
             match outcome {
-                TokenPricingOutcome::Priced(entry) => {
-                    prices.insert(token, entry);
+                TokenPricingOutcome::Priced(PricedToken { entry, route }) => {
+                    prices.insert(token.clone(), entry);
+                    routes.insert(token, route);
                 }
                 TokenPricingOutcome::Failed(error) => {
                     failed_items.push(FailedItem { key: token.to_string(), error });
@@ -591,7 +710,14 @@ impl<'a> PricingPassState<'a> {
             );
         }
         let new_flagged_components = std::mem::take(&mut self.new_flagged_components);
-        PricingPassOutcome { prices, block, failed_items, unattempted, new_flagged_components }
+        PricingPassOutcome {
+            prices,
+            routes,
+            block,
+            failed_items,
+            unattempted,
+            new_flagged_components,
+        }
     }
 
     /// Prices one token as the arithmetic mean of its buy price and its sell price, kept as an
@@ -602,16 +728,13 @@ impl<'a> PricingPassState<'a> {
         token: &Address,
         buy_leg: &ReachedToken,
         sell_out: BigUint,
-    ) -> TokenPriceEntry {
-        // The legs are discarded after the mean; this is the only place their divergence —
-        // sell_out under the probe amount is the round-trip loss — can be observed.
+    ) -> PricedToken {
         trace!(%token, buy_out = %buy_leg.amount_out, sell_out = %sell_out, "token priced");
-        let path_components = collect_route_components(buy_leg);
         let mid_price = Price {
             numerator: &buy_leg.amount_out * (&self.computation.probe_amount + &sell_out),
-            denominator: BigUint::from(2u8) * &self.computation.probe_amount * sell_out,
+            denominator: BigUint::from(2u8) * &self.computation.probe_amount * &sell_out,
         };
-        TokenPriceEntry { price: mid_price, path_components }
+        build_priced_token(mid_price, buy_leg, sell_out)
     }
 
     /// Prices a token with a sell solve of its bought amount back to the gas token. The stored
@@ -624,19 +747,23 @@ impl<'a> PricingPassState<'a> {
     ) -> TokenPricingOutcome {
         let (SellSolveBuyLeg::Trusted(route) | SellSolveBuyLeg::ThroughFlaggedPool(route)) =
             buy_leg;
-        let (sell_out, sell_components) = match self.solve_sell_leg(token, route.amount_out.clone())
-        {
+        let (sell_out, sell_route) = match self.solve_sell_leg(token, route.amount_out.clone()) {
             Ok(sell_leg) => sell_leg,
             Err(error) => return TokenPricingOutcome::Failed(error),
         };
-        let mut entry = match buy_leg {
+        let mut priced = match buy_leg {
             SellSolveBuyLeg::Trusted(route) => self.build_price_entry(token, route, sell_out),
             SellSolveBuyLeg::ThroughFlaggedPool(route) => build_sell_rate_entry(route, sell_out),
         };
-        entry
+        priced
+            .entry
             .path_components
-            .extend(sell_components);
-        TokenPricingOutcome::Priced(entry)
+            .extend(sell_route.iter().cloned());
+        priced
+            .route
+            .components
+            .extend(sell_route);
+        TokenPricingOutcome::Priced(priced)
     }
 
     /// Sells the bought amount back along the buy route, hop by hop in reverse. Returns
@@ -668,17 +795,23 @@ impl<'a> PricingPassState<'a> {
                 Err(_) => return flagged(PoolFlagReason::SwapFailed),
             }
         }
+        let min_sell_out =
+            &self.computation.probe_amount * self.computation.min_sell_out_bps / BPS_DENOMINATOR;
+        if amount < min_sell_out {
+            return ReverseSellOutcome::LowSellOut;
+        }
         ReverseSellOutcome::Sold(amount)
     }
 
     /// Re-roots the pass's shared snapshot at `token`, solves the route selling `amount` of
-    /// `token` back to the gas token, and returns what it delivers with its components. Returns
-    /// `MissingSellRoute` with the reason to help explain failures on the same block.
+    /// `token` back to the gas token, and returns what it delivers with its components in swap
+    /// order. Returns `MissingSellRoute` with the reason to help explain failures on the same
+    /// block.
     fn solve_sell_leg(
         &mut self,
         token: &Address,
         amount: BigUint,
-    ) -> Result<(BigUint, FxHashSet<ComponentId>), FailedItemError> {
+    ) -> Result<(BigUint, Vec<ComponentId>), FailedItemError> {
         let token_node = *self
             .token_nodes
             .get(token)
@@ -726,6 +859,8 @@ impl<'a> PricingPassState<'a> {
 struct PricingPassOutcome {
     /// Priced tokens with the components that must re-price them when they change.
     prices: FxHashMap<Address, TokenPriceEntry>,
+    /// The route behind each priced token's price.
+    routes: FxHashMap<Address, PriceRoute>,
     /// The block the market snapshot was taken at.
     block: u64,
     /// Tokens that were attempted and could not be priced: bought, but no sell route back.
@@ -771,6 +906,9 @@ pub struct TokenGasPriceComputation {
     /// market gives it something to price. The cap bounds what one pass costs; this bounds how
     /// often one runs. See the module's "Spacing pricing passes" section.
     min_pass_interval: Duration,
+    /// The least gas token a reverse sell must return, in basis points of `probe_amount`. A
+    /// reverse sell that returns less goes to a sell solve.
+    min_sell_out_bps: u32,
     /// What earlier pricing passes left behind: when to run the next one, which tokens have
     /// waited longest, and which components are flagged.
     ///
@@ -800,6 +938,25 @@ struct PassHistory {
     /// The flagged components, each with the number of the pricing pass that flagged it. The first
     /// buy pass of the next `FLAGGED_POOL_PASSES` pricing passes leaves the component out.
     flagged_components: FxHashMap<ComponentId, u64>,
+    /// The route behind each stored price, for the price jump warning.
+    routes: FxHashMap<Address, PriceRoute>,
+}
+
+impl PassHistory {
+    /// Stores the routes of the prices a pass produced, and forgets the routes of the tokens
+    /// that have no price in `stored`.
+    fn record_routes(
+        &mut self,
+        routes: &FxHashMap<Address, PriceRoute>,
+        stored: &TokenPricesWithDeps,
+    ) {
+        for (token, route) in routes {
+            self.routes
+                .insert(token.clone(), route.clone());
+        }
+        self.routes
+            .retain(|token, _| stored.contains_key(token));
+    }
 }
 
 /// How much of a pass the interval allows right now.
@@ -971,6 +1128,12 @@ const DEFAULT_MAX_TOKENS_PER_PASS: usize = 500;
 /// 2.4 s.
 const DEFAULT_MAX_SELL_SOLVES_PER_PASS: usize = 200;
 
+/// Basis points in a whole.
+const BPS_DENOMINATOR: u32 = 10_000;
+
+/// Default `min_sell_out_bps`: a reverse sell must return half the probe amount.
+const DEFAULT_MIN_SELL_OUT_BPS: u32 = 5_000;
+
 impl Default for TokenGasPriceComputation {
     fn default() -> Self {
         Self {
@@ -981,6 +1144,7 @@ impl Default for TokenGasPriceComputation {
             max_tokens_per_pass: DEFAULT_MAX_TOKENS_PER_PASS,
             max_sell_solves_per_pass: DEFAULT_MAX_SELL_SOLVES_PER_PASS,
             min_pass_interval: DEFAULT_MIN_PASS_INTERVAL,
+            min_sell_out_bps: DEFAULT_MIN_SELL_OUT_BPS,
             pass_history: Arc::new(Mutex::new(PassHistory::default())),
         }
     }
@@ -1040,11 +1204,10 @@ impl TokenGasPriceComputation {
     /// A whole pass also waits for a block other than `last_pass_block`, unless the interval is
     /// zero.
     ///
-    /// `must_solve` runs a whole pass whatever the interval says, for a caller that has nothing
-    /// stored to serve instead. `arrivals` only earns the tokens that arrived: those cannot be
-    /// quoted until they are priced, but pricing them is not a reason to start the interval
-    /// again or to rank the rest of the market again.
-    fn start_pass(&self, block: u64, arrivals: bool, must_solve: bool) -> PassSlot {
+    /// `arrivals` only earns the tokens that arrived: those cannot be quoted until they are
+    /// priced, but pricing them is not a reason to start the interval again or to rank the rest
+    /// of the market again.
+    fn start_pass(&self, block: u64, arrivals: bool) -> PassSlot {
         let mut state = self.lock_pass_history();
         let now = Instant::now();
         let interval_elapsed = state
@@ -1054,7 +1217,7 @@ impl TokenGasPriceComputation {
             state
                 .last_pass_block
                 .is_none_or(|last_block| last_block != block);
-        if (interval_elapsed && new_block) || must_solve {
+        if interval_elapsed && new_block {
             state.last_pass_started = Some(now);
             state.last_pass_block = Some(block);
             return PassSlot::Due;
@@ -1174,7 +1337,9 @@ impl TokenGasPriceComputation {
                 .last_updated()
                 .map(|b| b.number())
                 .unwrap_or(0);
-            (guard.component_topology(), block)
+            let topology =
+                remove_components(guard.base_market_state(), guard.component_topology(), &is_pamm);
+            (topology, block)
         };
 
         let universe = self.tokens_to_price(&topology);
@@ -1186,6 +1351,7 @@ impl TokenGasPriceComputation {
         if ordered.is_empty() {
             return Ok(PricingPassOutcome {
                 prices: FxHashMap::default(),
+                routes: FxHashMap::default(),
                 block,
                 failed_items: Vec::new(),
                 unattempted: universe,
@@ -1241,6 +1407,7 @@ impl TokenGasPriceComputation {
             warn!(unattempted = universe.len(), "no subgraph around the gas token");
             return Ok(PricingPassOutcome {
                 prices: FxHashMap::default(),
+                routes: FxHashMap::default(),
                 block,
                 failed_items: Vec::new(),
                 unattempted: universe,
@@ -1398,6 +1565,8 @@ impl TokenGasPriceComputation {
                 // Everything the pass priced, not only what the change pointed at: the pass
                 // ranks over the whole market, so it reaches tokens this block's change never
                 // named — which is the only way a token that has no price gets one.
+                let mut history = self.lock_pass_history();
+                warn_on_price_jumps(deps, &history.routes, &solved);
                 for (token, entry) in &solved.prices {
                     result.insert(token.clone(), entry.price.clone());
                     deps.insert(token.clone(), entry.clone());
@@ -1419,6 +1588,7 @@ impl TokenGasPriceComputation {
                     result.remove(&token);
                     deps.remove(&token);
                 }
+                history.record_routes(&solved.routes, deps);
             });
         if !edited {
             warn!("token price dependencies vanished between the read and the write");
@@ -1498,6 +1668,8 @@ impl TokenGasPriceComputation {
         );
         token_prices.insert(self.gas_token.clone(), gas_token_price);
 
+        self.lock_pass_history()
+            .record_routes(&solved.routes, &token_prices_with_deps);
         store
             .write()
             .await
@@ -1521,13 +1693,8 @@ impl DerivedComputation for TokenGasPriceComputation {
         ComputationRequirements::none()
     }
 
-    fn persist(
-        store: &mut DerivedData,
-        output: ComputationOutput<Self::Output>,
-        block: u64,
-        is_full_recompute: bool,
-    ) {
-        store.set_token_prices(output.data, output.failed_items, block, is_full_recompute);
+    fn persist(store: &mut DerivedData, output: ComputationOutput<Self::Output>, block: u64) {
+        store.set_token_prices(output.data, output.failed_items, block);
     }
 
     #[instrument(
@@ -1546,40 +1713,35 @@ impl DerivedComputation for TokenGasPriceComputation {
             .await
             .last_updated()
             .map_or(0, |block| block.number());
-        // A component arriving earns a pass inside the interval, but only for the tokens it
-        // carries; a full recompute earns a whole one, having nothing stored to serve instead.
-        let scope =
-            match self.start_pass(block, !changed.added.is_empty(), changed.is_full_recompute) {
-                PassSlot::Due => PassScope::Whole,
-                PassSlot::ArrivalsOnly => PassScope::ArrivalsOnly,
-                PassSlot::Deferred => {
-                    let stored = {
-                        let store_guard = store.read().await;
-                        store_guard.token_prices().cloned()
-                    };
-                    // Nothing stored means nothing to serve, so the interval cannot defer this
-                    // block: seeding runs instead.
-                    let Some(prices) = stored else {
-                        return self
-                            .seed_all_prices(market, store)
-                            .await;
-                    };
-                    Span::current().record("updated_token_prices", prices.len());
-                    return Ok(ComputationOutput::with_failures(prices, Vec::new()));
-                }
-            };
-
-        // Startup and lag recovery have nothing stored to select from, so they offer every token
-        // to the pass. So does a block whose selection finds nothing stored. Every other block
-        // selects, and the cap bounds what the pass gets through, whatever the block brought:
-        // the tokens of an added component are ranked first, not exempted from the cap.
-        if !changed.is_full_recompute {
-            if let Some(result) = self
-                .update_prices(market, store, changed, scope)
-                .await?
-            {
-                return Ok(result);
+        // An added component earns a pass inside the interval for its own tokens only.
+        let scope = match self.start_pass(block, !changed.added.is_empty()) {
+            PassSlot::Due => PassScope::Whole,
+            PassSlot::ArrivalsOnly => PassScope::ArrivalsOnly,
+            PassSlot::Deferred => {
+                let stored = {
+                    let store_guard = store.read().await;
+                    store_guard.token_prices().cloned()
+                };
+                // Nothing stored means nothing to serve, so the interval cannot defer this
+                // block: seeding runs instead.
+                let Some(prices) = stored else {
+                    return self
+                        .seed_all_prices(market, store)
+                        .await;
+                };
+                Span::current().record("updated_token_prices", prices.len());
+                return Ok(ComputationOutput::with_failures(prices, Vec::new()));
             }
+        };
+
+        // A block whose selection finds nothing stored offers every token to the pass. Every
+        // other block selects, and the cap bounds what the pass gets through, whatever the block
+        // brought: the tokens of an added component are ranked first, not exempted from the cap.
+        if let Some(result) = self
+            .update_prices(market, store, changed, scope)
+            .await?
+        {
+            return Ok(result);
         }
 
         self.seed_all_prices(market, store)
@@ -1597,9 +1759,11 @@ mod tests {
     use super::*;
     use crate::{
         algorithm::test_utils::{
-            component, setup_market_weighted, setup_market_weighted_boxed, token, MockProtocolSim,
+            component, component_with_protocol, setup_market_weighted, setup_market_weighted_boxed,
+            token, MockProtocolSim,
         },
         derived::store::DerivedData,
+        fallback::FALLBACK_PREFIX,
     };
 
     const PROBE_AMOUNT: u128 = 1_000_000_000_000_000_000;
@@ -1761,14 +1925,20 @@ mod tests {
             .await
             .expect("pricing must not fail");
 
-        // A full recompute whose deadline expires immediately attempts nothing; every token
+        // A seeding pass whose deadline expires immediately attempts nothing; every token
         // must keep its previous price rather than vanish with no later pass to restore it.
         let output = computation_for(&eth.address)
             .with_pass_budget(Duration::ZERO)
             .compute(
                 &market,
                 &store,
-                &ChangedComponents { is_full_recompute: true, ..ChangedComponents::default() },
+                &ChangedComponents {
+                    added: FxHashMap::from_iter([(
+                        "eth_usdc".to_string(),
+                        vec![eth.address.clone(), usdc.address.clone()],
+                    )]),
+                    ..ChangedComponents::default()
+                },
             )
             .await
             .expect("pricing must not fail");
@@ -1811,7 +1981,10 @@ mod tests {
             .compute(
                 &market,
                 &store,
-                &ChangedComponents { is_full_recompute: true, ..ChangedComponents::default() },
+                &ChangedComponents {
+                    removed: vec!["eth_usdc".to_string()],
+                    ..ChangedComponents::default()
+                },
             )
             .await
             .expect("pricing must not fail");
@@ -1833,7 +2006,7 @@ mod tests {
             .expect("pricing must not fail");
         // The manager persists between runs; without this `update_prices` bails out on the
         // missing stored prices and the test would exercise seeding twice.
-        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1, true);
+        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1);
 
         // The pool's state changes, marking USDC for re-pricing, but the deadline expires
         // before it is attempted: the previous price must survive.
@@ -1884,7 +2057,7 @@ mod tests {
             .await
             .expect("pricing must not fail");
         // The manager persists between runs; the incremental path reads the stored prices.
-        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1, true);
+        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1);
 
         // Both pools move, but only eth_aaa is reported as changed: AAA must re-price
         // against the new state while BBB keeps its stored price.
@@ -1930,7 +2103,7 @@ mod tests {
             .compute(&market, &store, &ChangedComponents::default())
             .await
             .expect("pricing must not fail");
-        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1, true);
+        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1);
 
         market.write().await.update_states([
             ("eth_aaa".to_string(), Box::new(MockProtocolSim::new(4000.0)) as Box<dyn ProtocolSim>),
@@ -1974,7 +2147,7 @@ mod tests {
             .compute(&market, &store, &ChangedComponents::default())
             .await
             .expect("pricing must not fail");
-        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1, true);
+        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1);
         assert!(!store
             .read()
             .await
@@ -2026,7 +2199,7 @@ mod tests {
             .compute(&market, &store, &ChangedComponents::default())
             .await
             .expect("pricing must not fail");
-        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1, true);
+        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1);
 
         market
             .write()
@@ -2205,7 +2378,7 @@ mod tests {
             .compute(&market, &store, &ChangedComponents::default())
             .await
             .expect("pricing must not fail");
-        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1, true);
+        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1);
 
         market.write().await.update_states([(
             "eth_aaa".to_string(),
@@ -2224,6 +2397,43 @@ mod tests {
         assert!(
             (ratio(&output.data[&aaa.address]) - 2000.0).abs() < 1e-6,
             "the block inside the interval serves the stored price, not the moved market"
+        );
+    }
+
+    /// A block inside the interval with no stored prices runs a pass, having nothing to serve.
+    #[tokio::test]
+    async fn test_a_pass_inside_the_interval_with_nothing_stored() {
+        use tycho_simulation::tycho_common::simulation::protocol_sim::ProtocolSim;
+
+        let eth = token(0, "ETH");
+        let aaa = token(1, "AAA");
+        let (market, _) =
+            setup_market_weighted(vec![("eth_aaa", &eth, &aaa, MockProtocolSim::new(2000.0))]);
+        let computation =
+            TokenGasPriceComputation::new(eth.address.clone(), 1, BigUint::from(PROBE_AMOUNT))
+                .with_min_pass_interval(Duration::from_secs(3600));
+        let store = DerivedData::new_shared();
+        computation
+            .compute(&market, &store, &ChangedComponents::default())
+            .await
+            .expect("pricing must not fail");
+        market.write().await.update_states([(
+            "eth_aaa".to_string(),
+            Box::new(MockProtocolSim::new(4000.0)) as Box<dyn ProtocolSim>,
+        )]);
+        let changed = ChangedComponents {
+            updated: vec!["eth_aaa".to_string()],
+            ..ChangedComponents::default()
+        };
+
+        let output = computation
+            .compute(&market, &store, &changed)
+            .await
+            .expect("pricing must not fail");
+
+        assert!(
+            (ratio(&output.data[&aaa.address]) - 4000.0).abs() < 1e-6,
+            "with nothing stored, the block inside the interval prices the moved market"
         );
     }
 
@@ -2246,7 +2456,7 @@ mod tests {
             .compute(&market, &store, &ChangedComponents::default())
             .await
             .expect("pricing must not fail");
-        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1, true);
+        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1);
 
         {
             let mut guard = market.write().await;
@@ -2291,7 +2501,7 @@ mod tests {
             .compute(&market, &store, &ChangedComponents::default())
             .await
             .expect("pricing must not fail");
-        TokenGasPriceComputation::persist(&mut *store.write().await, seeded, 1, true);
+        TokenGasPriceComputation::persist(&mut *store.write().await, seeded, 1);
 
         let mut added = FxHashMap::default();
         {
@@ -2336,7 +2546,7 @@ mod tests {
             .compute(&market, &store, &ChangedComponents::default())
             .await
             .expect("pricing must not fail");
-        TokenGasPriceComputation::persist(&mut *store.write().await, seeded, 1, true);
+        TokenGasPriceComputation::persist(&mut *store.write().await, seeded, 1);
 
         // A new pool prices AAA far better, and a new token arrives on the same block. The cap
         // of one takes the token with no price, so AAA is cut.
@@ -2369,7 +2579,7 @@ mod tests {
             (ratio(&cut.data[&aaa.address]) - 2000.0).abs() < 1e-6,
             "the cap took the token with no price, so AAA keeps its old price"
         );
-        TokenGasPriceComputation::persist(&mut *store.write().await, cut, 2, false);
+        TokenGasPriceComputation::persist(&mut *store.write().await, cut, 2);
 
         // Nothing changes on this block. Only the arrived rank can reach AAA: its stored
         // dependencies do not name the new pool.
@@ -2409,7 +2619,7 @@ mod tests {
             .compute(&market, &store, &ChangedComponents::default())
             .await
             .expect("pricing must not fail");
-        TokenGasPriceComputation::persist(&mut *store.write().await, seeded, 1, true);
+        TokenGasPriceComputation::persist(&mut *store.write().await, seeded, 1);
 
         let mut added = FxHashMap::default();
         {
@@ -2460,45 +2670,29 @@ mod tests {
             .with_min_pass_interval(Duration::from_millis(400));
 
         assert_eq!(
-            computation.start_pass(1, false, false),
+            computation.start_pass(1, false),
             PassSlot::Due,
             "the first pass is due, nothing has run"
         );
         assert_eq!(
-            computation.start_pass(2, false, false),
+            computation.start_pass(2, false),
             PassSlot::Deferred,
             "a block straight after one inside the interval waits"
         );
 
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(
-            computation.start_pass(3, true, false),
+            computation.start_pass(3, true),
             PassSlot::ArrivalsOnly,
             "an arrival inside the interval earns a pass for its own tokens"
         );
 
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(
-            computation.start_pass(4, false, false),
+            computation.start_pass(4, false),
             PassSlot::Due,
             "450ms after the only whole pass the interval has elapsed, so the arrival in the \
              middle of it did not restart it"
-        );
-    }
-
-    /// A caller with nothing stored to serve gets a whole pass whatever the interval says.
-    #[test]
-    fn test_a_must_solve_pass_ignores_the_interval() {
-        let eth = token(0, "ETH").address;
-        let computation = TokenGasPriceComputation::new(eth, 1, BigUint::from(PROBE_AMOUNT))
-            .with_min_pass_interval(Duration::from_secs(3600));
-
-        assert_eq!(computation.start_pass(1, false, false), PassSlot::Due);
-        assert_eq!(computation.start_pass(2, false, false), PassSlot::Deferred);
-        assert_eq!(
-            computation.start_pass(2, false, true),
-            PassSlot::Due,
-            "a full recompute has nothing to serve instead, so it runs a whole pass"
         );
     }
 
@@ -2508,10 +2702,10 @@ mod tests {
         let computation = TokenGasPriceComputation::new(eth, 1, BigUint::from(PROBE_AMOUNT))
             .with_min_pass_interval(Duration::from_millis(1));
 
-        assert_eq!(computation.start_pass(5, false, false), PassSlot::Due);
+        assert_eq!(computation.start_pass(5, false), PassSlot::Due);
         std::thread::sleep(Duration::from_millis(5));
-        assert_eq!(computation.start_pass(5, false, false), PassSlot::Deferred);
-        assert_eq!(computation.start_pass(6, false, false), PassSlot::Due);
+        assert_eq!(computation.start_pass(5, false), PassSlot::Deferred);
+        assert_eq!(computation.start_pass(6, false), PassSlot::Due);
     }
 
     /// Tokens that can never be priced must not hold a slot in every pass.
@@ -2552,7 +2746,7 @@ mod tests {
             .compute(&market, &store, &ChangedComponents::default())
             .await
             .expect("pricing must not fail");
-        TokenGasPriceComputation::persist(&mut *store.write().await, seeded, 1, true);
+        TokenGasPriceComputation::persist(&mut *store.write().await, seeded, 1);
 
         // AAA's pool moves. It has to be re-priced within a few passes rather than waiting
         // behind three tokens that fail every time.
@@ -2574,7 +2768,7 @@ mod tests {
                 repriced = true;
                 break;
             }
-            TokenGasPriceComputation::persist(&mut *store.write().await, output, block, false);
+            TokenGasPriceComputation::persist(&mut *store.write().await, output, block);
         }
 
         assert!(repriced, "the priced token is refreshed rather than starved by failing tokens");
@@ -2612,7 +2806,7 @@ mod tests {
             .compute(&market, &store, &ChangedComponents::default())
             .await
             .expect("pricing must not fail");
-        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1, true);
+        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1);
         assert!(
             !store
                 .read()
@@ -2711,7 +2905,7 @@ mod tests {
             .compute(&market, &store, &ChangedComponents::default())
             .await
             .expect("pricing must not fail");
-        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1, true);
+        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1);
         let first_pass = stamp(&computation, &aaa.address);
         assert_eq!(stamp(&computation, &bbb.address), first_pass, "one pass priced both");
 
@@ -2724,7 +2918,7 @@ mod tests {
             .compute(&market, &store, &changed)
             .await
             .expect("pricing must not fail");
-        TokenGasPriceComputation::persist(&mut *store.write().await, incremental, 2, false);
+        TokenGasPriceComputation::persist(&mut *store.write().await, incremental, 2);
 
         assert!(
             stamp(&computation, &aaa.address) > first_pass,
@@ -2751,7 +2945,7 @@ mod tests {
             .compute(&market, &store, &ChangedComponents::default())
             .await
             .expect("pricing must not fail");
-        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1, true);
+        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1);
 
         // The pool's state moves, but the changed set names no stored dependency, so the
         // incremental path must return the stored prices without re-solving anything.
@@ -2822,7 +3016,7 @@ mod tests {
             .compute(&market, &store, &ChangedComponents::default())
             .await
             .expect("pricing must not fail");
-        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1, true);
+        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1);
 
         // The pool turns one-way: the liquidity cap lets the 0.5e18 buy through but blocks the
         // 1e18 sell back. A token that was priced and then lost its sell route must stop being
@@ -2858,6 +3052,73 @@ mod tests {
                 .contains_key(&oneway.address),
             "a dropped token must leave the dependency map too"
         );
+        assert!(
+            !computation
+                .lock_pass_history()
+                .routes
+                .contains_key(&oneway.address),
+            "a dropped token must leave the stored routes too"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::floor_on(DEFAULT_MIN_SELL_OUT_BPS, (2.0 + 2.0 / (2.0 / 1.9)) / 2.0)]
+    #[case::floor_off(0, (2.0 + 2.0 / 0.25) / 2.0)]
+    #[tokio::test]
+    async fn test_low_sell_out(#[case] min_sell_out_bps: u32, #[case] expected: f64) {
+        // "lossy" buys the most X, 2 per ETH, but its 50% fee sells those 2 X back for 0.25 ETH.
+        // Below the floor, a sell solve sells them through "fair" for 2 / 1.9 ETH instead.
+        let eth = token(0, "ETH");
+        let x = token(1, "X");
+        let (market, _) = setup_market_weighted(vec![
+            ("lossy", &eth, &x, MockProtocolSim::new(4.0).with_fee(0.5)),
+            ("fair", &eth, &x, MockProtocolSim::new(1.9)),
+        ]);
+        let store = DerivedData::new_shared();
+        let computation =
+            TokenGasPriceComputation { min_sell_out_bps, ..computation_for(&eth.address) };
+
+        let prices = computation
+            .compute(&market, &store, &ChangedComponents::default())
+            .await
+            .expect("pricing must not fail")
+            .data;
+
+        assert!((ratio(&prices[&x.address]) - expected).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_pamm_left_out() {
+        // The pAMM quotes 3 X per ETH, the plain pool 2. Pricing leaves the pAMM out.
+        let eth = token(0, "ETH");
+        let x = token(1, "X");
+        let (market, _) = setup_market_weighted(vec![
+            ("pamm", &eth, &x, MockProtocolSim::new(3.0)),
+            ("plain", &eth, &x, MockProtocolSim::new(2.0)),
+        ]);
+        market
+            .write()
+            .await
+            .upsert_components([component_with_protocol(
+                "pamm",
+                &format!("{FALLBACK_PREFIX}fermiswap"),
+                &[eth.clone(), x.clone()],
+            )]);
+        let store = DerivedData::new_shared();
+
+        let prices = computation_for(&eth.address)
+            .compute(&market, &store, &ChangedComponents::default())
+            .await
+            .expect("pricing must not fail")
+            .data;
+
+        assert!((ratio(&prices[&x.address]) - 2.0).abs() < 1e-6);
+        let guard = store.read().await;
+        let deps = &guard
+            .token_prices_deps()
+            .expect("deps are stored")[&x.address]
+            .path_components;
+        assert_eq!(deps, &FxHashSet::from_iter(["plain".to_string()]));
     }
 
     #[tokio::test]
@@ -2885,6 +3146,66 @@ mod tests {
             .expect("deps are stored")[&usdc.address]
             .path_components;
         assert_eq!(deps, &FxHashSet::from_iter(["direct".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn test_route_and_amounts() {
+        // USDC is reachable only through ETH->MID->USDC. Fee-free pools buy 1500 USDC with one
+        // ETH probe and sell it back for the whole probe. A mock pool quotes its rate in address
+        // order, so MID takes the lower address.
+        let eth = token(0, "ETH");
+        let mid = token(1, "MID");
+        let usdc = token(2, "USDC");
+        let (market, _) = setup_market_weighted(vec![
+            ("eth_mid", &eth, &mid, MockProtocolSim::new(1.0)),
+            ("mid_usdc", &mid, &usdc, MockProtocolSim::new(1500.0)),
+        ]);
+        let store = DerivedData::new_shared();
+        let computation = computation_for(&eth.address);
+        computation
+            .compute(&market, &store, &ChangedComponents::default())
+            .await
+            .expect("pricing must not fail");
+
+        let history = computation.lock_pass_history();
+        let route = &history.routes[&usdc.address];
+        assert_eq!(route.components, vec!["eth_mid".to_string(), "mid_usdc".to_string()]);
+        let buy_amount_out = route
+            .buy_amount_out
+            .to_f64()
+            .expect("amount fits in f64");
+        let sell_amount_out = route
+            .sell_amount_out
+            .to_f64()
+            .expect("amount fits in f64");
+        assert!((buy_amount_out / PROBE_AMOUNT as f64 - 1500.0).abs() < 1e-6);
+        assert!((sell_amount_out / PROBE_AMOUNT as f64 - 1.0).abs() < 1e-6);
+    }
+
+    #[rstest::rstest]
+    #[case::up_ten_percent(100, 110, Some(1.1))]
+    #[case::down_ten_percent(110, 100, Some(100.0 / 110.0))]
+    #[case::up_five_percent(100, 105, None)]
+    #[case::unchanged(100, 100, None)]
+    #[case::stored_zero(0, 100, None)]
+    #[case::new_zero(100, 0, None)]
+    fn test_price_jump_ratio(
+        #[case] stored_numerator: u64,
+        #[case] new_numerator: u64,
+        #[case] expected: Option<f64>,
+    ) {
+        let price = |numerator: u64| Price {
+            numerator: BigUint::from(numerator),
+            denominator: BigUint::from(100u64),
+        };
+
+        let jump = price_jump_ratio(&price(stored_numerator), &price(new_numerator));
+
+        match (jump, expected) {
+            (Some(jump), Some(expected)) => assert!((jump - expected).abs() < 1e-9),
+            (None, None) => {}
+            (jump, expected) => panic!("expected {expected:?}, got {jump:?}"),
+        }
     }
 
     /// A pool that fails the reverse sell check: one whose output cap stops the reverse sell, or
@@ -2956,7 +3277,7 @@ mod tests {
             .compute(&market, &store, &ChangedComponents::default())
             .await
             .expect("pricing must not fail");
-        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1, true);
+        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1);
         let failure_before = store
             .read()
             .await
@@ -2973,7 +3294,7 @@ mod tests {
             .compute(&market, &store, &removed)
             .await
             .expect("pricing must not fail");
-        TokenGasPriceComputation::persist(&mut *store.write().await, output, 2, false);
+        TokenGasPriceComputation::persist(&mut *store.write().await, output, 2);
 
         assert!(failure_before);
         assert!(store
@@ -3020,6 +3341,11 @@ mod tests {
             .expect("deps are stored")[&y.address]
             .path_components;
         assert_eq!(deps, &FxHashSet::from_iter(["skewed".to_string()]));
+        let history = computation.lock_pass_history();
+        assert_eq!(
+            history.routes[&y.address].components,
+            vec!["skewed".to_string(), "skewed".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -3055,6 +3381,7 @@ mod tests {
         let record_pass = |new_flagged_components: FxHashSet<ComponentId>| {
             let outcome = PricingPassOutcome {
                 prices: FxHashMap::default(),
+                routes: FxHashMap::default(),
                 block: 0,
                 failed_items: Vec::new(),
                 unattempted: FxHashSet::default(),

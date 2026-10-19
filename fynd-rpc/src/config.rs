@@ -38,13 +38,25 @@ timeout_ms = 500
 
 # Example: a worker pool that never routes through a protocol system. An entry names a system
 # exactly ("uniswap_v2"), or a whole family when it ends with ":" — "fallback:" covers every
-# pAMM the TychoFallbackRouter executes. Absent = no restriction, which is the default.
+# pAMM and every "fallback:rfq:" RFQ venue. Absent = no restriction, which is the default.
 # [pools.no_pamm]
 # algorithm = "bellman_ford"
 # num_workers = 3
 # max_hops = 2
 # timeout_ms = 500
 # exclude_protocols = ["fallback:"]
+
+# Example: a worker pool whose algorithm never routes through a protocol system, while its
+# post-processors still can. Entries match as in exclude_protocols.
+# algorithm_exclude_protocols differs from exclude_protocols only in a pool that lists
+# post_processors.
+# [pools.replacer_only]
+# algorithm = "bellman_ford"
+# num_workers = 3
+# max_hops = 2
+# timeout_ms = 500
+# algorithm_exclude_protocols = ["rfq:bebop"]
+# post_processors = ["rfq_swap_replacer"]
 "#;
 
 /// Worker pools configuration loaded from TOML file.
@@ -167,6 +179,8 @@ mod tests {
             max_routes = 50
             liquidity_scope = "include_exclusive"
             exclude_protocols = ["fallback:", "uniswap_v2"]
+            algorithm_exclude_protocols = ["rfq:bebop"]
+            post_processors = ["rfq", "dedupe"]
         "#;
         let config: WorkerPoolsConfig = toml::from_str(toml).unwrap();
         let pool = &config.pools()["custom"];
@@ -182,6 +196,8 @@ mod tests {
             pool.exclude_protocols(),
             Some(["fallback:".to_string(), "uniswap_v2".to_string()].as_slice())
         );
+        assert_eq!(pool.algorithm_exclude_protocols(), Some(["rfq:bebop".to_string()].as_slice()));
+        assert_eq!(pool.post_processors(), ["rfq".to_string(), "dedupe".to_string()]);
     }
 
     /// A config written before `exclude_protocols` existed keeps parsing, and excludes nothing.
@@ -194,6 +210,21 @@ mod tests {
         let config: WorkerPoolsConfig = toml::from_str(toml).unwrap();
 
         assert_eq!(config.pools()["basic"].exclude_protocols(), None);
+        assert_eq!(config.pools()["basic"].algorithm_exclude_protocols(), None);
+    }
+
+    /// A config without `post_processors` parses and runs no post-processors.
+    #[test]
+    fn test_pool_config_without_post_processors() {
+        let toml = r#"
+            [pools.basic]
+            algorithm = "most_liquid"
+        "#;
+        let config: WorkerPoolsConfig = toml::from_str(toml).unwrap();
+
+        assert!(config.pools()["basic"]
+            .post_processors()
+            .is_empty());
     }
 }
 
@@ -203,8 +234,8 @@ pub mod defaults {
 
     // Re-export shared defaults from fynd-core as the single source of truth.
     pub use fynd_core::solver::defaults::{
-        GAS_REFRESH_INTERVAL, MIN_TOKEN_QUALITY, RECONNECT_DELAY, ROUTER_MIN_RESPONSES,
-        TRADED_N_DAYS_AGO, TVL_BUFFER_RATIO,
+        ENCODING_RETRY_BUDGET, GAS_REFRESH_INTERVAL, MIN_TOKEN_QUALITY, RECONNECT_DELAY,
+        ROUTER_MIN_RESPONSES, TRADED_N_DAYS_AGO, TVL_BUFFER_RATIO,
     };
 
     /// Default HTTP bind host (`"0.0.0.0"` — all interfaces).

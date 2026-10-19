@@ -2,8 +2,9 @@
 //!
 //! State overrides only help when they land on the slots a token actually reads. Most ERC-20s
 //! use Solidity's `keccak256(holder || base_slot)` mapping convention, but real tokens also use
-//! Vyper's reversed order, deep inheritance slots, proxies whose storage lives elsewhere, and
-//! rebasing shares. This module traces the token's read-only access, validates the observed slot
+//! Vyper's reversed order, deep inheritance slots, proxies whose storage lives elsewhere, rebasing
+//! shares, mappings under a namespaced base (OpenZeppelin v5, Base's B20, Animoca) and Solady's
+//! seeded keys. This module traces the token's read-only access, validates the observed slot
 //! with a sentinel override, then recovers the mapping convention needed to fund a simulated swap.
 
 use alloy::{
@@ -15,7 +16,9 @@ use alloy::{
         json_rpc::ErrorPayload,
         types::{
             state::{AccountOverride, StateOverride},
-            trace::geth::{GethDebugTracingCallOptions, GethDebugTracingOptions, PreStateConfig},
+            trace::geth::{
+                GethDebugTracingCallOptions, GethDebugTracingOptions, PreStateConfig, PreStateFrame,
+            },
             TransactionRequest,
         },
     },
@@ -37,6 +40,13 @@ const MAX_BASE_SLOT: u16 = 640;
 const MAX_SLOTS_TO_VERIFY: usize = 48;
 /// A value that survives common packed-balance flags and narrow integer casts.
 pub(crate) const PROBE_SENTINEL: U256 = U256::from_limbs([0xdead_beef_cafe_babe, 0, 0, 0]);
+/// Value written into a slot to test whether `balanceOf` divides the slot value by a rate.
+const SCALE_PROBE: U256 = U256::from_limbs([0, 0, 0, 1 << 8]);
+/// Largest value written into a scaled balance slot.
+///
+/// It stays below `U256::MAX` so that the token's own arithmetic on the slot value does not
+/// overflow.
+const MAX_SCALED_WORD: U256 = U256::from_limbs([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 6]);
 /// OpenZeppelin v5's ERC-20 balances mapping, under the namespace ERC-7201 prescribes.
 ///
 /// This is `keccak256(abi.encode(uint256(keccak256("openzeppelin.storage.ERC20")) - 1)) &
@@ -48,6 +58,39 @@ const OZ_V5_BALANCES_NS: B256 =
 /// Allowances are field 1 of `ERC20Storage`, so their namespace is the balances namespace plus one.
 const OZ_V5_ALLOWANCES_NS: B256 =
     B256::new(alloy::hex!("52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bace01"));
+/// The balances mapping of B20, Base's native token standard.
+///
+/// B20 keeps `B20CoreStorage` under the `base.b20` ERC-7201 namespace, and balances are its field
+/// 4: `(keccak256(abi.encode(uint256(keccak256("base.b20")) - 1)) & ~bytes32(uint256(0xff))) + 4`.
+const B20_BALANCES_NS: B256 =
+    B256::new(alloy::hex!("c78b71fee795ddd74aff64ea9b2474194c938c3196430e10bb5f01ed48434004"));
+/// The allowances mapping of B20, field 5 of `B20CoreStorage`.
+const B20_ALLOWANCES_NS: B256 =
+    B256::new(alloy::hex!("c78b71fee795ddd74aff64ea9b2474194c938c3196430e10bb5f01ed48434005"));
+/// The balances mapping of Animoca's ERC-20 library, at
+/// `uint256(keccak256("animoca.core.token.ERC20.ERC20.storage")) - 1`.
+const ANIMOCA_BALANCES_NS: B256 =
+    B256::new(alloy::hex!("1da92899d3da68bf9787824388a37ea2bfa79780bcef91b9716c390eec8ecbee"));
+/// The allowances mapping of Animoca's ERC-20 library, the field after its balances.
+const ANIMOCA_ALLOWANCES_NS: B256 =
+    B256::new(alloy::hex!("1da92899d3da68bf9787824388a37ea2bfa79780bcef91b9716c390eec8ecbef"));
+/// The fixed base slots of every known namespaced balances and allowances mapping.
+///
+/// Balance and allowance recovery both search the whole list. A base of the other kind never
+/// matches, because the slot it gives is a different keccak hash.
+const NAMESPACE_BASES: [B256; 6] = [
+    OZ_V5_BALANCES_NS,
+    OZ_V5_ALLOWANCES_NS,
+    B20_BALANCES_NS,
+    B20_ALLOWANCES_NS,
+    ANIMOCA_BALANCES_NS,
+    ANIMOCA_ALLOWANCES_NS,
+];
+/// The seed Solady's ERC-20 hashes after the holder's address to compute the balance slot.
+const SOLADY_BALANCE_SEED: [u8; 4] = alloy::hex!("87a211a2");
+/// The seed Solady's ERC-20 hashes between the owner and spender addresses to compute the
+/// allowance slot.
+const SOLADY_ALLOWANCE_SEED: [u8; 4] = alloy::hex!("7f5e9f20");
 
 sol! {
     interface IERC20LayoutProbe {
@@ -81,9 +124,30 @@ pub enum MappingPosition {
         /// Which way the implementation hashes the key and the base.
         key_order: KeyOrder,
     },
-    /// OpenZeppelin v5's namespaced storage. Which namespace applies follows from the mapping
-    /// being addressed, so a balance reads the balances one and an allowance the allowances one.
-    OpenZeppelinV5,
+    /// A Solidity mapping with a fixed 32-byte base slot, as namespaced storage such as ERC-7201
+    /// uses. A balance position holds the balances base, and an allowance position holds the
+    /// allowances base.
+    Namespaced {
+        /// The mapping's base slot.
+        base: B256,
+    },
+    /// Solady's ERC-20, which hashes each key with a fixed seed rather than with a base slot. The
+    /// seed follows from the mapping being addressed, so a balance uses the balance seed and an
+    /// allowance the allowance seed.
+    Solady,
+}
+
+/// How a token stores a balance in its balance slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BalanceEncoding {
+    /// The slot holds the balance.
+    Plain,
+    /// The slot holds the balance multiplied by `rate`. `balanceOf` divides the slot value by
+    /// `rate`.
+    Scaled {
+        /// Slot value per token unit that `balanceOf` reports.
+        rate: U256,
+    },
 }
 
 /// The slots needed to fund and approve one simulated token input.
@@ -92,6 +156,7 @@ pub struct TokenLayout {
     storage_contract: Address,
     balance: MappingPosition,
     allowance: MappingPosition,
+    balance_encoding: BalanceEncoding,
 }
 
 impl TokenLayout {
@@ -101,7 +166,31 @@ impl TokenLayout {
         balance: MappingPosition,
         allowance: MappingPosition,
     ) -> Self {
-        Self { storage_contract, balance, allowance }
+        Self { storage_contract, balance, allowance, balance_encoding: BalanceEncoding::Plain }
+    }
+
+    /// Returns this layout with `encoding` as the way that balances are stored.
+    #[must_use]
+    pub const fn with_balance_encoding(mut self, encoding: BalanceEncoding) -> Self {
+        self.balance_encoding = encoding;
+        self
+    }
+
+    /// Returns the value to write into a balance slot so that `balanceOf` reports `balance`.
+    ///
+    /// For a plain encoding, this is `balance`. For a scaled encoding, it is `balance * rate`,
+    /// capped just below 2^250. When the cap applies, `balanceOf` reports less than `balance`.
+    ///
+    /// # Arguments
+    ///
+    /// * `balance` - The balance that `balanceOf` must report.
+    pub fn balance_word(self, balance: U256) -> U256 {
+        match self.balance_encoding {
+            BalanceEncoding::Plain => balance,
+            BalanceEncoding::Scaled { rate } => balance
+                .checked_mul(rate)
+                .map_or(MAX_SCALED_WORD, |word| word.min(MAX_SCALED_WORD)),
+        }
     }
 
     /// Contract whose state holds this token's balances and allowances.
@@ -145,7 +234,7 @@ pub async fn discover_layout(
     holder: Address,
     spender: Address,
 ) -> Result<TokenLayout, DiscoveryError> {
-    let (storage_contract, balance) = discover_balance(provider, token, holder).await?;
+    let (storage_contract, balance, encoding) = discover_balance(provider, token, holder).await?;
 
     let allowance_calldata =
         IERC20LayoutProbe::allowanceCall { owner: holder, spender }.abi_encode();
@@ -165,20 +254,37 @@ pub async fn discover_layout(
         ))
     })?;
 
-    Ok(TokenLayout::new(storage_contract, balance, allowance))
+    Ok(TokenLayout::new(storage_contract, balance, allowance).with_balance_encoding(encoding))
 }
 
-/// Places the balance mapping, trying the plain balance view before the share-accounted one.
+/// Finds the contract and the mapping that hold the balance of `holder`.
 ///
-/// A rebasing token multiplies shares by a pooled rate inside `balanceOf`, so tracing that call
-/// finds the arithmetic and not the mapping; `sharesOf` reads the mapping directly. The retry
-/// replaces a list of addresses, which would name only the tokens already known to need it and
-/// would have to be kept per chain.
+/// Tries three probes, in this order:
+/// 1. `balanceOf(holder)`, for a token that stores each balance as it is.
+/// 2. `sharesOf(holder)`, for a rebasing token that stores shares. Its `balanceOf` computes the
+///    balance from the shares, so the first probe cannot find the mapping.
+/// 3. `balanceOf(holder)` again, for a token that stores each balance multiplied by a rate.
+///
+/// # Arguments
+///
+/// * `provider` - The node to trace and call. It must support `debug_traceCall`.
+/// * `token` - The token contract.
+/// * `holder` - The account whose balance slot to find.
+///
+/// # Returns
+///
+/// The contract that holds the balances, the position of the balance mapping, and how the
+/// mapping stores a balance.
+///
+/// # Errors
+///
+/// Returns [`DiscoveryError::Rpc`] when the node does not answer a probe, and
+/// [`DiscoveryError::Unsupported`] when no probe finds the mapping.
 async fn discover_balance(
     provider: &RootProvider<Ethereum>,
     token: Address,
     holder: Address,
-) -> Result<(Address, MappingPosition), DiscoveryError> {
+) -> Result<(Address, MappingPosition, BalanceEncoding), DiscoveryError> {
     let probes = [
         IERC20LayoutProbe::balanceOfCall { account: holder }.abi_encode(),
         ISharesToken::sharesOfCall { account: holder }.abi_encode(),
@@ -192,7 +298,7 @@ async fn discover_balance(
                 if let Some(position) =
                     recover_position(observed, |position| balance_slot(holder, position))
                 {
-                    return Ok((storage_contract, position));
+                    return Ok((storage_contract, position, BalanceEncoding::Plain));
                 }
                 failure = DiscoveryError::Unsupported(format!(
                     "could not recover a supported balance mapping for {token:#x}; observed slot {observed:#x}"
@@ -204,35 +310,37 @@ async fn discover_balance(
             Err(error) => failure = error,
         }
     }
-    Err(failure)
+    let calldata = IERC20LayoutProbe::balanceOfCall { account: holder }.abi_encode();
+    let is_mapping = |slot| recover_position(slot, |position| balance_slot(holder, position));
+    match find_scaled_slot(provider, token, &calldata, &is_mapping).await {
+        Ok(Some((storage_contract, slot, rate))) => {
+            let position = is_mapping(slot).ok_or_else(|| failure.clone())?;
+            Ok((storage_contract, position, BalanceEncoding::Scaled { rate }))
+        }
+        Ok(None) => Err(failure),
+        Err(error) => Err(error),
+    }
 }
 
-/// Finds the slot a read-only call depends on, by overwriting each slot it touched in turn.
-async fn find_accessed_slot(
-    provider: &RootProvider<Ethereum>,
-    token: Address,
-    calldata: &[u8],
-) -> Result<(Address, B256), DiscoveryError> {
-    let trace = provider
-        .debug_trace_call_prestate(
-            token_call(token, calldata),
-            BlockId::latest(),
-            GethDebugTracingCallOptions::new(GethDebugTracingOptions::prestate_tracer(
-                PreStateConfig::default(),
-            )),
-        )
-        .await
-        .map_err(|error| {
-            DiscoveryError::Rpc(format!(
-                "debug_traceCall prestate probe for {token:#x} failed: {error}"
-            ))
-        })?;
-
-    // Highest keys first: a mapping slot is a keccak hash and lands near the top of the key order,
-    // while a contract's fixed fields sit at 0, 1, 2 and sort to the bottom. Taking the cap from
-    // that end reaches the mapping on a token that reads many fixed slots.
+/// Returns the storage slots that a traced call read, in the order in which to test them.
+///
+/// Leaves out accounts without code, because they cannot hold token storage. Puts the highest
+/// slot keys first, because a mapping slot is a hash and sorts above the fixed fields of a
+/// contract.
+///
+/// # Arguments
+///
+/// * `trace` - The prestate trace of the call.
+fn candidates(trace: &PreStateFrame) -> Vec<(Address, B256)> {
     let mut candidates: Vec<(Address, B256)> = Vec::new();
     for (&storage_contract, account) in trace.pre_state() {
+        if account
+            .code
+            .as_ref()
+            .is_none_or(|code| code.is_empty())
+        {
+            continue;
+        }
         candidates.extend(
             account
                 .storage
@@ -241,6 +349,121 @@ async fn find_accessed_slot(
                 .map(|&slot| (storage_contract, slot)),
         );
     }
+    candidates
+}
+
+/// Finds a balance slot whose value `balanceOf` divides by a rate.
+///
+/// Traces the call, then tests each slot that `is_mapping` accepts, up to
+/// [`MAX_SLOTS_TO_VERIFY`] slots. A test writes [`SCALE_PROBE`] into the slot, and then twice
+/// that value. The slot passes when the first answer is above zero and below the written value,
+/// and the second answer is twice the first.
+///
+/// # Arguments
+///
+/// * `provider` - The node to trace and call.
+/// * `token` - The token contract.
+/// * `calldata` - The encoded `balanceOf` call.
+/// * `is_mapping` - Returns the mapping position of a slot, or `None` when the slot is not a
+///   balance slot of the holder.
+///
+/// # Returns
+///
+/// The contract that holds the slot, the slot, and the rate, or `None` when no slot passes.
+///
+/// # Errors
+///
+/// Returns [`DiscoveryError::Rpc`] when the node does not answer.
+async fn find_scaled_slot(
+    provider: &RootProvider<Ethereum>,
+    token: Address,
+    calldata: &[u8],
+    is_mapping: &impl Fn(B256) -> Option<MappingPosition>,
+) -> Result<Option<(Address, B256, U256)>, DiscoveryError> {
+    let trace = trace_call(provider, token, calldata).await?;
+    let candidates: Vec<(Address, B256)> = candidates(&trace)
+        .into_iter()
+        .filter(|&(_, slot)| is_mapping(slot).is_some())
+        .take(MAX_SLOTS_TO_VERIFY)
+        .collect();
+    for (storage_contract, slot) in candidates {
+        let Some(answer) =
+            probe_slot(provider, token, storage_contract, calldata, slot, SCALE_PROBE).await?
+        else {
+            continue;
+        };
+        if answer == U256::ZERO || answer >= SCALE_PROBE {
+            continue;
+        }
+        let doubled = SCALE_PROBE * U256::from(2_u8);
+        let Some(twice) =
+            probe_slot(provider, token, storage_contract, calldata, slot, doubled).await?
+        else {
+            continue;
+        };
+        let expected = answer * U256::from(2_u8);
+        if twice.abs_diff(expected) <= U256::from(1_u8) {
+            return Ok(Some((storage_contract, slot, SCALE_PROBE / answer)));
+        }
+    }
+    Ok(None)
+}
+
+/// Returns the prestate trace of `calldata` sent to `token` on the latest block.
+///
+/// # Errors
+///
+/// Returns [`DiscoveryError::Rpc`] when the node does not answer.
+async fn trace_call(
+    provider: &RootProvider<Ethereum>,
+    token: Address,
+    calldata: &[u8],
+) -> Result<PreStateFrame, DiscoveryError> {
+    provider
+        .debug_trace_call_prestate(
+            token_call(token, calldata),
+            BlockId::latest(),
+            GethDebugTracingCallOptions::new(GethDebugTracingOptions::prestate_tracer(
+                // The skip below needs each account's code, so the request asks for it rather than
+                // relying on the node's default.
+                PreStateConfig { disable_code: Some(false), ..Default::default() },
+            )),
+        )
+        .await
+        .map_err(|error| {
+            DiscoveryError::Rpc(format!(
+                "debug_traceCall prestate probe for {token:#x} failed: {error}"
+            ))
+        })
+}
+
+/// Finds the storage slot that the value returned by `calldata` comes from.
+///
+/// Traces the call, then writes [`PROBE_SENTINEL`] into each slot that the call read, up to
+/// [`MAX_SLOTS_TO_VERIFY`] slots. The first slot for which the call returns the sentinel is the
+/// result.
+///
+/// # Arguments
+///
+/// * `provider` - The node to trace and call.
+/// * `token` - The token contract.
+/// * `calldata` - The encoded `balanceOf`, `sharesOf` or `allowance` call.
+///
+/// # Returns
+///
+/// The contract that holds the slot, and the slot.
+///
+/// # Errors
+///
+/// Returns [`DiscoveryError::Rpc`] when the node does not answer, and
+/// [`DiscoveryError::Unsupported`] when no slot returns the sentinel.
+async fn find_accessed_slot(
+    provider: &RootProvider<Ethereum>,
+    token: Address,
+    calldata: &[u8],
+) -> Result<(Address, B256), DiscoveryError> {
+    let trace = trace_call(provider, token, calldata).await?;
+    let mut candidates = candidates(&trace);
     candidates.truncate(MAX_SLOTS_TO_VERIFY);
 
     // Every candidate is verified with its own `eth_call`, so they go out together: run in turn
@@ -271,7 +494,12 @@ fn token_call(token: Address, calldata: &[u8]) -> TransactionRequest {
     }
 }
 
-/// Whether overwriting one slot changes what the token reports, which is what identifies it.
+/// Returns whether `calldata` returns [`PROBE_SENTINEL`] after the sentinel is written into
+/// `slot` of `storage_contract`.
+///
+/// # Errors
+///
+/// Returns [`DiscoveryError::Rpc`] when the node does not answer.
 async fn slot_matches(
     provider: &RootProvider<Ethereum>,
     token: Address,
@@ -279,18 +507,47 @@ async fn slot_matches(
     calldata: &[u8],
     slot: B256,
 ) -> Result<bool, DiscoveryError> {
+    let answer =
+        probe_slot(provider, token, storage_contract, calldata, slot, PROBE_SENTINEL).await?;
+    Ok(answer == Some(PROBE_SENTINEL))
+}
+
+/// Calls `token` with `value` written into one storage slot, and returns the result.
+///
+/// # Arguments
+///
+/// * `provider` - The node to call.
+/// * `token` - The token contract to call.
+/// * `storage_contract` - The contract whose storage gets the value.
+/// * `calldata` - The encoded call.
+/// * `slot` - The slot that gets the value.
+/// * `value` - The value to write.
+///
+/// # Returns
+///
+/// The first 32 bytes that the call returns, or `None` when the call reverts, runs out of gas,
+/// or returns fewer than 32 bytes.
+///
+/// # Errors
+///
+/// Returns [`DiscoveryError::Rpc`] for any other error from the node.
+async fn probe_slot(
+    provider: &RootProvider<Ethereum>,
+    token: Address,
+    storage_contract: Address,
+    calldata: &[u8],
+    slot: B256,
+    value: U256,
+) -> Result<Option<U256>, DiscoveryError> {
     match provider
         .call(token_call(token, calldata))
-        .overrides(state_override_single(storage_contract, slot, B256::from(PROBE_SENTINEL)))
+        .overrides(state_override_single(storage_contract, slot, B256::from(value)))
         .await
     {
-        Ok(response) => {
-            Ok(response.len() >= 32 && U256::from_be_slice(&response[..32]) == PROBE_SENTINEL)
-        }
+        Ok(response) => Ok((response.len() >= 32).then(|| U256::from_be_slice(&response[..32]))),
         Err(error) => match error.as_error_resp() {
-            // A guarded proxy reverts when its implementation slot is overwritten, which proves
-            // the slot is not the mapping.
-            Some(payload) if is_revert(payload) => Ok(false),
+            // A revert or an out-of-gas result proves the slot is not the mapping.
+            Some(payload) if is_revert(payload) || is_out_of_gas(payload) => Ok(None),
             // Every other error response -- a rate limit, a compute budget, a head that moved --
             // proves nothing about the slot. Counting it as a miss would end discovery in
             // "could not identify", and that verdict is cached for the life of the process.
@@ -302,6 +559,11 @@ async fn slot_matches(
             ))),
         },
     }
+}
+
+/// Returns whether the error response says that the call ran out of gas.
+fn is_out_of_gas(payload: &ErrorPayload) -> bool {
+    payload.message.contains("out of gas")
 }
 
 /// Whether an error response is the contract reverting rather than the node declining to run.
@@ -336,7 +598,13 @@ fn recover_position(
             }
         }
     }
-    (slot_for(MappingPosition::OpenZeppelinV5) == slot).then_some(MappingPosition::OpenZeppelinV5)
+    for base in NAMESPACE_BASES {
+        let namespaced = MappingPosition::Namespaced { base };
+        if slot_for(namespaced) == slot {
+            return Some(namespaced);
+        }
+    }
+    (slot_for(MappingPosition::Solady) == slot).then_some(MappingPosition::Solady)
 }
 
 /// Slot holding one holder's balance under a given convention.
@@ -346,7 +614,13 @@ fn balance_slot(holder: Address, position: MappingPosition) -> B256 {
             solidity_mapping(holder, B256::from(U256::from(base)))
         }
         MappingPosition::Direct { base, key_order: KeyOrder::Vyper } => vyper_mapping(holder, base),
-        MappingPosition::OpenZeppelinV5 => solidity_mapping(holder, OZ_V5_BALANCES_NS),
+        MappingPosition::Namespaced { base } => solidity_mapping(holder, base),
+        MappingPosition::Solady => {
+            let mut hash_input = [0_u8; 32];
+            hash_input[..20].copy_from_slice(holder.as_slice());
+            hash_input[28..].copy_from_slice(&SOLADY_BALANCE_SEED);
+            keccak256(hash_input)
+        }
     }
 }
 
@@ -363,8 +637,15 @@ fn allowance_slot(owner: Address, spender: Address, position: MappingPosition) -
             buffer[44..].copy_from_slice(spender.as_slice());
             keccak256(buffer)
         }
-        MappingPosition::OpenZeppelinV5 => {
-            solidity_mapping(spender, solidity_mapping(owner, OZ_V5_ALLOWANCES_NS))
+        MappingPosition::Namespaced { base } => {
+            solidity_mapping(spender, solidity_mapping(owner, base))
+        }
+        MappingPosition::Solady => {
+            let mut hash_input = [0_u8; 52];
+            hash_input[..20].copy_from_slice(owner.as_slice());
+            hash_input[28..32].copy_from_slice(&SOLADY_ALLOWANCE_SEED);
+            hash_input[32..].copy_from_slice(spender.as_slice());
+            keccak256(hash_input)
         }
     }
 }

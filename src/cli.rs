@@ -99,6 +99,9 @@ pub struct ServeArgs {
     /// e.g., --protocols all_onchain,exclude:vm:fermiswap.
     /// Use "pricelevelstream:<venue>" to serve a pAMM from the Titan price level stream,
     /// e.g., --protocols all_onchain,exclude:vm:fermiswap,pricelevelstream:fermiswap.
+    /// Use "fallback:rfq:metric" or "fallback:rfq:bebop" to execute that RFQ protocol through its
+    /// fallback router (MetricFallbackRouter, BebopFallbackRouter),
+    /// e.g., --protocols all_onchain,fallback:rfq:metric.
     #[arg(short, long, value_delimiter = ',', value_name = "PROTO1,PROTO2")]
     pub protocols: Vec<String>,
 
@@ -138,6 +141,11 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = defaults::ROUTER_MIN_RESPONSES)]
     pub worker_router_min_responses: usize,
 
+    /// Milliseconds after the best candidates were encoded during which a failed encoding may
+    /// still be retried on the next candidate (0 = no retries)
+    #[arg(long, default_value_t = defaults::ENCODING_RETRY_BUDGET.as_millis() as u64)]
+    pub encoding_retry_budget_ms: u64,
+
     /// Path to worker pools TOML config file
     #[arg(short, long, env, default_value = "worker_pools.toml")]
     pub worker_pools_config: PathBuf,
@@ -172,6 +180,12 @@ pub struct ServeArgs {
     /// Disabled by default.
     #[arg(long)]
     pub enable_simulation: bool,
+
+    /// Simulate each quote on the block that it was priced on, instead of the latest block.
+    /// A node that does not have that block yet is asked again, for at most two block times.
+    /// Disabled by default.
+    #[arg(long)]
+    pub simulate_on_quote_block: bool,
 
     /// Watermark appended to every encoded transaction's calldata (e.g. "fynd"), so on-chain
     /// observers can attribute router calls to this deployment. The EVM ignores calldata past
@@ -292,6 +306,7 @@ mod cli_tests {
         assert_eq!(args.reconnect_delay_secs, 5);
         assert_eq!(args.worker_router_timeout_ms, 100);
         assert_eq!(args.worker_router_min_responses, 0);
+        assert_eq!(args.encoding_retry_budget_ms, 5);
         assert_eq!(args.blocklist_config, None);
         assert_eq!(args.hosted_swagger_url, None);
         assert_eq!(args.collector_url, None);

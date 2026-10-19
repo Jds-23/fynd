@@ -33,7 +33,10 @@ use tycho_simulation::{
 
 use crate::{
     algorithm::{AlgorithmConfig, AlgorithmError, AlgorithmRegistry},
-    derived::{ComputationManager, ComputationManagerConfig, SharedDerivedDataRef},
+    derived::{
+        registry::ErasedComputation, ComputationManager, ComputationManagerConfig,
+        DerivedComputation, SharedDerivedDataRef,
+    },
     encoding::{encoder::Encoder, fee_fetcher::RouterFeeFetcher, router_fees::SharedRouterFees},
     feed::{
         events::{MarketEvent, MarketEventHandler},
@@ -44,10 +47,11 @@ use crate::{
         DataFeedError, TychoFeedConfig,
     },
     graph::EdgeWeightUpdaterWithDerived,
+    post_process::{PostProcessorRegistry, UnknownPostProcessorError},
     price_guard::{
         guard::PriceGuard, provider::PriceProvider, provider_registry::PriceProviderRegistry,
     },
-    simulation::simulator::QuoteSimulator,
+    simulation::simulator::{QuoteSimulator, SimulationBlock},
     types::constants::native_token,
     worker_pool::{
         pool::{WorkerPool, WorkerPoolBuilder},
@@ -86,6 +90,9 @@ pub mod defaults {
     /// Minimum number of solver pool responses required before returning a quote (`0` = wait for
     /// all).
     pub const ROUTER_MIN_RESPONSES: usize = 0;
+    /// How long encoding retries may take, counted from when the best candidates were encoded
+    /// (`0` = no retries).
+    pub const ENCODING_RETRY_BUDGET: Duration = Duration::from_millis(5);
     /// Capacity of the task queue for each worker pool.
     pub const POOL_TASK_QUEUE_CAPACITY: usize = 1000;
     /// Minimum number of hops allowed in a route.
@@ -184,6 +191,17 @@ pub struct PoolConfig {
     /// `["fallback:"]`. Absent = no restriction.
     #[serde(default)]
     exclude_protocols: Option<Vec<String>>,
+    /// Protocol systems this worker pool's algorithm never routes through, e.g.
+    /// `["rfq:bebop"]`. Its post-processors still see them. This key differs from
+    /// `exclude_protocols` only when the pool lists `post_processors`. Absent = no restriction.
+    #[serde(default)]
+    algorithm_exclude_protocols: Option<Vec<String>>,
+    /// Names of the post-processors every worker in this pool runs, in order, on the route its
+    /// algorithm returned. Absent = none. Each name is either built in
+    /// (`rfq_swap_replacer`) or registered in the
+    /// [`PostProcessorRegistry`](crate::PostProcessorRegistry) given to the builder.
+    #[serde(default)]
+    post_processors: Vec<String>,
 }
 
 impl PoolConfig {
@@ -201,6 +219,8 @@ impl PoolConfig {
             connector_tokens: None,
             liquidity_scope: None,
             exclude_protocols: None,
+            algorithm_exclude_protocols: None,
+            post_processors: Vec::new(),
         }
     }
 
@@ -227,9 +247,37 @@ impl PoolConfig {
 
     /// Sets the protocol systems this worker pool never routes through. An entry names a protocol
     /// system exactly (`"uniswap_v2"`), or the whole family under a prefix when it ends with `:`
-    /// (`"fallback:"` covers every pAMM the TychoFallbackRouter executes).
+    /// (`"fallback:"` covers every `fallback:` venue: pAMMs and `fallback:rfq:` RFQ venues).
     pub fn with_exclude_protocols(mut self, exclude_protocols: Vec<String>) -> Self {
         self.exclude_protocols = Some(exclude_protocols);
+        self
+    }
+
+    /// Returns the protocol systems this worker pool's algorithm never routes through.
+    pub fn algorithm_exclude_protocols(&self) -> Option<&[String]> {
+        self.algorithm_exclude_protocols
+            .as_deref()
+    }
+
+    /// Sets the protocol systems this worker pool's algorithm never routes through. Entries match
+    /// as in [`with_exclude_protocols`](Self::with_exclude_protocols). Post-processors still see
+    /// these protocols, so a post-processor can add a swap through one.
+    pub fn with_algorithm_exclude_protocols(
+        mut self,
+        algorithm_exclude_protocols: Vec<String>,
+    ) -> Self {
+        self.algorithm_exclude_protocols = Some(algorithm_exclude_protocols);
+        self
+    }
+
+    /// Returns the names of the post-processors this worker pool runs, in order.
+    pub fn post_processors(&self) -> &[String] {
+        &self.post_processors
+    }
+
+    /// Sets the names of the post-processors this worker pool runs on each route, in order.
+    pub fn with_post_processors(mut self, post_processors: Vec<String>) -> Self {
+        self.post_processors = post_processors;
         self
     }
 
@@ -344,6 +392,9 @@ pub enum SolverBuildError {
     /// A worker pool referenced an algorithm name that is not registered.
     #[error(transparent)]
     UnknownAlgorithm(#[from] UnknownAlgorithmError),
+    /// A worker pool listed a post-processor that is neither built in nor registered.
+    #[error(transparent)]
+    UnknownPostProcessor(#[from] UnknownPostProcessorError),
     /// No native gas token is defined for the requested chain.
     #[error("gas token not configured for chain")]
     GasToken,
@@ -393,6 +444,8 @@ enum PoolEntry {
         connector_tokens: Option<FxHashSet<Address>>,
         liquidity_scope: Option<LiquidityScope>,
         exclude_protocols: Vec<String>,
+        algorithm_exclude_protocols: Vec<String>,
+        post_processors: Vec<String>,
     },
     Custom(CustomPoolEntry),
 }
@@ -483,6 +536,8 @@ struct BuiltComponents {
 pub struct FyndBuilder {
     /// Algorithms the caller brought, served when a pool names one.
     algorithms: AlgorithmRegistry,
+    /// Post-processors the caller brought, served when a pool lists one.
+    post_processors: PostProcessorRegistry,
     chain: Chain,
     tycho_url: String,
     rpc_url: String,
@@ -505,13 +560,16 @@ pub struct FyndBuilder {
     pricing_min_pass_interval: Option<Duration>,
     router_timeout: Duration,
     router_min_responses: usize,
+    encoding_retry_budget: Duration,
     encoder: Option<Encoder>,
     calldata_watermark: Option<Vec<u8>>,
     pools: Vec<PoolEntry>,
     price_guard_enabled: bool,
     simulation_enabled: bool,
+    simulation_block: SimulationBlock,
     price_providers: Vec<Box<dyn PriceProvider>>,
     pending_indexers: Vec<(String, Box<dyn TxDeltaIndexer>)>,
+    computations: Vec<Box<dyn ErasedComputation>>,
 }
 
 impl FyndBuilder {
@@ -525,6 +583,7 @@ impl FyndBuilder {
     ) -> Self {
         Self {
             algorithms: AlgorithmRegistry::new(),
+            post_processors: PostProcessorRegistry::new(),
             chain,
             tycho_url: tycho_url.into(),
             rpc_url: rpc_url.into(),
@@ -545,13 +604,16 @@ impl FyndBuilder {
             pricing_min_pass_interval: None,
             router_timeout: DEFAULT_ROUTER_TIMEOUT,
             router_min_responses: defaults::ROUTER_MIN_RESPONSES,
+            encoding_retry_budget: defaults::ENCODING_RETRY_BUDGET,
             encoder: None,
             calldata_watermark: None,
             pools: Vec::new(),
             price_guard_enabled: false,
             simulation_enabled: false,
+            simulation_block: SimulationBlock::Latest,
             price_providers: Vec::new(),
             pending_indexers: Vec::new(),
+            computations: Vec::new(),
         }
     }
 
@@ -656,8 +718,7 @@ impl FyndBuilder {
     /// Sets how long after a token-pricing pass starts the next one may start.
     ///
     /// The cap bounds what one pass costs; this bounds how often one runs. A block inside the
-    /// interval serves the stored prices, unless a component brought a token with no price or
-    /// the manager asked for a full recompute.
+    /// interval serves the stored prices, unless an added component brings a token with no price.
     pub fn set_pricing_min_pass_interval(mut self, interval: Duration) -> Self {
         self.pricing_min_pass_interval = Some(interval);
         self
@@ -672,6 +733,13 @@ impl FyndBuilder {
     /// Sets the minimum number of solver responses before early return (default: 0).
     pub fn worker_router_min_responses(mut self, min: usize) -> Self {
         self.router_min_responses = min;
+        self
+    }
+
+    /// Sets how long encoding retries may take, counted from when the best candidates were
+    /// encoded (default: 5ms). `Duration::ZERO` turns retrying off.
+    pub fn encoding_retry_budget(mut self, budget: Duration) -> Self {
+        self.encoding_retry_budget = budget;
         self
     }
 
@@ -703,6 +771,8 @@ impl FyndBuilder {
             connector_tokens: None,
             liquidity_scope: None,
             exclude_protocols: Vec::new(),
+            algorithm_exclude_protocols: Vec::new(),
+            post_processors: Vec::new(),
         });
         self
     }
@@ -748,6 +818,30 @@ impl FyndBuilder {
     /// lives outside this crate without changing how its pools are configured.
     pub fn with_algorithms(mut self, algorithms: AlgorithmRegistry) -> Self {
         self.algorithms = algorithms;
+        self
+    }
+
+    /// Runs `computation` on each market update, together with the built-in derived computations.
+    ///
+    /// The computation reads the market and the derived data store, and its output goes into the
+    /// store under its [`ID`](DerivedComputation::ID). A deployment can keep its own view of the
+    /// market current this way.
+    ///
+    /// The build fails when a built-in computation or an earlier call already uses the same ID.
+    pub fn with_computation<C: DerivedComputation>(mut self, computation: C) -> Self {
+        self.computations
+            .push(Box::new(computation));
+        self
+    }
+
+    /// Serves the post-processors a pool lists by name.
+    ///
+    /// A pool lists post-processor names; this hands the builder the ones the caller registered.
+    /// The built-in names need no registration. A name that is neither built in nor in
+    /// `post_processors` fails [`build`](Self::build) with
+    /// [`SolverBuildError::UnknownPostProcessor`].
+    pub fn with_post_processors(mut self, post_processors: PostProcessorRegistry) -> Self {
+        self.post_processors = post_processors;
         self
     }
 
@@ -809,6 +903,12 @@ impl FyndBuilder {
         self
     }
 
+    /// Sets the block that a quote simulation runs on. Defaults to [`SimulationBlock::Latest`].
+    pub fn simulation_block(mut self, block: SimulationBlock) -> Self {
+        self.simulation_block = block;
+        self
+    }
+
     /// Adds a named worker pool using the given [`PoolConfig`].
     ///
     /// # Errors
@@ -836,6 +936,11 @@ impl FyndBuilder {
                 .exclude_protocols()
                 .map(<[String]>::to_vec)
                 .unwrap_or_default(),
+            algorithm_exclude_protocols: config
+                .algorithm_exclude_protocols()
+                .map(<[String]>::to_vec)
+                .unwrap_or_default(),
+            post_processors: config.post_processors().to_vec(),
         });
         Ok(self)
     }
@@ -924,9 +1029,14 @@ impl FyndBuilder {
         }
         // ComputationManager::new returns a broadcast receiver that we don't need here —
         // workers subscribe via computation_manager.event_sender() below.
-        let (computation_manager, _) =
+        let (mut computation_manager, _) =
             ComputationManager::new(computation_config, market_data.clone())
                 .map_err(|e| SolverBuildError::ComputationManager(e.to_string()))?;
+        for computation in self.computations {
+            computation_manager
+                .register_boxed(computation)
+                .map_err(|e| SolverBuildError::ComputationManager(e.to_string()))?;
+        }
 
         let derived_data: SharedDerivedDataRef = computation_manager.store();
         let derived_event_tx = computation_manager.event_sender();
@@ -962,6 +1072,8 @@ impl FyndBuilder {
                     connector_tokens,
                     liquidity_scope: _,
                     exclude_protocols,
+                    algorithm_exclude_protocols,
+                    post_processors,
                 } => {
                     let mut algo_cfg = AlgorithmConfig::new(
                         min_hops,
@@ -972,13 +1084,18 @@ impl FyndBuilder {
                     if let Some(tokens) = connector_tokens {
                         algo_cfg = algo_cfg.with_connector_tokens(tokens);
                     }
+                    let factories = self
+                        .post_processors
+                        .resolve(&name, &post_processors)?;
                     let named = WorkerPoolBuilder::new()
                         .name(name)
                         .algorithm_config(algo_cfg)
                         .num_workers(num_workers)
                         .task_queue_capacity(task_queue_capacity)
                         .liquidity_scope(pool_scope)
-                        .exclude_protocols(exclude_protocols);
+                        .exclude_protocols(exclude_protocols)
+                        .algorithm_exclude_protocols(algorithm_exclude_protocols)
+                        .post_processor_factories(factories);
                     let builder = self
                         .algorithms
                         .configure(&algorithm, named)?;
@@ -1063,6 +1180,7 @@ impl FyndBuilder {
                     self.rpc_url.as_str(),
                     chain,
                     defaults::SIMULATION_REQUEST_TIMEOUT,
+                    self.simulation_block,
                 )
                 .map_err(|error| SolverBuildError::QuoteSimulator(error.to_string()))?,
             )
@@ -1074,7 +1192,8 @@ impl FyndBuilder {
         // When disabled, per-request attempts to enable the guard return an error.
         let router_config = WorkerPoolRouterConfig::default()
             .with_timeout(self.router_timeout)
-            .with_min_responses(self.router_min_responses);
+            .with_min_responses(self.router_min_responses)
+            .with_encoding_retry_budget(self.encoding_retry_budget);
         let mut router = WorkerPoolRouter::new(solver_pool_handles, router_config, encoder);
         if let Some(simulator) = quote_simulator {
             router = router.with_simulator(simulator);
@@ -1788,5 +1907,52 @@ mod tests {
             Duration::from_millis(100),
         );
         assert!(over.is_empty());
+    }
+
+    #[test]
+    fn test_pool_config_with_post_processors() {
+        let config = PoolConfig::new("most_liquid")
+            .with_post_processors(vec!["a".to_string(), "b".to_string()]);
+
+        assert_eq!(config.post_processors(), ["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn test_pool_config_default_post_processors() {
+        assert!(PoolConfig::new("most_liquid")
+            .post_processors()
+            .is_empty());
+    }
+
+    /// A misspelled name has to stop the build, not the first quote that reaches the pool.
+    #[tokio::test]
+    async fn test_build_unregistered_post_processor() {
+        let config = PoolConfig::new("most_liquid").with_post_processors(vec!["rfq".to_string()]);
+        let result = FyndBuilder::new(
+            Chain::Ethereum,
+            "wss://example.invalid",
+            "https://example.invalid",
+            vec!["uniswap_v2".to_string()],
+            100.0,
+        )
+        .add_pool("pool", &config)
+        .expect("add_pool should accept the config")
+        .build();
+
+        let Err(error) = result else {
+            panic!("a pool listing an unregistered post-processor must not build");
+        };
+        assert!(
+            matches!(error, SolverBuildError::UnknownPostProcessor(_)),
+            "expected UnknownPostProcessor, got: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("pool 'pool'") &&
+                error.to_string().contains("'rfq'"),
+            "expected the error to name the pool and the unregistered post-processor 'rfq', \
+             got: {error}"
+        );
     }
 }

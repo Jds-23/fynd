@@ -436,6 +436,9 @@ fn error_label(error: &SolveError) -> &'static str {
             RouteRejection::FallbackNotSimulatable => {
                 "route rejected: pAMM fallback not simulatable"
             }
+            RouteRejection::FallbackBelowMinAmountOut => {
+                "route rejected: pAMM fallback below min amount out"
+            }
             // `RouteRejection` is `#[non_exhaustive]`; a variant added upstream lands here.
             _ => "route rejected: other",
         },

@@ -38,6 +38,9 @@ pub mod feed;
 /// Graph management for algorithms. Provides [`GraphManager`](graph::GraphManager)
 /// trait and the reusable [`PetgraphStableDiGraphManager`](graph::PetgraphStableDiGraphManager).
 pub mod graph;
+/// Post-processors that change the route a pool's algorithm returns: the [`RoutePostProcessor`]
+/// trait and the [`PostProcessorRegistry`] of factories a caller registers.
+pub mod post_process;
 /// External price validation for quotes.
 pub mod price_guard;
 /// Re-execute an already-built route against a (possibly newer) market state.
@@ -66,6 +69,10 @@ pub use algorithm::{
 // Required for implementing the Algorithm trait externally
 pub use derived::computation::ComputationRequirements;
 pub use feed::{events::MarketEvent, market_data::StateLabel};
+pub use post_process::{
+    PostProcessRequest, PostProcessorAlreadyRegistered, PostProcessorRegistry, RoutePostProcessor,
+    UnknownPostProcessorError,
+};
 pub use price_guard::{
     config::PriceGuardConfig,
     provider::{ExternalPrice, PriceProvider, PriceProviderError},
@@ -75,6 +82,7 @@ pub use replay::{replay_route, ReplayError, RouteReplay};
 // Re-exported so an external implementor names the same types without matching our
 // `rustc-hash` version itself.
 pub use rustc_hash;
+pub use simulation::simulator::{SimulationBlock, SimulationPurpose};
 pub use solver::{FyndBuilder, PoolConfig, Solver, SolverBuildError, SolverParts, WaitReadyError};
 /// Processes ephemeral pending bundles against live Tycho market state. Obtained by calling
 /// [`FyndBuilder::build_with_pending`](solver::FyndBuilder::build_with_pending).
@@ -93,9 +101,9 @@ pub use tycho_simulation::evm::stream::BlockStepController;
 /// to receive raw transaction deltas during pending-block simulation.
 pub use tycho_simulation::tycho_common::traits::TxDeltaIndexer;
 pub use types::{
-    BlockInfo, ClientFeeParams, ComponentId, EncodingOptions, EncodingOptionsError, FeeBreakdown,
-    Order, OrderQuote, OrderSide, OrderValidationError, PermitDetails, PermitSingle, Quote,
-    QuoteOptions, QuoteRequest, QuoteStatus, Route, RouteExclusionFilter, RouteExclusions,
+    BlockInfo, ClientFeeParams, ComponentId, EncodingOptions, EncodingOptionsError, EventLog,
+    FeeBreakdown, Order, OrderQuote, OrderSide, OrderValidationError, PermitDetails, PermitSingle,
+    Quote, QuoteOptions, QuoteRequest, QuoteStatus, Route, RouteExclusionFilter, RouteExclusions,
     RouteValidationError, SimulationResult, SingleOrderQuote, SolveError, SolveParams, SolveResult,
     SurplusInfo, Swap, TaskId, Transaction, UserTransferType,
 };

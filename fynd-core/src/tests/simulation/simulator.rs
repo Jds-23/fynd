@@ -7,18 +7,21 @@ use alloy::{
         json_rpc::ErrorPayload,
         types::simulate::{SimCallResult, SimulatedBlock},
     },
-    sol_types::SolError,
+    sol_types::{SolCall, SolError},
     transports::mock::Asserter,
 };
 use num_bigint::BigUint;
+use tycho_simulation::tycho_common::Bytes as TychoBytes;
 
 use super::*;
 use crate::{
+    algorithm::test_utils::{component, token, MockProtocolSim},
     simulation::{
         deviation::fixtures::quote_with_fees,
         token_layout::{KeyOrder, MappingPosition, TokenLayout, PROBE_SENTINEL},
     },
     tests::metrics::recorded_metrics,
+    Route, Swap, Transaction,
 };
 
 /// A budget long enough that a mocked provider, which answers at once, never meets it.
@@ -26,17 +29,79 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[test]
 fn test_success_reports_amount_out_and_gas_used() {
-    let result = SimulationAttempt::Success { amount_out: BigUint::from(42_u8), gas_used: 123_456 }
-        .into_result();
+    let result = SimulationAttempt::Success {
+        amount_out: BigUint::from(42_u8),
+        gas_used: 123_456,
+        logs: Vec::new(),
+    }
+    .into_result();
     assert!(
-        matches!(result, SimulationResult::Success { amount_out, gas_used } if amount_out == BigUint::from(42_u8) && gas_used == 123_456)
+        matches!(result, SimulationResult::Success { amount_out, gas_used, .. } if amount_out == BigUint::from(42_u8) && gas_used == 123_456)
     );
 }
 
 #[test]
 fn test_revert_reports_no_gas() {
-    let result = SimulationAttempt::Reverted { reason: "no liquidity".to_string() }.into_result();
-    assert!(matches!(result, SimulationResult::Failure { reason } if reason == "no liquidity"));
+    let result =
+        SimulationAttempt::Reverted { reason: "no liquidity".to_string(), replay: empty_replay() }
+            .into_result();
+    assert!(matches!(result, SimulationResult::Reverted { reason } if reason == "no liquidity"));
+}
+
+#[test]
+fn test_failure_stays_apart_from_a_revert() {
+    let result = SimulationAttempt::Failure { reason: "timed out".to_string() }.into_result();
+    assert!(matches!(result, SimulationResult::Failure { reason } if reason == "timed out"));
+}
+
+#[tokio::test]
+async fn test_simulated_call_returns_its_logs_undecoded() {
+    let emitter = Address::repeat_byte(0xCC);
+    let topics = vec![B256::repeat_byte(0x11), B256::repeat_byte(0x22)];
+    let data = Bytes::from(vec![0x33; 64]);
+    let mut response = simulated_response(
+        U256::from(123_u64)
+            .to_be_bytes::<32>()
+            .to_vec(),
+        true,
+        87_654,
+    );
+    response[0].calls[0].logs = vec![alloy::rpc::types::Log {
+        inner: alloy::primitives::Log::new_unchecked(emitter, topics.clone(), data.clone()),
+        ..Default::default()
+    }];
+    let asserter = Asserter::new();
+    asserter.push_success(&response);
+
+    let result = simulate_with_overrides(
+        &RootProvider::new(RpcClient::mocked(asserter)),
+        SimulatedCall {
+            sender: Address::repeat_byte(1),
+            router: Address::repeat_byte(2),
+            value: U256::ZERO,
+            data: &[0x12],
+            block: BlockNumberOrTag::Latest,
+        },
+        native_balance_override(Address::repeat_byte(1)),
+        test_envelope(),
+        TEST_TIMEOUT,
+    )
+    .await;
+
+    let CallOutcome::Success { logs, .. } = result else {
+        panic!("the call succeeded");
+    };
+    assert_eq!(
+        logs,
+        vec![EventLog {
+            address: emitter.to_vec().into(),
+            topics: topics
+                .iter()
+                .map(|topic| topic.to_vec().into())
+                .collect(),
+            data: data.to_vec().into(),
+        }]
+    );
 }
 
 #[test]
@@ -63,7 +128,147 @@ fn test_token_overrides_fund_both_holders_and_both_spenders() {
     assert_eq!(state_diff.len(), 4);
 }
 
+/// The signature code merges into the sender's existing override. Replacing that override would
+/// drop the sender's funding, and the simulation would revert on an empty balance instead of in
+/// the swap.
+#[test]
+fn test_client_fee_signature_override_on_the_sender() {
+    let sender = Address::repeat_byte(1);
+    let mut overrides = native_balance_override(sender);
+
+    add_client_fee_receiver_override(&mut overrides, sender);
+
+    let account = &overrides[&sender];
+    assert_eq!(account.balance, Some(SIMULATION_FUNDING_VALUE));
+    assert_eq!(account.nonce, Some(SIMULATION_SENDER_NONCE));
+    assert_eq!(account.code, Some(Bytes::from_static(&ACCEPT_ANY_ERC1271_SIGNATURE_CODE)));
+}
+
+/// The byte the mocked simulator's native-token address repeats. A quote selling the native token
+/// skips token layout discovery, so the simulation is the only RPC call.
+const MOCKED_NATIVE_TOKEN_BYTE: u8 = 9;
+
+/// The router the encoded quote calls.
+const ENCODED_QUOTE_ROUTER: Address = Address::repeat_byte(0x02);
+
+/// An encoded quote selling the mocked simulator's native token.
+fn encoded_quote() -> OrderQuote {
+    let token_in = token(MOCKED_NATIVE_TOKEN_BYTE, "NATIVE");
+    let token_out = token(0x0B, "OUT");
+    let swap = Swap::new(
+        "pool".to_string(),
+        "uniswap_v2".to_string(),
+        token_in.address.clone(),
+        token_out.address.clone(),
+        BigUint::from(1_000_u64),
+        BigUint::from(990_u64),
+        BigUint::from(50_000_u64),
+        component("pool", &[token_in.clone(), token_out.clone()]),
+        Box::new(MockProtocolSim::new(1.0)),
+    );
+    let route = Route::new(
+        vec![swap],
+        [(token_in.address.clone(), token_in), (token_out.address.clone(), token_out)],
+    )
+    .expect("a one-swap route");
+    let mut quote = quote_with_fees(1_000_000).with_route(route);
+    quote.set_transaction(Transaction::new(
+        TychoBytes::from(ENCODED_QUOTE_ROUTER.as_slice()),
+        BigUint::ZERO,
+        vec![0x12],
+    ));
+    quote
+}
+
+/// Client fee params naming `receiver`, with the zero placeholder signature the TS client sends.
+fn client_fee_params(receiver: &[u8]) -> ClientFeeParams {
+    ClientFeeParams::new(
+        100,
+        TychoBytes::from(receiver),
+        BigUint::ZERO,
+        u64::MAX,
+        TychoBytes::from(vec![0; 65]),
+    )
+}
+
+/// With client fee params on the quote, the simulation gives the fee receiver code that accepts
+/// the placeholder signature. Without them, or for a zero receiver the router never checks, no
+/// address gets that code.
+#[rstest::rstest]
+#[case::with_client_fee(Some(Address::repeat_byte(0x0C)), true)]
+#[case::without_client_fee(None, false)]
+#[case::zero_receiver(Some(Address::ZERO), false)]
+#[tokio::test]
+async fn test_simulate_attempt_client_fee_receiver(
+    #[case] receiver: Option<Address>,
+    #[case] receiver_gets_code: bool,
+) {
+    let client_fee = receiver.map(|receiver| client_fee_params(receiver.as_slice()));
+    let asserter = Asserter::new();
+    // Only a reverted attempt carries the replay payload, the one place the overrides the
+    // simulation sent can be read back.
+    asserter.push_success(&simulated_response(
+        crate::simulation::revert::RouterErrors::TychoRouter__EmptySwaps {}.abi_encode(),
+        false,
+        0,
+    ));
+
+    let attempt = mocked_simulator(&asserter, TEST_TIMEOUT)
+        .simulate_attempt(&encoded_quote(), client_fee.as_ref(), SimulationPurpose::QUOTE)
+        .await;
+
+    let SimulationAttempt::Reverted { replay, .. } = attempt else {
+        panic!("the mocked call reverts");
+    };
+    let overrides = replay.payload.block_state_calls[0]
+        .state_overrides
+        .as_ref()
+        .expect("state overrides");
+    let code = Bytes::from_static(&ACCEPT_ANY_ERC1271_SIGNATURE_CODE);
+    let accounts_with_code: Vec<Address> = overrides
+        .iter()
+        .filter(|(_, account)| account.code.as_ref() == Some(&code))
+        .map(|(address, _)| *address)
+        .collect();
+    let expected: Vec<Address> = receiver
+        .filter(|_| receiver_gets_code)
+        .into_iter()
+        .collect();
+    assert_eq!(accounts_with_code, expected);
+}
+
+/// A receiver the simulation cannot give code to fails setup before any RPC call: one that is not
+/// an address, and the router, whose own code the override would replace.
+#[rstest::rstest]
+#[case::not_20_bytes(vec![0x0C; 19], "is not 20 bytes")]
+#[case::router(ENCODED_QUOTE_ROUTER.to_vec(), "is the router")]
+#[tokio::test]
+async fn test_simulate_attempt_unusable_client_fee_receiver(
+    #[case] receiver: Vec<u8>,
+    #[case] expected_reason: &str,
+) {
+    let asserter = Asserter::new();
+
+    let attempt = mocked_simulator(&asserter, TEST_TIMEOUT)
+        .simulate_attempt(
+            &encoded_quote(),
+            Some(&client_fee_params(&receiver)),
+            SimulationPurpose::QUOTE,
+        )
+        .await;
+
+    let SimulationAttempt::Failure { reason } = attempt else {
+        panic!("setup fails");
+    };
+    assert!(reason.starts_with("simulation setup failed: client fee receiver"), "{reason}");
+    assert!(reason.contains(expected_reason), "{reason}");
+}
+
 /// An envelope for the tests that drive the call directly, without a quote to derive one from.
+fn empty_replay() -> Box<Replay> {
+    Box::new(Replay { parent_block: 0, payload: SimulatePayload::default() })
+}
+
 fn test_envelope() -> SimulationEnvelope {
     SimulationEnvelope { gas_limit: SIMULATION_MIN_GAS_LIMIT, gas_price: 1 }
 }
@@ -149,7 +354,7 @@ fn test_sender_override_funds_a_used_account() {
 fn mocked_simulator(asserter: &Asserter, timeout: Duration) -> QuoteSimulator {
     QuoteSimulator::with_provider(
         RootProvider::new(RpcClient::mocked(asserter.clone())),
-        Address::repeat_byte(9),
+        Address::repeat_byte(MOCKED_NATIVE_TOKEN_BYTE),
         timeout,
     )
 }
@@ -164,6 +369,257 @@ fn simulated_response(return_data: Vec<u8>, status: bool, gas_used: u64) -> Vec<
             ..Default::default()
         }],
     }]
+}
+
+/// Answers `eth_simulateV1` with a successful call, echoing the request id, and only when the
+/// request names `block` as the state to run on.
+struct SimulatesOn {
+    block: &'static str,
+    response: serde_json::Value,
+}
+
+impl wiremock::Match for SimulatesOn {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        let Ok(body) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+            return false;
+        };
+        body["method"] == "eth_simulateV1" && body["params"][1] == self.block
+    }
+}
+
+impl wiremock::Respond for SimulatesOn {
+    fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let id = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .map(|body| body["id"].clone())
+            .unwrap_or_default();
+        wiremock::ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": self.response}))
+    }
+}
+
+/// Answers every request with the error geth gives for a block it does not have.
+struct HeaderNotFound;
+
+impl wiremock::Respond for HeaderNotFound {
+    fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let id = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .map(|body| body["id"].clone())
+            .unwrap_or_default();
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32000, "message": "header not found"},
+        }))
+    }
+}
+
+fn http_simulator(
+    server: &wiremock::MockServer,
+    block_time: Duration,
+    request_timeout: Duration,
+) -> QuoteSimulator {
+    QuoteSimulator::with_provider(
+        RootProvider::new_http(server.uri().parse().unwrap()),
+        Address::repeat_byte(9),
+        request_timeout,
+    )
+    .with_block_time(block_time)
+}
+
+fn call_on_block(number: u64) -> SimulatedCall<'static> {
+    SimulatedCall {
+        sender: Address::repeat_byte(1),
+        router: Address::repeat_byte(2),
+        value: U256::ZERO,
+        data: &[0x12],
+        block: BlockNumberOrTag::Number(number),
+    }
+}
+
+#[tokio::test]
+async fn test_simulation_waits_for_a_node_that_does_not_have_the_block_yet() {
+    let server = wiremock::MockServer::start().await;
+    let response = serde_json::to_value(simulated_response(
+        U256::from(123_u64)
+            .to_be_bytes::<32>()
+            .to_vec(),
+        true,
+        87_654,
+    ))
+    .unwrap();
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(HeaderNotFound)
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(SimulatesOn { block: "0x4d2", response: response.clone() })
+        .respond_with(SimulatesOn { block: "0x4d2", response })
+        .mount(&server)
+        .await;
+    let simulator = http_simulator(&server, Duration::from_secs(2), TEST_TIMEOUT);
+    let started = std::time::Instant::now();
+
+    let attempt = simulator
+        .simulate_within_timeout(
+            call_on_block(1_234),
+            native_balance_override(Address::repeat_byte(1)),
+            test_envelope(),
+        )
+        .await;
+
+    assert!(matches!(attempt, SimulationAttempt::Success { .. }), "found on the third try");
+    assert!(started.elapsed() >= Duration::from_millis(1_500), "waited 500 ms, then 1 s");
+}
+
+#[tokio::test]
+async fn test_simulation_gives_up_on_the_block_after_two_block_times() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(HeaderNotFound)
+        .mount(&server)
+        .await;
+    let simulator = http_simulator(&server, Duration::from_millis(400), TEST_TIMEOUT);
+    let started = std::time::Instant::now();
+
+    let attempt = simulator
+        .simulate_within_timeout(
+            call_on_block(1_234),
+            native_balance_override(Address::repeat_byte(1)),
+            test_envelope(),
+        )
+        .await;
+
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(&attempt, SimulationAttempt::BlockUnavailable { reason } if reason.contains("header not found")),
+        "a node failure, not a failed or reverted call"
+    );
+    assert!(elapsed >= Duration::from_millis(800), "waited two block times: {elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1_500), "and no longer: {elapsed:?}");
+    let requests = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .len();
+    assert_eq!(requests, 3, "asked at 0, 500 ms and 800 ms");
+}
+
+#[tokio::test]
+async fn test_waiting_for_the_block_stays_within_the_request_timeout() {
+    // Two Ethereum block times would be 24 s; the request allows 1 s.
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(HeaderNotFound)
+        .mount(&server)
+        .await;
+    let simulator = http_simulator(&server, Duration::from_secs(12), Duration::from_millis(1_000));
+    let started = std::time::Instant::now();
+
+    let attempt = simulator
+        .simulate_within_timeout(
+            call_on_block(1_234),
+            native_balance_override(Address::repeat_byte(1)),
+            test_envelope(),
+        )
+        .await;
+
+    let elapsed = started.elapsed();
+    assert!(matches!(attempt, SimulationAttempt::BlockUnavailable { .. }));
+    assert!(elapsed < Duration::from_millis(1_000), "within the request timeout: {elapsed:?}");
+    let requests = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .len();
+    assert_eq!(requests, 2, "asked at 0 and 500 ms; a 1 s wait would outlast the request");
+}
+
+#[tokio::test]
+async fn test_other_node_errors_are_not_retried() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0", "id": 0,
+            "error": {"code": -32601, "message": "the method eth_simulateV1 does not exist"},
+        })))
+        .mount(&server)
+        .await;
+    let simulator = http_simulator(&server, Duration::from_secs(2), TEST_TIMEOUT);
+
+    let attempt = simulator
+        .simulate_within_timeout(
+            call_on_block(1_234),
+            native_balance_override(Address::repeat_byte(1)),
+            test_envelope(),
+        )
+        .await;
+
+    assert!(matches!(attempt, SimulationAttempt::Failure { .. }));
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn test_simulator_runs_on_the_latest_block_by_default() {
+    let simulator = mocked_simulator(&Asserter::new(), TEST_TIMEOUT);
+    let quote = encoded_quote();
+
+    let setup = SimulationSetup::for_quote(&quote, None, simulator.block).expect("a valid quote");
+
+    assert_eq!(setup.call.block, BlockNumberOrTag::Latest);
+}
+
+#[test]
+fn test_setup_runs_on_the_quote_block_when_asked() {
+    let quote = encoded_quote();
+
+    let setup =
+        SimulationSetup::for_quote(&quote, None, SimulationBlock::Quote).expect("a valid quote");
+
+    assert_eq!(setup.call.block, BlockNumberOrTag::Number(quote.block().number()));
+}
+
+#[tokio::test]
+async fn test_simulation_runs_on_the_block_it_is_given() {
+    let server = wiremock::MockServer::start().await;
+    let response = serde_json::to_value(simulated_response(
+        U256::from(123_u64)
+            .to_be_bytes::<32>()
+            .to_vec(),
+        true,
+        87_654,
+    ))
+    .unwrap();
+    wiremock::Mock::given(SimulatesOn { block: "0x4d2", response: response.clone() })
+        .respond_with(SimulatesOn { block: "0x4d2", response })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = RootProvider::new_http(server.uri().parse().unwrap());
+
+    let result = simulate_with_overrides(
+        &provider,
+        SimulatedCall {
+            sender: Address::repeat_byte(1),
+            router: Address::repeat_byte(2),
+            value: U256::ZERO,
+            data: &[0x12],
+            block: BlockNumberOrTag::Number(1_234),
+        },
+        native_balance_override(Address::repeat_byte(1)),
+        test_envelope(),
+        TEST_TIMEOUT,
+    )
+    .await;
+
+    assert!(matches!(result, CallOutcome::Success { .. }), "the node was asked for block 1234");
 }
 
 #[tokio::test]
@@ -183,6 +639,7 @@ async fn test_simulate_call_against_mocked_provider() {
             router: Address::repeat_byte(2),
             value: U256::ZERO,
             data: &[0x12],
+            block: BlockNumberOrTag::Latest,
         },
         native_balance_override(Address::repeat_byte(1)),
         test_envelope(),
@@ -190,7 +647,7 @@ async fn test_simulate_call_against_mocked_provider() {
     )
     .await;
     assert!(
-        matches!(result, CallOutcome::Success { amount_out, gas_used } if amount_out == BigUint::from(123_u64) && gas_used == 87_654)
+        matches!(result, CallOutcome::Success { amount_out, gas_used, .. } if amount_out == BigUint::from(123_u64) && gas_used == 87_654)
     );
 }
 
@@ -205,6 +662,7 @@ async fn test_simulated_call_rejects_non_uint256_return_data() {
             router: Address::repeat_byte(2),
             value: U256::ZERO,
             data: &[],
+            block: BlockNumberOrTag::Latest,
         },
         native_balance_override(Address::repeat_byte(1)),
         test_envelope(),
@@ -233,6 +691,7 @@ async fn test_simulated_call_decodes_revert_data_from_mocked_rpc_error() {
             router: Address::repeat_byte(2),
             value: U256::ZERO,
             data: &[],
+            block: BlockNumberOrTag::Latest,
         },
         native_balance_override(Address::repeat_byte(1)),
         test_envelope(),
@@ -244,13 +703,13 @@ async fn test_simulated_call_decodes_revert_data_from_mocked_rpc_error() {
     );
 }
 
-/// A prestate trace naming one account and the slots its read touched.
+/// A prestate trace naming one contract and the slots its read touched.
 fn prestate(contract: Address, slots: &[B256]) -> serde_json::Value {
     let storage: serde_json::Map<String, serde_json::Value> = slots
         .iter()
         .map(|slot| (format!("{slot:#x}"), serde_json::json!(format!("{:#x}", B256::ZERO))))
         .collect();
-    serde_json::json!({ format!("{contract:#x}"): { "storage": storage } })
+    serde_json::json!({ format!("{contract:#x}"): { "code": "0x6000", "storage": storage } })
 }
 
 /// Queues one full discovery: a balance trace and probe, then an allowance trace and probe.
@@ -303,11 +762,13 @@ async fn test_layout_cache_remembers_an_unsupported_token() {
     let asserter = Asserter::new();
     let simulator = mocked_simulator(&asserter, TEST_TIMEOUT);
     // Both balance views name a slot no convention produces, so recovery fails on the token
-    // itself rather than on the node.
+    // itself rather than on the node. The scaled probe traces once more and finds no mapping
+    // slot to write.
     for _ in 0..2 {
         asserter.push_success(&prestate(Address::repeat_byte(3), &[B256::repeat_byte(0x99)]));
         asserter.push_success(&Bytes::from(B256::from(PROBE_SENTINEL).to_vec()));
     }
+    asserter.push_success(&prestate(Address::repeat_byte(3), &[B256::repeat_byte(0x99)]));
 
     let first = simulator
         .cached_layout(Address::repeat_byte(3), Address::repeat_byte(1), Address::repeat_byte(2))
@@ -373,6 +834,7 @@ async fn simulate_reverting_call(asserter: Asserter) -> SimulationAttempt {
                 router: Address::repeat_byte(2),
                 value: U256::ZERO,
                 data: &[0x12],
+                block: BlockNumberOrTag::Latest,
             },
             native_balance_override(Address::repeat_byte(1)),
             test_envelope(),
@@ -394,7 +856,7 @@ async fn test_simulate_names_a_revert_the_node_reported_without_a_payload() {
     let attempt = simulate_reverting_call(asserter).await;
 
     assert!(
-        matches!(attempt.into_result(), SimulationResult::Failure { reason }
+        matches!(attempt.into_result(), SimulationResult::Reverted { reason }
             if reason.contains("TychoRouter__EmptySwaps")),
         "the traced error names the revert"
     );
@@ -415,10 +877,62 @@ async fn test_simulate_keeps_the_node_message_when_the_trace_fails() {
     let attempt = simulate_reverting_call(asserter).await;
 
     assert!(
-        matches!(attempt.into_result(), SimulationResult::Failure { reason }
+        matches!(attempt.into_result(), SimulationResult::Reverted { reason }
             if reason == "simulation reverted: execution reverted"),
         "the node's own message survives"
     );
+}
+
+/// A reverted call is only reproducible against the block it ran in: a signed RFQ quote expires,
+/// and `prevrandao` is drawn per call. The replay has to carry that block, not the head's.
+#[tokio::test]
+async fn test_reverted_simulation_carries_a_replay_pinned_to_its_block() {
+    let asserter = Asserter::new();
+    let mut response = simulated_response(
+        crate::simulation::revert::RouterErrors::TychoRouter__EmptySwaps {}.abi_encode(),
+        false,
+        0,
+    );
+    response[0].inner.header.inner.number = 101;
+    response[0].inner.header.inner.timestamp = 1_700_000_000;
+    asserter.push_success(&response);
+    let sender = Address::repeat_byte(1);
+
+    let outcome = simulate_with_overrides(
+        &RootProvider::new(RpcClient::mocked(asserter)),
+        SimulatedCall {
+            sender,
+            router: Address::repeat_byte(2),
+            value: U256::ZERO,
+            data: &[0x12],
+            block: BlockNumberOrTag::Latest,
+        },
+        native_balance_override(sender),
+        test_envelope(),
+        TEST_TIMEOUT,
+    )
+    .await;
+
+    let CallOutcome::Reverted { replay, .. } = outcome else {
+        panic!("the call reverted");
+    };
+    assert_eq!(replay.parent_block, 100);
+    let block = &replay.payload.block_state_calls[0];
+    let environment = block
+        .block_overrides
+        .as_ref()
+        .expect("block overrides");
+    assert_eq!(environment.number, Some(U256::from(101)));
+    assert_eq!(environment.time, Some(1_700_000_000));
+    assert!(environment.random.is_some(), "prevrandao is pinned");
+    assert!(block
+        .state_overrides
+        .as_ref()
+        .is_some_and(|overrides| overrides.contains_key(&sender)));
+    assert_eq!(block.calls[0].input.input(), Some(&Bytes::from_static(&[0x12])));
+    assert!(replay
+        .payload_json()
+        .contains("\"blockStateCalls\""));
 }
 
 /// A server that accepts the connection and never answers, so the request outlives the timeout.
@@ -444,6 +958,7 @@ async fn test_simulation_times_out_when_the_node_does_not_answer() {
         &unresponsive_rpc_url().await,
         Chain::Ethereum,
         Duration::from_millis(50),
+        SimulationBlock::Latest,
     )
     .expect("build a simulator against the local listener");
 
@@ -454,6 +969,7 @@ async fn test_simulation_times_out_when_the_node_does_not_answer() {
                 router: Address::repeat_byte(2),
                 value: U256::ZERO,
                 data: &[0x12],
+                block: BlockNumberOrTag::Latest,
             },
             native_balance_override(Address::repeat_byte(1)),
             test_envelope(),
@@ -476,7 +992,9 @@ fn test_record_outcome_success() {
             &SimulationAttempt::Success {
                 amount_out: BigUint::from(999_000u64),
                 gas_used: 120_000,
+                logs: Vec::new(),
             },
+            SimulationPurpose::QUOTE,
         );
     });
 
@@ -499,6 +1017,9 @@ fn test_record_outcome_success() {
         "{:?}",
         counted.1
     );
+    for (name, labels, _) in &recorded {
+        assert!(labels.contains(&"purpose=quote".to_string()), "{name}: {labels:?}");
+    }
 
     let (.., deviation) = recorded
         .iter()
@@ -534,7 +1055,8 @@ fn test_record_outcome_reverted() {
     metrics::with_local_recorder(&recorder, || {
         record_outcome(
             &quote_with_fees(1_000_000),
-            &SimulationAttempt::Reverted { reason: "reverted".to_string() },
+            &SimulationAttempt::Reverted { reason: "reverted".to_string(), replay: empty_replay() },
+            SimulationPurpose::QUOTE,
         );
     });
 
@@ -566,6 +1088,7 @@ fn test_record_outcome_failed() {
         record_outcome(
             &quote_with_fees(1_000_000),
             &SimulationAttempt::Failure { reason: "timed out".to_string() },
+            SimulationPurpose::QUOTE,
         );
     });
 
@@ -573,6 +1096,90 @@ fn test_record_outcome_failed() {
         .iter()
         .any(|(name, labels, _)| name == "quote_simulations_total" &&
             labels.contains(&"outcome=failed".to_string())));
+}
+
+/// Runs the receiver code on a live node: an `isValidSignature` call with a zero placeholder
+/// signature and a 1000-wei transfer with no calldata must both return the ERC-1271 magic value.
+#[tokio::test]
+#[ignore = "requires RPC_URL"]
+async fn test_live_accept_any_erc1271_signature_code() {
+    alloy::sol! {
+        function isValidSignature(bytes32 hash, bytes signature) returns (bytes4 magicValue);
+    }
+
+    let rpc_url = std::env::var("RPC_URL").expect("set RPC_URL");
+    let provider = alloy::providers::ProviderBuilder::default()
+        .connect_http(rpc_url.parse().expect("valid URL"));
+    let sender = Address::repeat_byte(0x11);
+    let receiver = Address::repeat_byte(0x22);
+    let mut overrides = native_balance_override(sender);
+    add_client_fee_receiver_override(&mut overrides, receiver);
+
+    let signature_check =
+        isValidSignatureCall { hash: B256::repeat_byte(0x11), signature: Bytes::from(vec![0; 65]) }
+            .abi_encode();
+    let mut magic_value = [0_u8; 32];
+    magic_value[..4].copy_from_slice(&isValidSignatureCall::SELECTOR);
+
+    for (name, value, data) in [
+        ("isValidSignature", U256::ZERO, signature_check),
+        ("value transfer", U256::from(1_000_u64), Vec::new()),
+    ] {
+        let outcome = simulate_with_overrides(
+            &provider,
+            SimulatedCall {
+                sender,
+                router: receiver,
+                value,
+                data: &data,
+                block: BlockNumberOrTag::Latest,
+            },
+            overrides.clone(),
+            test_envelope(),
+            Duration::from_secs(10),
+        )
+        .await;
+
+        let CallOutcome::Success { amount_out, .. } = outcome else {
+            panic!("{name}: the call to the receiver code did not succeed");
+        };
+        assert_eq!(amount_out, BigUint::from_bytes_be(&magic_value), "{name}");
+    }
+}
+
+#[test]
+fn test_record_outcome_labels_a_caller_purpose() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+
+    metrics::with_local_recorder(&recorder, || {
+        record_outcome(
+            &quote_with_fees(1_000_000),
+            &SimulationAttempt::Success {
+                amount_out: BigUint::from(999_000u64),
+                gas_used: 120_000,
+                logs: Vec::new(),
+            },
+            SimulationPurpose::new("sample"),
+        );
+    });
+
+    let recorded = recorded_metrics(&snapshotter);
+    let names: Vec<&str> = recorded
+        .iter()
+        .map(|(name, ..)| name.as_str())
+        .collect();
+    for metric in [
+        "quote_simulations_total",
+        "quote_simulation_deviation_bps",
+        "quote_simulation_gas_estimate",
+        "quote_simulation_gas_used",
+    ] {
+        assert!(names.contains(&metric), "{metric} is recorded: {names:?}");
+    }
+    for (name, labels, _) in &recorded {
+        assert!(labels.contains(&"purpose=sample".to_string()), "{name}: {labels:?}");
+    }
 }
 
 /// Drives the real call path against a live node: the simulation must be accepted (the node
@@ -603,7 +1210,13 @@ async fn test_live_simulate_and_trace() {
     ] {
         let outcome = simulate_with_overrides(
             &provider,
-            SimulatedCall { sender, router: usdt, value: U256::ZERO, data: &data },
+            SimulatedCall {
+                sender,
+                router: usdt,
+                value: U256::ZERO,
+                data: &data,
+                block: BlockNumberOrTag::Latest,
+            },
             native_balance_override(sender),
             test_envelope(),
             Duration::from_secs(10),
@@ -611,9 +1224,10 @@ async fn test_live_simulate_and_trace() {
         .await;
 
         let described = match &outcome {
-            CallOutcome::Reverted { reason } => format!("reverted: {reason}"),
+            CallOutcome::Reverted { reason, .. } => format!("reverted: {reason}"),
             CallOutcome::Success { amount_out, .. } => format!("success: {amount_out}"),
             CallOutcome::Failure(reason) => format!("failed: {reason}"),
+            CallOutcome::BlockUnavailable(reason) => format!("block unavailable: {reason}"),
         };
         println!("  {name} -> {described}");
         assert!(

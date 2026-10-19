@@ -1,4 +1,121 @@
 
+## [0.112.4](https://github.com/propeller-heads/fynd/compare/0.112.3...0.112.4) (2026-10-15)
+
+### Features
+
+* **core:** let rfq_swap_replacer fill Native quotes partially ([48eeb15](https://github.com/propeller-heads/fynd/commit/48eeb156ef8554ee6167387b5e58daf7f1cedb2d))
+* **core:** add the Native and Liquorice RFQs ([7c222a1](https://github.com/propeller-heads/fynd/commit/7c222a1e485ebdfd3959814acd4e76a6654b598f))
+
+
+## [0.112.3](https://github.com/propeller-heads/fynd/compare/0.112.2...0.112.3) (2026-10-14)
+
+### Features
+
+* **core:** let rfq_swap_replacer fill Hashflow quotes partially ([4f8b606](https://github.com/propeller-heads/fynd/commit/4f8b606221b9864201378506ec82d7607d381e14))
+* **core:** count post-processor outcomes and gains ([967b299](https://github.com/propeller-heads/fynd/commit/967b2994df9920af4844896f5f5bf137ab014648))
+* **core:** hide algorithm_exclude_protocols from the algorithm only ([2e3001e](https://github.com/propeller-heads/fynd/commit/2e3001e5efe2e6e3ab7b57885da73dd1b97b73c1))
+* **core:** label won quotes by the post-processors that made them ([a00b5e7](https://github.com/propeller-heads/fynd/commit/a00b5e7d3bf2e568040c04612c1ec6278a1cfb00))
+* **core:** limit RFQs without partial fills to the sell token ([4a8c88d](https://github.com/propeller-heads/fynd/commit/4a8c88d207902211481934cb2639dfec5449c792))
+* **core:** let rfq_swap_replacer use fallback:rfq: components ([6e7512b](https://github.com/propeller-heads/fynd/commit/6e7512b40506888229dd425787ad5989cf37d951))
+* **core:** add rfq_swap_replacer as a built-in post-processor ([835ac82](https://github.com/propeller-heads/fynd/commit/835ac82c5e59c0e62eff4c31444c7d0fb3270943))
+* **core:** pass the pool's drop rule to post-processors ([1fd0f5e](https://github.com/propeller-heads/fynd/commit/1fd0f5e334b5d495a46a0d3f8c1487726d9a77c0))
+* **core:** quote the algorithm's route when a processed route fails ([aa20b04](https://github.com/propeller-heads/fynd/commit/aa20b0450d9cf80c998311ce1cc56acc3bdaa447))
+* count each invalid exclusive route shape separately ([a57048d](https://github.com/propeller-heads/fynd/commit/a57048d2687a7e2509859ead68cf5308c8a28449))
+* allow exclusive legs on any hop of a route ([e3e82f9](https://github.com/propeller-heads/fynd/commit/e3e82f9afb6ba86b514bffae616e3537b91be5d0))
+
+### Bug Fixes
+
+* **deps:** resolve rustls advisories RUSTSEC-2026-0346 to 0349 ([9e0954c](https://github.com/propeller-heads/fynd/commit/9e0954cf1b4d531976286aa046671fc9da82abad))
+* **core:** log the worker pool when the algorithm returns an invalid route ([febd093](https://github.com/propeller-heads/fynd/commit/febd093c070816d9ff46e6b20e5d55a9486881e4))
+
+
+## [0.112.2](https://github.com/propeller-heads/fynd/compare/0.112.1...0.112.2) (2026-10-14)
+
+### Features
+
+* **core:** run pool post-processors in the worker ([75130b6](https://github.com/propeller-heads/fynd/commit/75130b6f4e69f8ea5dd7aaee6cf2365698a8c6da))
+* **core:** add RoutePostProcessor trait and registry ([28e0c35](https://github.com/propeller-heads/fynd/commit/28e0c35ffbe2ead5e628c3198347b8b183ce1530))
+* **rpc:** pass post-processors through fynd-rpc ([b4e3dd8](https://github.com/propeller-heads/fynd/commit/b4e3dd865bd9438020910793889949a4cefa799c))
+
+### Bug Fixes
+
+* **core:** stop post-processors before the task deadline ([e0c4312](https://github.com/propeller-heads/fynd/commit/e0c43120eddd8cfb7e2380f06c2094143c1b61e3))
+
+### Performance Improvements
+
+* **core:** let post-processors borrow the route ([bbd3c7e](https://github.com/propeller-heads/fynd/commit/bbd3c7e5b2b10c94079fba36498a1aace3f2ec0d))
+
+
+## [0.112.1](https://github.com/propeller-heads/fynd/compare/0.112.0...0.112.1) (2026-10-13)
+
+### Features
+
+* **deps:** build against tycho 0.451.0 ([2237a86](https://github.com/propeller-heads/fynd/commit/2237a8685c5d8b1e6879fea4c3deb3cc22d37fa9))
+* **core:** send the order sender to Bebop as the origin ([8c60af3](https://github.com/propeller-heads/fynd/commit/8c60af339aa6216eb9422e7efe71a0b5324d2250))
+
+### Bug Fixes
+
+* Cargo audit package bump ([8624094](https://github.com/propeller-heads/fynd/commit/862409400b585d7c2b45409cd112db0328375e91))
+
+
+## [0.112.0](https://github.com/propeller-heads/fynd/compare/0.111.1...0.112.0) (2026-10-08)
+
+### Bug Fixes
+
+* **core:** place Solady token mappings ([5f03e1e](https://github.com/propeller-heads/fynd/commit/5f03e1ef5fe7037d63ec68f3f25e936ad1e943a0))
+* **core:** place B20 and Animoca token mappings ([05246f9](https://github.com/propeller-heads/fynd/commit/05246f90140f599ed30a0ef25b177401a54c52a5))
+* **core:** skip accounts without code when probing token slots ([ca452c4](https://github.com/propeller-heads/fynd/commit/ca452c4a8896545a012f2b03eb2afa29a2fa1743))
+
+
+## [0.111.1](https://github.com/propeller-heads/fynd/compare/0.110.8...0.111.1) (2026-10-07)
+
+### Features
+
+* **core:** fail an RFQ encode when its signed quote exceeds slippage ([1765e90](https://github.com/propeller-heads/fynd/commit/1765e9001cecd7311dfc653f490662f30df88b7b))
+* **core:** give up on a route that takes too long to encode ([43e7da6](https://github.com/propeller-heads/fynd/commit/43e7da68209bda0fc1164291609407f20c31ce45))
+* **core:** make the encoding retry budget configurable ([3d0eda9](https://github.com/propeller-heads/fynd/commit/3d0eda95ad266dcdd8f38e4ea49892053fde209f))
+* **core:** label encoding failures cut off by the retry budget ([aa3b80b](https://github.com/propeller-heads/fynd/commit/aa3b80bce39d8348c73c74056e4061dda243bc77))
+* **core:** cap encoding fallback rounds at 5ms ([b434dd1](https://github.com/propeller-heads/fynd/commit/b434dd100b329a4c9c242a36d204ca5910c7d3e8))
+* **core:** skip RFQ candidates when falling back on encoding ([84b774a](https://github.com/propeller-heads/fynd/commit/84b774aabae77c1779cdf8b179ba2f7ef801e925))
+* encode the next-best candidate when the best fails to encode ([fba51cd](https://github.com/propeller-heads/fynd/commit/fba51cdeacdcd66c9f006c6f149962c9c64f1e48))
+
+### Bug Fixes
+
+* **core:** treat fallback:rfq legs as RFQ when falling back on encoding ([0508476](https://github.com/propeller-heads/fynd/commit/0508476abc879ebf818d4e451287a26f106b9a4b))
+* **core:** count encoding failures once per order ([a657a2a](https://github.com/propeller-heads/fynd/commit/a657a2a59b6294bf03893b73030deb1f5048a8c8))
+* **core:** keep every price-checked candidate per order ([9e9d629](https://github.com/propeller-heads/fynd/commit/9e9d6292bd11d80cd240c881aac925a97a05ab7b))
+
+
+## [0.111.0](https://github.com/propeller-heads/fynd/compare/0.110.8...0.111.0) (2026-10-07)
+
+### Features
+
+* **core:** fail an RFQ encode when its signed quote exceeds slippage ([1765e90](https://github.com/propeller-heads/fynd/commit/1765e9001cecd7311dfc653f490662f30df88b7b))
+* **core:** give up on a route that takes too long to encode ([43e7da6](https://github.com/propeller-heads/fynd/commit/43e7da68209bda0fc1164291609407f20c31ce45))
+* **core:** make the encoding retry budget configurable ([3d0eda9](https://github.com/propeller-heads/fynd/commit/3d0eda95ad266dcdd8f38e4ea49892053fde209f))
+* **core:** label encoding failures cut off by the retry budget ([aa3b80b](https://github.com/propeller-heads/fynd/commit/aa3b80bce39d8348c73c74056e4061dda243bc77))
+* **core:** cap encoding fallback rounds at 5ms ([b434dd1](https://github.com/propeller-heads/fynd/commit/b434dd100b329a4c9c242a36d204ca5910c7d3e8))
+* **core:** skip RFQ candidates when falling back on encoding ([84b774a](https://github.com/propeller-heads/fynd/commit/84b774aabae77c1779cdf8b179ba2f7ef801e925))
+* encode the next-best candidate when the best fails to encode ([fba51cd](https://github.com/propeller-heads/fynd/commit/fba51cdeacdcd66c9f006c6f149962c9c64f1e48))
+
+### Bug Fixes
+
+* **core:** treat fallback:rfq legs as RFQ when falling back on encoding ([0508476](https://github.com/propeller-heads/fynd/commit/0508476abc879ebf818d4e451287a26f106b9a4b))
+* **core:** count encoding failures once per order ([a657a2a](https://github.com/propeller-heads/fynd/commit/a657a2a59b6294bf03893b73030deb1f5048a8c8))
+* **core:** keep every price-checked candidate per order ([9e9d629](https://github.com/propeller-heads/fynd/commit/9e9d6292bd11d80cd240c881aac925a97a05ab7b))
+
+
+## [0.110.8](https://github.com/propeller-heads/fynd/compare/0.110.7...0.110.8) (2026-10-05)
+
+### Features
+
+* **token-prices:** warn when a token price jumps 10% or more ([ea902a5](https://github.com/propeller-heads/fynd/commit/ea902a552d789804fc062621671ab9f6ec992f3a))
+
+### Bug Fixes
+
+* **core:** allow the deprecated fetch_update on Rust 1.98 ([3d9608f](https://github.com/propeller-heads/fynd/commit/3d9608f8e00d5f5ea77f830955f1a484e040f931))
+
+
 ## [0.110.7](https://github.com/propeller-heads/fynd/compare/0.110.6...0.110.7) (2026-09-30)
 
 ### Features

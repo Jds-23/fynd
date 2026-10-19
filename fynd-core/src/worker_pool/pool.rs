@@ -21,6 +21,7 @@ use crate::{
         market_data::MarketData,
     },
     graph::EdgeWeightUpdaterWithDerived,
+    post_process::registry::PostProcessorFactories,
     types::internal::SolveTask,
     worker_pool::{
         registry::{
@@ -51,6 +52,11 @@ pub struct WorkerPoolConfig {
     liquidity_scope: LiquidityScope,
     /// Protocol systems this worker pool's workers never route through.
     exclude_protocols: Vec<String>,
+    /// Protocol systems this worker pool's algorithms never route through, though its
+    /// post-processors still see them.
+    algorithm_exclude_protocols: Vec<String>,
+    /// Factories for the post-processors every worker in this pool builds, in the order they run.
+    post_processor_factories: PostProcessorFactories,
 }
 
 impl WorkerPoolConfig {
@@ -70,6 +76,8 @@ impl Default for WorkerPoolConfig {
             task_queue_capacity: 1000,
             liquidity_scope: LiquidityScope::default(),
             exclude_protocols: Vec::new(),
+            algorithm_exclude_protocols: Vec::new(),
+            post_processor_factories: PostProcessorFactories::default(),
         }
     }
 }
@@ -122,6 +130,10 @@ impl WorkerPool {
         // Spawn workers
         let liquidity_scope = config.liquidity_scope;
         let exclude_protocols = config.exclude_protocols.clone();
+        let algorithm_exclude_protocols = config
+            .algorithm_exclude_protocols
+            .clone();
+        let post_processor_factories = config.post_processor_factories.clone();
         let params = SpawnWorkersParams {
             algorithm: algorithm.clone(),
             pool_name: name.clone(),
@@ -135,6 +147,8 @@ impl WorkerPool {
             shutdown_tx: shutdown_tx.clone(),
             liquidity_scope,
             exclude_protocols,
+            algorithm_exclude_protocols,
+            post_processor_factories,
         };
         let workers = config.spawner.spawn(params)?;
 
@@ -285,6 +299,20 @@ impl WorkerPoolBuilder {
         self
     }
 
+    /// Sets the protocol systems this pool's algorithms never route through. Post-processors still
+    /// see them. Entries match as in [`exclude_protocols`](Self::exclude_protocols).
+    pub fn algorithm_exclude_protocols(mut self, algorithm_exclude_protocols: Vec<String>) -> Self {
+        self.config.algorithm_exclude_protocols = algorithm_exclude_protocols;
+        self
+    }
+
+    /// Sets the factories for the post-processors every worker in this pool runs on the route its
+    /// algorithm returned, in order. Each worker calls them once, on its own thread.
+    pub(crate) fn post_processor_factories(mut self, factories: PostProcessorFactories) -> Self {
+        self.config.post_processor_factories = factories;
+        self
+    }
+
     /// Builds and spawns the worker pool.
     ///
     /// Creates an internal task queue and returns both the worker pool and a handle
@@ -322,5 +350,77 @@ impl WorkerPoolBuilder {
 impl Default for WorkerPoolBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::{Duration, Instant},
+    };
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::{
+        derived::DerivedData,
+        feed::events::{EventError, MarketEvent},
+        post_process::{PostProcessRequest, PostProcessorRegistry, RoutePostProcessor},
+        types::RouteResult,
+    };
+
+    struct Noop;
+
+    #[async_trait]
+    impl MarketEventHandler for Noop {
+        async fn handle_event(&mut self, _event: &MarketEvent) -> Result<(), EventError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl RoutePostProcessor for Noop {
+        async fn process(
+            &self,
+            _request: &PostProcessRequest<'_>,
+            _route: &RouteResult,
+        ) -> Option<RouteResult> {
+            None
+        }
+    }
+
+    /// Each worker builds its own post-processors, so a pool of two calls the factory twice.
+    #[test]
+    fn test_pool_post_processor_factory_once_per_worker() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let registry = PostProcessorRegistry::new()
+            .with_post_processor("count", move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Noop
+            })
+            .expect("the name is free");
+        let factories = registry
+            .resolve("pool", &["count".to_string()])
+            .expect("the name is registered");
+        let (_event_tx, event_rx) = broadcast::channel(10);
+        let (_derived_event_tx, derived_event_rx) = broadcast::channel(10);
+
+        let (pool, _task_handle) = WorkerPoolBuilder::new()
+            .num_workers(2)
+            .post_processor_factories(factories)
+            .build(MarketData::new_shared(), DerivedData::new_shared(), event_rx, derived_event_rx)
+            .expect("most_liquid is a built-in algorithm");
+
+        let started = Instant::now();
+        while calls.load(Ordering::SeqCst) < 2 && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        pool.shutdown();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

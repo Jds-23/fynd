@@ -2,6 +2,10 @@ use std::{collections::HashMap, env, fmt, time::Duration};
 
 use tokio_stream::Stream;
 use tracing::{info, warn};
+use tycho_execution::encoding::evm::{
+    swap_encoder::swap_encoder_registry::SwapEncoderRegistry, BEBOP_FALLBACK_PROTOCOL_SYSTEM,
+    HASHFLOW_FALLBACK_PROTOCOL_SYSTEM, METRIC_FALLBACK_PROTOCOL_SYSTEM,
+};
 use tycho_simulation::{
     evm::{
         engine_db::tycho_db::PreCachedDB,
@@ -40,7 +44,9 @@ use tycho_simulation::{
         protocols::{
             bebop::{client_builder::BebopClientBuilder, state::BebopState},
             hashflow::{client_builder::HashflowClientBuilder, state::HashflowState},
+            liquorice::{client_builder::LiquoriceClientBuilder, state::LiquoriceState},
             metric::{client_builder::MetricClientBuilder, state::MetricState},
+            native::{client_builder::NativeClientBuilder, state::NativeState},
         },
         stream::RFQStreamBuilder,
     },
@@ -65,9 +71,22 @@ const EXCLUSIVE_CAPABLE_PROTOCOLS: &[&str] = &["ekubo_v3"];
 /// Tycho, e.g. `pricelevelstream:fermiswap`.
 const PRICE_LEVEL_STREAM_PREFIX: &str = "pricelevelstream:";
 
-/// Marks a `--protocols` entry served from an RFQ client rather than from Tycho, e.g.
-/// `rfq:bebop`.
-const RFQ_PREFIX: &str = "rfq:";
+/// Marks a protocol served from an RFQ client rather than from Tycho, e.g. `rfq:bebop`: both its
+/// `--protocols` entry and the protocol system of the components the client streams.
+pub(crate) const RFQ_PREFIX: &str = "rfq:";
+
+/// Removes the `fallback:` prefix from `protocol_system`, if it has one.
+pub(crate) fn strip_fallback_prefix(protocol_system: &str) -> &str {
+    protocol_system
+        .strip_prefix(FALLBACK_PREFIX)
+        .unwrap_or(protocol_system)
+}
+
+/// Whether `protocol_system` is an RFQ protocol, through its own executor (`rfq:`) or its
+/// fallback router (`fallback:rfq:`).
+pub(crate) fn is_rfq_protocol(protocol_system: &str) -> bool {
+    strip_fallback_prefix(protocol_system).starts_with(RFQ_PREFIX)
+}
 
 /// Marks a `--protocols` entry that drops a protocol system from the list rather than adding one,
 /// e.g. `exclude:vm:fermiswap`.
@@ -127,6 +146,8 @@ const PRICE_LEVEL_STREAM_CHAIN: Chain = Chain::Ethereum;
 ///
 /// Tracks tycho-execution's `executor_addresses.json`. A Metric leg on any other chain would price
 /// from the RFQ stream and then fail to encode, so the entry is rejected at registration instead.
+/// A `fallback:rfq:metric` entry must also pass this check, because `MetricFallbackRouter` calls
+/// the Metric pools that `MetricExecutor` calls.
 const METRIC_CHAINS: &[Chain] = &[Chain::Base, Chain::Robinhood];
 
 /// Whether a `--protocols` entry names a Tycho protocol system.
@@ -134,7 +155,84 @@ const METRIC_CHAINS: &[Chain] = &[Chain::Base, Chain::Robinhood];
 /// The RFQ clients and the pAMM price level stream each connect to their own endpoint, so their
 /// entries never appear among the protocol systems Tycho serves.
 pub fn is_tycho_system(entry: &str) -> bool {
-    !entry.starts_with(RFQ_PREFIX) && !entry.starts_with(PRICE_LEVEL_STREAM_PREFIX)
+    RfqEntry::parse(entry).is_none() && !entry.starts_with(PRICE_LEVEL_STREAM_PREFIX)
+}
+
+/// An RFQ `--protocols` entry, by the contract its legs execute through.
+///
+/// Each variant holds the `rfq:<protocol>` name, with any `fallback:` prefix removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RfqEntry<'a> {
+    /// `rfq:<protocol>`: the protocol's own executor.
+    Direct(&'a str),
+    /// `fallback:rfq:<protocol>`: the protocol's fallback router, e.g. `MetricFallbackRouter`.
+    ViaFallbackRouter(&'a str),
+}
+
+impl<'a> RfqEntry<'a> {
+    fn parse(entry: &'a str) -> Option<Self> {
+        if let Some(rfq) = entry
+            .strip_prefix(FALLBACK_PREFIX)
+            .filter(|rest| rest.starts_with(RFQ_PREFIX))
+        {
+            return Some(Self::ViaFallbackRouter(rfq));
+        }
+        entry
+            .starts_with(RFQ_PREFIX)
+            .then_some(Self::Direct(entry))
+    }
+
+    fn protocol(self) -> &'a str {
+        match self {
+            Self::Direct(rfq) | Self::ViaFallbackRouter(rfq) => rfq,
+        }
+    }
+}
+
+/// Rejects `protocol_system` when tycho-execution's `executor_addresses.json` has no executor for
+/// it on `chain`.
+fn require_executor(chain: Chain, protocol_system: &str) -> Result<(), DataFeedError> {
+    let registry = SwapEncoderRegistry::new_with_defaults(chain).map_err(|e| {
+        DataFeedError::Config(format!(
+            "cannot check the {protocol_system} executor on {chain}: {e}"
+        ))
+    })?;
+    // Not `get_encoder`: it resolves any `fallback:` system to the `fallback` family encoder.
+    if registry
+        .executor_addresses()
+        .contains_key(protocol_system)
+    {
+        return Ok(());
+    }
+    Err(DataFeedError::Config(format!(
+        "{protocol_system} has no executor on {chain} in tycho-execution's executor_addresses.json"
+    )))
+}
+
+/// The RFQ entries in `protocols`, each with the entry it was parsed from. Rejects an RFQ
+/// protocol requested both with and without the `fallback:` prefix.
+///
+/// Both clients would emit the same component ids under different protocol systems, so each poll
+/// would overwrite the other client's label.
+fn parse_rfq_entries(protocols: &[String]) -> Result<Vec<(&str, RfqEntry<'_>)>, DataFeedError> {
+    let mut variants: HashMap<&str, RfqEntry> = HashMap::new();
+    let mut rfq_entries = Vec::new();
+    for protocol in protocols {
+        let Some(rfq_entry) = RfqEntry::parse(protocol) else {
+            continue;
+        };
+        if variants
+            .insert(rfq_entry.protocol(), rfq_entry)
+            .is_some_and(|previous| previous != rfq_entry)
+        {
+            return Err(DataFeedError::Config(format!(
+                "RFQ protocol '{}' requested both with and without the '{FALLBACK_PREFIX}' prefix",
+                rfq_entry.protocol()
+            )));
+        }
+        rfq_entries.push((protocol.as_str(), rfq_entry));
+    }
+    Ok(rfq_entries)
 }
 
 /// Whether any requested protocol is streamed from Tycho.
@@ -173,7 +271,7 @@ pub fn matches_streamed_system(entry: &str, protocol_system: &str) -> bool {
 pub(crate) fn has_rfq_protocols(protocols: &[String]) -> bool {
     protocols
         .iter()
-        .any(|protocol| protocol.starts_with(RFQ_PREFIX))
+        .any(|protocol| RfqEntry::parse(protocol).is_some())
 }
 
 /// The `exclusive:` prefix was applied to a protocol system that has no exclusive variant.
@@ -367,9 +465,9 @@ fn register_exchange(
         "uniswap_v4" => builder.exchange::<UniswapV4State>("uniswap_v4", tvl_filter.clone(), None),
         "ekubo_v2" => builder.exchange::<EkuboState>("ekubo_v2", tvl_filter.clone(), None),
         "vm:curve" => {
-            // Tycho's curve_filter keeps standard coins and, since 0.428.0, oracle coins
-            // with trusted rate providers (including weETH getRate()). Untrusted oracle,
-            // rebasing and ERC4626 coins remain excluded from the hybrid CurveState.
+            // Tycho's curve_filter drops pools with rate-bearing or rebasing coins, which the
+            // hybrid CurveState can misprice, unless Tycho has verified the pool or its rate
+            // provider.
             builder.exchange::<CurveState>("vm:curve", tvl_filter.clone(), Some(curve_filter))
         }
         "uniswap_v4_hooks" => builder.exchange::<UniswapV4State>(
@@ -452,33 +550,50 @@ pub(crate) fn register_rfq(
     protocols: &[String],
     rfq_tokens: std::collections::HashSet<Bytes>,
 ) -> Result<RFQStreamBuilder, DataFeedError> {
-    for protocol in protocols {
-        match protocol.as_str() {
+    for (protocol, rfq_entry) in parse_rfq_entries(protocols)? {
+        match rfq_entry.protocol() {
             "rfq:bebop" => {
+                if let RfqEntry::ViaFallbackRouter(_) = rfq_entry {
+                    require_executor(chain, BEBOP_FALLBACK_PROTOCOL_SYSTEM)?;
+                }
                 let key = get_env("BEBOP_KEY")?;
                 info!("Adding {protocol} RFQ client...");
-                let bebop_client = BebopClientBuilder::new(chain, key)
+                let mut bebop_builder = BebopClientBuilder::new(chain, key)
                     .tokens(rfq_tokens.clone())
-                    .tvl_threshold(min_tvl)
+                    .tvl_threshold(min_tvl);
+                if let RfqEntry::ViaFallbackRouter(_) = rfq_entry {
+                    bebop_builder = bebop_builder.with_fallback_router();
+                }
+                let bebop_client = bebop_builder
                     .build()
                     .map_err(|e| DataFeedError::StreamError(e.to_string()))?;
                 rfq_stream_builder =
                     rfq_stream_builder.add_client::<BebopState>("bebop", Box::new(bebop_client));
             }
             "rfq:hashflow" => {
+                if let RfqEntry::ViaFallbackRouter(_) = rfq_entry {
+                    require_executor(chain, HASHFLOW_FALLBACK_PROTOCOL_SYSTEM)?;
+                }
                 let user = get_env("HASHFLOW_USER")?;
                 let key = get_env("HASHFLOW_KEY")?;
                 info!("Adding {protocol} RFQ client...");
-                let hashflow_client = HashflowClientBuilder::new(chain, user, key)
+                let mut hashflow_builder = HashflowClientBuilder::new(chain, user, key)
                     .tokens(rfq_tokens.clone())
                     .tvl_threshold(min_tvl)
-                    .poll_time(Duration::from_secs(30))
+                    .poll_time(Duration::from_secs(30));
+                if let RfqEntry::ViaFallbackRouter(_) = rfq_entry {
+                    hashflow_builder = hashflow_builder.with_fallback_router();
+                }
+                let hashflow_client = hashflow_builder
                     .build()
                     .map_err(|e| DataFeedError::StreamError(e.to_string()))?;
                 rfq_stream_builder = rfq_stream_builder
                     .add_client::<HashflowState>("hashflow", Box::new(hashflow_client));
             }
             "rfq:metric" => {
+                if let RfqEntry::ViaFallbackRouter(_) = rfq_entry {
+                    require_executor(chain, METRIC_FALLBACK_PROTOCOL_SYSTEM)?;
+                }
                 if !METRIC_CHAINS.contains(&chain) {
                     return Err(DataFeedError::Config(format!(
                         "{protocol} is only deployed on {}, but this feed runs on {chain}",
@@ -491,19 +606,47 @@ pub(crate) fn register_rfq(
                 }
                 let api_key = get_env("METRIC_API_KEY")?;
                 info!("Adding {protocol} RFQ client...");
-                let metric_client = MetricClientBuilder::new(chain)
+                let mut metric_builder = MetricClientBuilder::new(chain)
                     .tokens(rfq_tokens.clone())
                     .tvl_threshold(min_tvl)
-                    .api_key(Some(api_key))
+                    .api_key(Some(api_key));
+                if let RfqEntry::ViaFallbackRouter(_) = rfq_entry {
+                    metric_builder = metric_builder.with_fallback_router();
+                }
+                let metric_client = metric_builder
                     .build()
                     .map_err(|e| DataFeedError::StreamError(e.to_string()))?;
                 rfq_stream_builder =
                     rfq_stream_builder.add_client::<MetricState>("metric", Box::new(metric_client));
             }
-            p if p.starts_with(RFQ_PREFIX) => {
-                warn!("Skipping unknown RFQ protocol: {}", p);
+            "rfq:native" => {
+                require_executor(chain, protocol)?;
+                let api_key = get_env("NATIVE_API_KEY")?;
+                info!("Adding {protocol} RFQ client...");
+                let native_client = NativeClientBuilder::new(chain, api_key)
+                    .tokens(rfq_tokens.clone())
+                    .tvl_threshold(min_tvl)
+                    .build()
+                    .map_err(|e| DataFeedError::StreamError(e.to_string()))?;
+                rfq_stream_builder =
+                    rfq_stream_builder.add_client::<NativeState>("native", Box::new(native_client));
             }
-            _ => {}
+            "rfq:liquorice" => {
+                require_executor(chain, protocol)?;
+                let user = get_env("LIQUORICE_USER")?;
+                let key = get_env("LIQUORICE_KEY")?;
+                info!("Adding {protocol} RFQ client...");
+                let liquorice_client = LiquoriceClientBuilder::new(chain, user, key)
+                    .tokens(rfq_tokens.clone())
+                    .tvl_threshold(min_tvl)
+                    .build()
+                    .map_err(|e| DataFeedError::StreamError(e.to_string()))?;
+                rfq_stream_builder = rfq_stream_builder
+                    .add_client::<LiquoriceState>("liquorice", Box::new(liquorice_client));
+            }
+            _ => {
+                warn!("Skipping unknown RFQ protocol: {}", protocol);
+            }
         }
     }
     Ok(rfq_stream_builder)
@@ -744,9 +887,19 @@ fn get_env(var: &str) -> Result<String, DataFeedError> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use rstest::rstest;
     use tycho_simulation::price_level_stream::config::PRICE_LEVEL_STREAM_FAMILY;
 
     use super::*;
+
+    #[rstest]
+    #[case::rfq("rfq:bebop", true)]
+    #[case::rfq_via_fallback_router("fallback:rfq:bebop", true)]
+    #[case::pamm("fallback:tycho_pamm", false)]
+    #[case::onchain("uniswap_v2", false)]
+    fn test_is_rfq_protocol(#[case] protocol_system: &str, #[case] expected: bool) {
+        assert_eq!(is_rfq_protocol(protocol_system), expected);
+    }
 
     /// A writer that keeps every byte a subscriber formats, so a test can assert on the
     /// rendered log lines.
@@ -876,6 +1029,35 @@ mod tests {
                 ..Default::default()
             },
             state: ProtocolComponentState::new("curve_pool", HashMap::new(), HashMap::new()),
+            component_tvl: None,
+            entrypoints: vec![],
+        };
+        assert_eq!(curve_filter(&component), kept);
+    }
+
+    // Guard the upstream filter behavior Fynd relies on when updating Tycho dependencies.
+    #[rstest::rstest]
+    #[case::legacy_steth("0xDC24316b9AE028F1497c275EB9192a3Ea0f67022", true)]
+    #[case::steth_ng("0x21e27a5e5513d6e65c4f830167390997aa84843a", true)]
+    #[case::other_steth_pool("0x1111111111111111111111111111111111111111", false)]
+    fn test_curve_filter_rebasing_pool(#[case] pool_id: &str, #[case] kept: bool) {
+        use tycho_simulation::tycho_common::models::protocol::{
+            ProtocolComponent, ProtocolComponentState,
+        };
+
+        let steth = vec!["0xae7ab96520de3a18e5e111b5eaab095312d7fe84"];
+        let static_attributes = HashMap::from([(
+            "rebase_tokens".to_string(),
+            Bytes::from(serde_json::to_vec(&steth).unwrap()),
+        )]);
+        let component = ComponentWithState {
+            component: ProtocolComponent {
+                id: pool_id.to_string(),
+                protocol_system: "vm:curve".to_string(),
+                static_attributes,
+                ..Default::default()
+            },
+            state: ProtocolComponentState::new(pool_id, HashMap::new(), HashMap::new()),
             component_tvl: None,
             entrypoints: vec![],
         };
@@ -1181,6 +1363,73 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::rfq("rfq:bebop", Some(RfqEntry::Direct("rfq:bebop")))]
+    #[case::rfq_via_fallback_router(
+        "fallback:rfq:metric",
+        Some(RfqEntry::ViaFallbackRouter("rfq:metric"))
+    )]
+    #[case::pamm("fallback:fermiswap", None)]
+    #[case::tycho_system("uniswap_v3", None)]
+    fn test_rfq_entry_parse(#[case] entry: &str, #[case] expected: Option<RfqEntry>) {
+        assert_eq!(RfqEntry::parse(entry), expected);
+        assert_eq!(is_tycho_system(entry), expected.is_none());
+    }
+
+    #[test]
+    fn test_register_rfq_fallback_router_without_executor() {
+        let Err(err) = register_rfq_entries(Chain::Arbitrum, &["fallback:rfq:metric"]) else {
+            panic!("expected fallback:rfq:metric to be rejected on arbitrum");
+        };
+        assert!(
+            err.to_string()
+                .contains("fallback:rfq:metric has no executor on arbitrum"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn test_register_rfq_hashflow_via_fallback_router() {
+        let Err(err) = register_rfq_entries(Chain::Base, &["fallback:rfq:hashflow"]) else {
+            panic!("expected fallback:rfq:hashflow to be rejected on base");
+        };
+        assert!(
+            err.to_string()
+                .contains("fallback:rfq:hashflow has no executor on base"),
+            "got {err}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::native_off_executor_chains(Chain::Polygon, "rfq:native")]
+    #[case::native_via_fallback_router(Chain::Ethereum, "fallback:rfq:native")]
+    #[case::liquorice_off_ethereum(Chain::Base, "rfq:liquorice")]
+    #[case::liquorice_via_fallback_router(Chain::Ethereum, "fallback:rfq:liquorice")]
+    fn test_register_rfq_without_executor(#[case] chain: Chain, #[case] entry: &str) {
+        let Err(err) = register_rfq_entries(chain, &[entry]) else {
+            panic!("expected {entry} to be rejected on {chain}");
+        };
+        assert!(
+            err.to_string()
+                .contains(&format!("{entry} has no executor on {chain}")),
+            "got {err}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::metric(&["rfq:metric", "fallback:rfq:metric"])]
+    #[case::bebop(&["fallback:rfq:bebop", "rfq:bebop"])]
+    fn test_register_rfq_both_variants(#[case] entries: &[&str]) {
+        let Err(err) = register_rfq_entries(Chain::Base, entries) else {
+            panic!("expected {entries:?} to be rejected");
+        };
+        assert!(
+            err.to_string()
+                .contains("both with and without the 'fallback:' prefix"),
+            "got {err}"
+        );
+    }
+
     #[test]
     fn test_register_rfq_metric_off_supported_chains() {
         let Err(err) = register_rfq_entries(Chain::Ethereum, &["rfq:metric"]) else {
@@ -1193,11 +1442,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_register_rfq_metric_requires_api_key() {
+    #[rstest::rstest]
+    #[case::base(Chain::Base, "rfq:metric")]
+    #[case::robinhood_via_fallback_router(Chain::Robinhood, "fallback:rfq:metric")]
+    fn test_register_rfq_metric_requires_api_key(#[case] chain: Chain, #[case] entry: &str) {
         env::remove_var("METRIC_API_KEY");
-        let Err(err) = register_rfq_entries(Chain::Base, &["rfq:metric"]) else {
-            panic!("expected rfq:metric to require METRIC_API_KEY");
+        let Err(err) = register_rfq_entries(chain, &[entry]) else {
+            panic!("expected {entry} on {chain} to require METRIC_API_KEY");
         };
         assert!(
             err.to_string()

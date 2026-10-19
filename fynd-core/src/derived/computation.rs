@@ -170,22 +170,24 @@ pub struct FailedItem {
 /// `Ok(output)` = some data produced; `output.failed_items` may be non-empty.
 #[derive(Debug, Clone)]
 pub struct ComputationOutput<T> {
+    /// The data the computation produced.
     pub data: T,
+    /// The items the computation could not produce data for.
     pub failed_items: Vec<FailedItem>,
 }
 
 impl<T> ComputationOutput<T> {
-    /// Only computations that cannot report per-item failures use this, and the ones that
-    /// ship all can, so it is reachable from tests alone.
-    #[cfg(test)]
+    /// Returns an output with no failed items.
     pub fn success(data: T) -> Self {
         Self { data, failed_items: vec![] }
     }
 
+    /// Returns an output with `failed_items` as the items that failed.
     pub fn with_failures(data: T, failed_items: Vec<FailedItem>) -> Self {
         Self { data, failed_items }
     }
 
+    /// Returns whether any item failed.
     pub fn has_failures(&self) -> bool {
         !self.failed_items.is_empty()
     }
@@ -223,11 +225,7 @@ impl<T> ComputationOutput<T> {
 ///         store: &SharedDerivedDataRef,
 ///         changed: &ChangedComponents,
 ///     ) -> Result<Self::Output, ComputationError> {
-///         if changed.is_full_recompute {
-///             // Full recompute: process all components
-///         } else {
-///             // Incremental: only process changed components
-///         }
+///         // Recompute the added and updated components; drop the removed ones.
 ///     }
 /// }
 /// ```
@@ -257,13 +255,7 @@ pub trait DerivedComputation: Send + Sync + 'static {
     /// partial failures, so a computation needs no change to `DerivedData` to be
     /// stored. Computations that keep a typed failure map (or other bespoke storage)
     /// override this. The manager calls it after [`Self::compute`].
-    fn persist(
-        store: &mut DerivedData,
-        output: ComputationOutput<Self::Output>,
-        block: u64,
-        is_full_recompute: bool,
-    ) {
-        let _ = is_full_recompute;
+    fn persist(store: &mut DerivedData, output: ComputationOutput<Self::Output>, block: u64) {
         store.set_output(Self::ID, output.data, block);
     }
 
@@ -282,8 +274,8 @@ pub trait DerivedComputation: Send + Sync + 'static {
     /// # Incremental Computation
     ///
     /// Implementations should use `changed` to only recompute data affected by the changes:
-    /// - `changed.is_full_recompute` - If true, recompute everything (startup/lag recovery)
-    /// - `changed.added` - New components to compute
+    /// - `changed.added` - New components to compute. At startup this carries every component in
+    ///   the market.
     /// - `changed.removed` - Components to remove from results
     /// - `changed.updated` - Components whose state changed
     ///

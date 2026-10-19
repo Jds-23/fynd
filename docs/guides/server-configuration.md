@@ -57,7 +57,7 @@ fynd serve \
 **Limitations:**
 
 * RFQ protocols cannot run alone. At least one on-chain protocol is required.
-* When encoding is enabled (`encoding_options` in the quote request), `rfq:bebop` and `rfq:hashflow` quotes require an additional round-trip to the RFQ provider to fetch a signed quote. This can add significant tail latency to solve times. If you are using these protocols, consider quoting first without encoding to evaluate the price, and only request encoding once you are confident the quote is worth executing. `rfq:metric` encodes locally and needs no such round-trip — its executor reads the on-chain oracle Metric updates every block.
+* When encoding is enabled (`encoding_options` in the quote request), `rfq:bebop`, `rfq:hashflow`, `rfq:native` and `rfq:liquorice` quotes require an additional round-trip to the RFQ provider to fetch a signed quote. This can add significant tail latency to solve times. If you are using these protocols, consider quoting first without encoding to evaluate the price, and only request encoding once you are confident the quote is worth executing. `rfq:metric` encodes locally and needs no such round-trip — its executor reads the on-chain oracle Metric updates every block.
 * `rfq:metric` runs on Base and Robinhood only, the chains its executor is deployed on. Naming it on any other chain fails at startup rather than producing quotes that cannot be encoded.
 * Metric is reached by a different entry per chain: `pricelevelstream:metric` on Ethereum, `rfq:metric` on Base and Robinhood. Each is gated on its own chains — the price level stream is Ethereum-only — so the two never serve the same deployment and cannot double-count the liquidity.
 
@@ -65,6 +65,8 @@ fynd serve \
 
 * RFQ protocols require API keys passed via environment variables. Check the [RFQ protocol docs](https://docs.propellerheads.xyz/tycho/for-solvers/request-for-quote-protocols) for the specific variables each protocol needs.
 * `rfq:metric` reads `METRIC_API_KEY` (required — the Bearer token for Metric's quote endpoints) and `METRIC_API_URL` (optional, defaults to `https://api.metric.xyz`).
+* `rfq:native` reads `NATIVE_API_KEY`. It runs on Ethereum, Base, Arbitrum, BSC and Robinhood only. Neither `rfq:native` nor `rfq:liquorice` has a `fallback:rfq:` form.
+* `rfq:liquorice` reads `LIQUORICE_USER` (the solver name) and `LIQUORICE_KEY`. It runs on Ethereum only.
 
 ### pAMM Price Level Stream
 
@@ -150,6 +152,7 @@ Run `fynd serve --help` for the full list.
 | `--traded-n-days-ago`              | —                     | `3`                        | Only include tokens traded within this many days.                                                                                                                                                              |
 | `--worker-router-timeout-ms`       | —                     | `100`                      | Default solve timeout (ms)                                                                                                                                                                                     |
 | `--worker-router-min-responses`    | —                     | `0`                        | Early return threshold (0 = wait for all pools)                                                                                                                                                                |
+| `--encoding-retry-budget-ms`       | —                     | `5`                        | Time after the first encode during which a failed encoding is retried on the next candidate (0 = no retries)                                                                                                   |
 | `-w, --worker-pools-config`        | `WORKER_POOLS_CONFIG` | `worker_pools.toml`        | Worker pools config file path                                                                                                                                                                                  |
 | `--blocklist-config`               | `BLOCKLIST_CONFIG`    | [tycho-simulation default](https://github.com/propeller-heads/tycho-simulation/blob/main/blocklist.toml)                          | Path to blocklist TOML config file. Components listed here are excluded from the Tycho stream.                                                                                                                                                                                     |
 | `--disable-tls`                    | —                     | `false`                    | Disable TLS for Tycho connection                                                                                                                                                                               |
@@ -161,6 +164,7 @@ Run `fynd serve --help` for the full list.
 | `--partial-blocks`                           | —        | `false`      | Enable partial block (flashblock) updates from the Tycho stream. Pool state updates are delivered mid-block rather than only at finalization, reducing latency. Only applies to on-chain protocols. |
 | `--enable-price-guard`                       | —        | `false`      | Enable [price guard](price-guard.md) validation against external price sources.                                                                                        |
 | `--enable-simulation`                        | —        | `false`      | Enable simulation of encoded quotes against the latest block. Requires an RPC endpoint serving `eth_simulateV1` and `debug_traceCall`. |
+| `--simulate-on-quote-block`                  | —        | `false`      | Simulate each quote on the block that it was priced on, instead of the latest block. A node that does not have that block yet is asked again, for at most two block times. |
 | `--price-guard-lower-tolerance-bps`          | —        | `300`        | Max allowed deviation (bps) when the quote's output is below the provider's expected amount.                                                                           |
 | `--price-guard-upper-tolerance-bps`          | —        | `10000`      | Max allowed deviation (bps) when the quote's output is above the provider's expected amount.                                                                           |
 | `--price-guard-fail-on-provider-error`       | —        | `false`      | Reject quotes when all price providers fail with infrastructure errors.                                                                                                |
@@ -195,6 +199,27 @@ All pools solve every incoming order in parallel. Fynd picks the best result acr
 | `timeout_ms`          | `100`           | Maximum time in milliseconds allowed per order processing in this pool |
 | `max_routes`          | _(no limit)_    | Maximum number of candidate routes to evaluate per order               |
 | `connector_tokens`    | _(no restriction)_ | Allowlist of `"0x..."`-prefixed token addresses permitted as intermediate hops. Source and destination are always allowed regardless. Absent = all tokens reachable. |
+| `algorithm_exclude_protocols` | _(no restriction)_ | Protocol systems the pool's algorithm never routes through. Its post-processors still see them. An entry names a protocol system exactly (`"rfq:bebop"`), or a whole family when it ends with `:` (`"rfq:"`). `exclude_protocols`, with the same entries, hides protocols from the whole pool. Without `post_processors` this key does the same as `exclude_protocols` |
+| `post_processors`     | _(none)_        | Names of post-processors, in order, that every worker in the pool runs on the route its algorithm returned, after the worker validates that route. `rfq_swap_replacer` is built into fynd-core; a binary that embeds Fynd registers more names through `PostProcessorRegistry`, and a custom name may not equal a built-in name. If a processed route fails the checks, the worker logs a warning and quotes the algorithm's route. A name that is not registered stops the server from starting |
+
+### Post-processors
+
+`rfq_swap_replacer` replaces one swap, or a run of swaps between two tokens that every path passes through, with one swap through an RFQ component when that raises the net amount out. The server must index `rfq:` or `fallback:rfq:` protocols (`--protocols`, see Including RFQ Protocols), and the pool must not drop them with `exclude_protocols`. Only `rfq:bebop`, `rfq:hashflow` and `rfq:native` support an input amount smaller than the quoted amount, so they can replace any swap. Native accepts down to half the quoted amount. Every other RFQ protocol can replace only swaps starting at the sell token, where the input amount matches the quoted amount exactly. The default `worker_pools.toml` does not enable it.
+
+```toml
+[pools.most_liquid_rfq]
+algorithm       = "most_liquid"
+post_processors = ["rfq_swap_replacer"]
+```
+
+`algorithm_exclude_protocols` hides protocols from the algorithm only, so `rfq_swap_replacer` still sees them. With it, a pool can reach a protocol only through the replacer. In the example below, Bebop appears in a route only when the replacer adds it, so the pool's quotes show the gain of the replacer alone.
+
+```toml
+[pools.replacer_only]
+algorithm                   = "most_liquid"
+algorithm_exclude_protocols = ["rfq:bebop"]
+post_processors             = ["rfq_swap_replacer"]
+```
 
 ### Connector tokens
 

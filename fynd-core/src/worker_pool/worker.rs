@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use num_bigint::BigUint;
+use num_bigint::{BigInt, BigUint};
 use tokio::sync::{broadcast, Notify};
 use tracing::{debug, error, info, warn};
 use tycho_simulation::{tycho_common::models::protocol::ProtocolComponent, tycho_core::Bytes};
@@ -33,10 +33,17 @@ use crate::{
         market_data::{MarketData, MarketDataView, StateLabel},
     },
     graph::{EdgeWeightUpdaterWithDerived, GraphManager},
-    types::{internal::SolveTask, Route, RouteExclusionFilter, RouteExclusions},
+    post_process::{PostProcessRequest, PostProcessors, ProcessedRoute, RoutePostProcessor},
+    types::{internal::SolveTask, Route, RouteExclusionFilter, RouteExclusions, RouteResult},
     worker_pool_router::LiquidityScope,
     BlockInfo, Order, OrderQuote, QuoteStatus, SingleOrderQuote, SolveError, SolveParams,
 };
+
+/// How long before the task deadline the worker stops waiting for post-processors. A worker sends
+/// one answer per task, after it validates and prices the route, and the router reads no answer
+/// after the deadline. Without this margin, a post-processor that runs to the deadline would also
+/// lose the algorithm's route.
+const POST_PROCESS_DEADLINE_MARGIN: Duration = Duration::from_millis(10);
 
 /// Whether a worker with this scope and exclusion list must keep `component` out of its graph: an
 /// exclusive component in a `PublicOnly` worker pool, or a component of an excluded protocol
@@ -93,6 +100,14 @@ fn resolve_exclusions(view: &MarketDataView<'_>, params: &SolveParams) -> Arc<Ro
     }
     *cache = Some((generation, exclusions.clone()));
     exclusions
+}
+
+/// Checks that `route` is valid and that it passes the request's route filter.
+fn check_route(route: &Route, order: &Order, params: &SolveParams) -> Result<(), String> {
+    route
+        .validate()
+        .map_err(|err| err.to_string())?;
+    validate_route_filter(route, order, params.route_filter())
 }
 
 /// Check every leg, including split branches, against the original request filter. Reading
@@ -253,6 +268,16 @@ fn record_price_impact_metrics(pool_name: &str, duration: Duration, outcome: &'s
     .increment(1);
 }
 
+/// Counts a post-processed route that failed the checks, so the worker quoted the algorithm's
+/// route instead.
+fn record_post_processed_route_rejected(pool_name: &str) {
+    metrics::counter!(
+        "worker_pool_post_processed_route_rejected_total",
+        "pool" => pool_name.to_string()
+    )
+    .increment(1);
+}
+
 /// A solver worker instance that maintains a market graph and processes solve requests.
 pub(crate) struct SolverWorker<A>
 where
@@ -286,6 +311,16 @@ where
     /// Protocol systems this worker never routes through. Empty for every worker pool that does
     /// not set `exclude_protocols`.
     exclude_protocols: Vec<String>,
+    /// Protocol systems only this worker's algorithm leaves out of its graph. Post-processors
+    /// still see them. Empty for every worker pool that does not set
+    /// `algorithm_exclude_protocols`.
+    algorithm_exclude_protocols: Vec<String>,
+    /// The protocol systems the algorithm's graph and route never use: `exclude_protocols` plus
+    /// `algorithm_exclude_protocols`.
+    algorithm_exclusions: Vec<String>,
+    /// Post-processors run on the algorithm's route, in config order. Empty when the pool sets no
+    /// `post_processors`.
+    post_processors: PostProcessors,
 }
 
 impl<A> SolverWorker<A>
@@ -326,6 +361,9 @@ where
             pool_name,
             liquidity_scope: LiquidityScope::default(),
             exclude_protocols: Vec::new(),
+            algorithm_exclude_protocols: Vec::new(),
+            algorithm_exclusions: Vec::new(),
+            post_processors: PostProcessors::default(),
         }
     }
 
@@ -338,6 +376,37 @@ where
     /// Sets the protocol systems this worker never routes through.
     pub(crate) fn with_exclude_protocols(mut self, exclude_protocols: Vec<String>) -> Self {
         self.exclude_protocols = exclude_protocols;
+        self.merge_algorithm_exclusions();
+        self
+    }
+
+    /// Sets the protocol systems only this worker's algorithm never routes through.
+    pub(crate) fn with_algorithm_exclude_protocols(
+        mut self,
+        algorithm_exclude_protocols: Vec<String>,
+    ) -> Self {
+        self.algorithm_exclude_protocols = algorithm_exclude_protocols;
+        self.merge_algorithm_exclusions();
+        self
+    }
+
+    /// Builds `algorithm_exclusions` from the two exclusion lists.
+    fn merge_algorithm_exclusions(&mut self) {
+        self.algorithm_exclusions = self
+            .exclude_protocols
+            .iter()
+            .chain(&self.algorithm_exclude_protocols)
+            .cloned()
+            .collect();
+    }
+
+    /// Sets the post-processors this worker runs on every route, in the order given, each with its
+    /// registered name.
+    pub(crate) fn with_post_processors(
+        mut self,
+        post_processors: Vec<(String, Box<dyn RoutePostProcessor>)>,
+    ) -> Self {
+        self.post_processors = PostProcessors::new(self.pool_name.clone(), post_processors);
         self
     }
 
@@ -377,7 +446,7 @@ where
     ///
     /// Call this on startup or to recreate the graph from the latest market topology. It resets
     /// three things together, from one read: the graph, the fallback pool index, and which pAMMs
-    /// the graph holds and which it left out.
+    /// the graph holds and which it left out. It then calls `initialize` on each post-processor.
     pub async fn initialize_graph(&mut self) {
         let topology = {
             // One read: the index and the topology must describe the same market, or a pAMM whose
@@ -385,9 +454,9 @@ where
             let market = self.market_data.read().await;
             // Owned already, so the graph is built without holding the market lock.
             let topology = market.component_topology();
-            let Self { pamm_admission, liquidity_scope, exclude_protocols, .. } = self;
+            let Self { pamm_admission, liquidity_scope, algorithm_exclusions, .. } = self;
             let caller_drops = |component: &ProtocolComponent| {
-                should_drop_component(*liquidity_scope, exclude_protocols, component)
+                should_drop_component(*liquidity_scope, algorithm_exclusions, component)
             };
             let withheld_pamms =
                 pamm_admission.withhold_from_graph(&market, &topology, &caller_drops);
@@ -398,43 +467,238 @@ where
 
         self.graph_manager
             .initialize_graph(&topology);
+        self.post_processors
+            .initialize(&self.market_data)
+            .await;
         self.initialized = true;
     }
 
-    /// Applies one market event to the graph, with the pAMM admission rule run over it first.
+    /// Applies the pAMM admission rule to a market event before passing the event to the graph and
+    /// the post-processors.
+    ///
+    /// The graph drops what the pool rule and `algorithm_exclude_protocols` drop. The
+    /// post-processors drop what the pool rule drops, so they still learn of a component only the
+    /// algorithm leaves out.
     pub async fn process_event(&mut self, event: MarketEvent) {
         let market_data = self.market_data.clone();
-        let event = {
+        let mut post_processor_event = None;
+        let graph_event = {
             let market = market_data.read().await;
-            let Self { pamm_admission, liquidity_scope, exclude_protocols, .. } = self;
-            let caller_drops = |component: &ProtocolComponent| {
+            let Self {
+                pamm_admission,
+                liquidity_scope,
+                exclude_protocols,
+                algorithm_exclude_protocols,
+                algorithm_exclusions,
+                post_processors,
+                ..
+            } = self;
+            let pool_drops = |component: &ProtocolComponent| {
                 should_drop_component(*liquidity_scope, exclude_protocols, component)
             };
+            let graph_drops = |component: &ProtocolComponent| {
+                should_drop_component(*liquidity_scope, algorithm_exclusions, component)
+            };
             let mut event = event;
-            pamm_admission.apply_pamm_admission(&market, &caller_drops, &mut event);
-            filter_event(market.base_market_state(), event, &caller_drops)
+            pamm_admission.apply_pamm_admission(&market, &graph_drops, &mut event);
+            if post_processors.is_empty() || algorithm_exclude_protocols.is_empty() {
+                // One event serves both: the graph rule is the pool rule, or nobody else reads it.
+                filter_event(market.base_market_state(), event, &graph_drops)
+            } else {
+                // The graph rule drops everything the pool rule drops, so it can filter the
+                // post-processors' event instead of the original.
+                let for_post_processors =
+                    filter_event(market.base_market_state(), event, &pool_drops);
+                let for_graph = filter_event(
+                    market.base_market_state(),
+                    for_post_processors.clone(),
+                    &graph_drops,
+                );
+                post_processor_event = Some(for_post_processors);
+                for_graph
+            }
         };
+        let post_processor_event = post_processor_event
+            .as_ref()
+            .unwrap_or(&graph_event);
 
-        match event {
+        match &graph_event {
             MarketEvent::MarketUpdated { .. } => {
                 if let Err(e) = self
                     .graph_manager
-                    .handle_event(&event)
+                    .handle_event(&graph_event)
                     .await
                 {
                     // Graph errors currently returned by handle_event are non-fatal, so we just log
                     // them.
                     warn!("Error handling market event: {:?}", e);
                 }
+                self.post_processors
+                    .handle_event(post_processor_event)
+                    .await;
+            }
+        }
+    }
+
+    /// Checks what the algorithm's own route cannot break but a post-processor can: the pool's
+    /// component rules, and `net_amount_out` against the route's amount out for a sell order.
+    /// The router subtracts the two as unsigned numbers, so a net above the amount out would
+    /// underflow there.
+    fn check_processed_route(
+        &self,
+        order: &Order,
+        route: &Route,
+        net_amount_out: &BigInt,
+    ) -> Result<(), String> {
+        for swap in route.swaps() {
+            if should_drop_component(
+                self.liquidity_scope,
+                &self.exclude_protocols,
+                swap.protocol_component(),
+            ) {
+                return Err(format!(
+                    "route uses component {} that this pool leaves out of its graph",
+                    swap.component_id()
+                ));
+            }
+        }
+        if !order.is_sell() {
+            return Ok(());
+        }
+        let Some(output_token) = route.output_token() else {
+            return Ok(());
+        };
+        let amount_out = BigInt::from(route.amount_out(&output_token));
+        if *net_amount_out > amount_out {
+            return Err(format!(
+                "net amount out {net_amount_out} is above the route amount out {amount_out}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Prices the fallback legs of `route` and records the amount out they pay. Does nothing for a
+    /// route with no fallback leg.
+    ///
+    /// A pAMM route is ranked on what its fallbacks pay against `min_amount_out`, so a leg with no
+    /// fallback, or one that cannot be priced, makes the route unquotable: there is no floor to
+    /// check.
+    ///
+    /// # Errors
+    ///
+    /// [`SolveError::RouteRejected`] when a leg cannot be priced, and [`SolveError::NotReady`]
+    /// when the request names an overlay the market no longer holds.
+    async fn price_fallback_legs(
+        &self,
+        order: &Order,
+        params: &SolveParams,
+        route: &mut Route,
+    ) -> Result<(), SolveError> {
+        if !has_fallback_leg(route) {
+            return Ok(());
+        }
+        // The same view the algorithm solved against, so the fallback is selected and priced on
+        // the requested overlay rather than the base state.
+        let market = self
+            .read_market(params.state_label())
+            .await?;
+        match price_through_fallbacks(
+            route,
+            &market,
+            self.pamm_admission.fallback_pools(),
+            params.route_filter(),
+            &self.algorithm_exclusions,
+        ) {
+            Ok(amount) => {
+                route.set_fallback_amount_out(amount);
+                Ok(())
+            }
+            Err(error) => {
+                let rejection = error.rejection();
+                debug!(order_id = %order.id(), %error, "{rejection}");
+                Err(SolveError::route_rejected(order.id(), rejection))
+            }
+        }
+    }
+
+    /// Runs the post-processors on the algorithm's route, which the worker already checked.
+    /// Returns the route to quote and the names of the post-processors that made it. The names are
+    /// empty when no post-processor replaced the route. A processed route gets its fallback
+    /// pricing here; the algorithm's route does not. When the processed route fails the checks,
+    /// including that pricing, logs the reason and returns the algorithm's route with no names, so
+    /// a post-processor never fails a quote.
+    async fn post_process(
+        &self,
+        order: &Order,
+        params: &SolveParams,
+        exclusions: &RouteExclusions,
+        deadline: Instant,
+        result: RouteResult,
+    ) -> (RouteResult, Vec<String>) {
+        if self.post_processors.is_empty() {
+            return (result, Vec::new());
+        }
+        let drops_component = |component: &ProtocolComponent| {
+            should_drop_component(self.liquidity_scope, &self.exclude_protocols, component)
+        };
+        let request = PostProcessRequest::new(
+            order,
+            &self.market_data,
+            &self.derived_data,
+            exclusions,
+            deadline
+                .checked_sub(POST_PROCESS_DEADLINE_MARGIN)
+                .unwrap_or(deadline),
+        )
+        .with_label(params.state_label())
+        .with_pool_drops(&drops_component);
+        let Some(processed) = self
+            .post_processors
+            .run(&request, &result)
+            .await
+        else {
+            return (result, Vec::new());
+        };
+        let ProcessedRoute { route: mut processed_route, post_processed_by } = processed;
+        let mut checked = check_route(processed_route.route(), order, params).and_then(|()| {
+            self.check_processed_route(
+                order,
+                processed_route.route(),
+                processed_route.net_amount_out(),
+            )
+        });
+        if checked.is_ok() {
+            checked = self
+                .price_fallback_legs(order, params, processed_route.route_mut())
+                .await
+                .map_err(|err| err.to_string());
+        }
+        match checked {
+            Ok(()) => (processed_route, post_processed_by),
+            Err(err) => {
+                warn!(
+                    order_id = %order.id(),
+                    worker_pool = %self.pool_name,
+                    algorithm = self.algorithm.name(),
+                    post_processed_by = %post_processed_by.join("+"),
+                    error = %err,
+                    "post-processed route failed the checks; keeping the algorithm's route"
+                );
+                record_post_processed_route_rejected(&self.pool_name);
+                (result, Vec::new())
             }
         }
     }
 
     /// Returns a quote for an order, optionally solved against a named state overlay.
+    ///
+    /// `deadline` is when the caller stops waiting. Post-processors stop
+    /// [`POST_PROCESS_DEADLINE_MARGIN`] before it.
     pub async fn quote(
         &mut self,
         order: &Order,
         params: SolveParams,
+        deadline: Instant,
     ) -> Result<SingleOrderQuote, SolveError> {
         let start_time = Instant::now();
 
@@ -497,7 +761,7 @@ where
 
         let mut request = SolveRequest::new(graph, self.market_data.clone(), order)
             .with_derived(self.derived_data.clone())
-            .with_shared_exclusions(exclusions);
+            .with_shared_exclusions(Arc::clone(&exclusions));
         if let Some(label) = params.state_label().cloned() {
             request = request.with_label(label);
         }
@@ -508,21 +772,10 @@ where
 
         let order_quote = match result {
             Ok(result) => {
-                // Extract scalar values before consuming result with into_route()
-                let amount_out_net_gas = result
-                    .net_amount_out()
-                    .to_biguint()
-                    .unwrap_or(BigUint::ZERO);
-                let gas_price = result.gas_price().clone();
-                let mut route = result.into_route();
-
-                if let Err(err) = route
-                    .validate()
-                    .map_err(|err| err.to_string())
-                    .and_then(|()| validate_route_filter(&route, order, params.route_filter()))
-                {
+                if let Err(err) = check_route(result.route(), order, &params) {
                     error!(
                         order_id = %order.id(),
+                        worker_pool = %self.pool_name,
                         algorithm = self.algorithm.name(),
                         error = %err,
                         "algorithm produced an invalid route"
@@ -533,29 +786,21 @@ where
                     )));
                 }
 
-                // A pAMM route is ranked on what its fallbacks pay against `min_amount_out`, so a
-                // leg with no fallback, or one that cannot be priced, is dropped here — there is
-                // no floor to check.
-                if has_fallback_leg(&route) {
-                    // The same view the algorithm solved against, so the fallback is selected and
-                    // priced on the requested overlay rather than the base state.
-                    let market = self
-                        .read_market(params.state_label())
+                let (result, post_processed_by) = self
+                    .post_process(order, &params, &exclusions, deadline, result)
+                    .await;
+                // Extract scalar values before consuming result with into_route()
+                let net_amount_out = result.net_amount_out().clone();
+                let amount_out_net_gas = net_amount_out
+                    .to_biguint()
+                    .unwrap_or(BigUint::ZERO);
+                let gas_price = result.gas_price().clone();
+                let mut route = result.into_route();
+
+                // The worker priced a processed route in `post_process`.
+                if post_processed_by.is_empty() {
+                    self.price_fallback_legs(order, &params, &mut route)
                         .await?;
-                    match price_through_fallbacks(
-                        &mut route,
-                        &market,
-                        self.pamm_admission.fallback_pools(),
-                        params.route_filter(),
-                        &self.exclude_protocols,
-                    ) {
-                        Ok(amount) => route.set_fallback_amount_out(amount),
-                        Err(error) => {
-                            let rejection = error.rejection();
-                            debug!(order_id = %order.id(), %error, "{rejection}");
-                            return Err(SolveError::route_rejected(order.id(), rejection));
-                        }
-                    }
                 }
 
                 // This is a first naive approach to getting the total gas of this quote
@@ -631,6 +876,7 @@ where
                 )
                 .with_route(route)
                 .with_gas_price(gas_price);
+                quote.set_post_processed_by(post_processed_by);
                 if let Some(bps) = price_impact_bps {
                     quote = quote.with_price_impact_bps(bps);
                 }
@@ -903,7 +1149,7 @@ where
                             let result = {
                                 let params = task.params().clone();
                                 let order = task.order();
-                                self.quote(order, params).await
+                                self.quote(order, params, task.deadline()).await
                             };
 
                             let outcome = match &result {
@@ -973,7 +1219,7 @@ fn solve_error_from_algorithm_error(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::atomic::Ordering, time::Duration};
 
     use rstest::rstest;
     use rustc_hash::FxHashMap;
@@ -995,11 +1241,17 @@ mod tests {
         },
         fallback::{manager::PammState, FALLBACK_PREFIX},
         graph::petgraph::{PetgraphStableDiGraphManager, StableDiGraph},
+        post_process::test_utils::{direct_swap, swap_through, MockPostProcessor},
         types::{
             ComponentId, OrderSide, Route, RouteExclusionFilter, RouteRejection, RouteResult, Swap,
         },
         AlgorithmError,
     };
+
+    /// A deadline far enough away that no test reaches it.
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
 
     /// A minimal mock algorithm for testing the worker.
     /// Uses DepthAndPrice as the edge weight type to satisfy trait bounds.
@@ -1114,7 +1366,7 @@ mod tests {
         let ord = order(&token_a, &token_b, 100, OrderSide::Sell);
 
         let result = worker
-            .quote(&ord, SolveParams::default())
+            .quote(&ord, SolveParams::default(), far_deadline())
             .await;
 
         match result {
@@ -1212,7 +1464,7 @@ mod tests {
         );
         let ord = order(&token_a, &token_c, 100, OrderSide::Sell);
         let result = worker
-            .quote(&ord, SolveParams::default().with_route_filter(filter))
+            .quote(&ord, SolveParams::default().with_route_filter(filter), far_deadline())
             .await;
         match (rejection, result) {
             (Some(expected), Err(SolveError::AlgorithmError(msg))) => {
@@ -1345,7 +1597,9 @@ mod tests {
             RouteExclusionFilter::default().with_excluded_protocols(["uniswap_v2".to_string()]),
         );
 
-        let result = worker.quote(&ord, params).await;
+        let result = worker
+            .quote(&ord, params, far_deadline())
+            .await;
 
         match result {
             Err(SolveError::AlgorithmError(msg)) => {
@@ -1374,7 +1628,7 @@ mod tests {
         let ord = order(&token_a, &token_b, 100, OrderSide::Sell);
 
         let quote = worker
-            .quote(&ord, SolveParams::default())
+            .quote(&ord, SolveParams::default(), far_deadline())
             .await
             .expect("split route must quote");
 
@@ -1400,7 +1654,7 @@ mod tests {
         let ord = order(&token_a, &token_b, 100, OrderSide::Sell);
 
         let quote = worker
-            .quote(&ord, SolveParams::default())
+            .quote(&ord, SolveParams::default(), far_deadline())
             .await
             .expect("an unrepresentable price impact must not fail the quote");
 
@@ -1462,7 +1716,7 @@ mod tests {
         let ord = order(&token_a, &token_b, 100, OrderSide::Sell);
 
         let quote = worker
-            .quote(&ord, SolveParams::default())
+            .quote(&ord, SolveParams::default(), far_deadline())
             .await
             .expect("a route the calculation cannot price still quotes");
 
@@ -1530,7 +1784,7 @@ mod tests {
         let ord = order(&token_a, &token_b, 100, OrderSide::Sell);
 
         worker
-            .quote(&ord, SolveParams::default().with_route_filter(filter))
+            .quote(&ord, SolveParams::default().with_route_filter(filter), far_deadline())
             .await
     }
 
@@ -1576,6 +1830,34 @@ mod tests {
                 Err(SolveError::RouteRejected { reason: RouteRejection::FallbackExcluded, .. })
             ),
             "expected rejection before fallback simulation, got {result:?}"
+        );
+    }
+
+    /// The algorithm's fallback pricing leaves out `algorithm_exclude_protocols`, as it does the
+    /// pool's `exclude_protocols`. The control is the test below, where the pool prices.
+    #[tokio::test]
+    async fn test_quote_pamm_route_with_algorithm_excluded_fallback() {
+        let mut worker = SolverWorker::new(
+            market_with_unpriceable_fallback_pool(),
+            DerivedData::new_shared(),
+            PropAMMRouteAlgorithm,
+            0,
+            "test_pool".to_string(),
+        )
+        .with_algorithm_exclude_protocols(vec!["uniswap_v3".to_string()]);
+        worker.initialize_graph().await;
+        let ord = order(&token(0x01, "A"), &token(0x02, "B"), 100, OrderSide::Sell);
+
+        let result = worker
+            .quote(&ord, SolveParams::default(), far_deadline())
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(SolveError::RouteRejected { reason: RouteRejection::FallbackExcluded, .. })
+            ),
+            "expected the excluded fallback pool to leave the leg no fallback, got {result:?}"
         );
     }
 
@@ -2005,8 +2287,8 @@ mod tests {
     #[tokio::test]
     async fn test_process_event_readmits_a_pamm_behind_an_excluded_fallback_pool() {
         let market = market_with_pamm();
-        let mut worker = admission_worker(market.clone());
-        worker.exclude_protocols = vec!["uniswap_v3".to_string()];
+        let mut worker =
+            admission_worker(market.clone()).with_exclude_protocols(vec!["uniswap_v3".to_string()]);
         worker.initialize_graph().await;
         assert_eq!(
             worker.pamm_admission.state_of(PAMM),
@@ -2032,8 +2314,8 @@ mod tests {
     #[tokio::test]
     async fn test_initialize_graph_leaves_an_excluded_pamm_off_the_record() {
         let market = market_with_pamm_and_fallback();
-        let mut worker = admission_worker(market);
-        worker.exclude_protocols = vec![FALLBACK_PREFIX.to_string()];
+        let mut worker =
+            admission_worker(market).with_exclude_protocols(vec![FALLBACK_PREFIX.to_string()]);
 
         worker.initialize_graph().await;
 
@@ -2611,5 +2893,411 @@ mod tests {
         let err = crate::AlgorithmError::Timeout { elapsed_ms: 7 };
         let mapped = solve_error_from_algorithm_error("o1", &num_bigint::BigUint::from(5u64), err);
         assert!(matches!(mapped, SolveError::Timeout { elapsed_ms: 7 }), "got {mapped:?}");
+    }
+
+    fn replace_route(result: RouteResult, swaps: Vec<Swap>, net_amount_out: u64) -> RouteResult {
+        let route = Route::new(swaps, result.route().tokens().clone()).expect("non-empty swaps");
+        RouteResult::new(route, BigInt::from(net_amount_out), result.gas_price().clone())
+    }
+
+    fn rfq_route(result: RouteResult) -> RouteResult {
+        replace_route(result, vec![direct_swap("rfq:bebop", 120)], 118)
+    }
+
+    fn worker_with_post_processor(
+        post_processor: MockPostProcessor,
+    ) -> SolverWorker<SplitRouteAlgorithm> {
+        let token_a = token(0x01, "A");
+        let token_b = token(0x02, "B");
+        let (market, _) = setup_market_weighted(vec![
+            ("p1", &token_a, &token_b, MockProtocolSim::new(2.0)),
+            ("p2", &token_a, &token_b, MockProtocolSim::new(2.0)),
+        ]);
+        SolverWorker::new(
+            market,
+            DerivedData::new_shared(),
+            SplitRouteAlgorithm { reported_spot_price: 2.0 },
+            0,
+            "test_pool".to_string(),
+        )
+        .with_post_processors(vec![("rfq".to_string(), Box::new(post_processor))])
+    }
+
+    fn a_to_b_order() -> Order {
+        order(&token(0x01, "A"), &token(0x02, "B"), 100, OrderSide::Sell)
+    }
+
+    #[tokio::test]
+    async fn test_quote_post_processed_route() {
+        let mut worker = worker_with_post_processor(MockPostProcessor::new(rfq_route));
+
+        let quote = worker
+            .quote(&a_to_b_order(), SolveParams::default(), far_deadline())
+            .await
+            .expect("the processed route is valid");
+
+        let route = quote
+            .order()
+            .route()
+            .expect("the quote has a route");
+        assert_eq!(route.swaps().len(), 1);
+        assert_eq!(
+            route.swaps()[0]
+                .protocol_component()
+                .protocol_system,
+            "rfq:bebop"
+        );
+        assert_eq!(quote.order().amount_out(), &BigUint::from(120u64));
+        assert_eq!(quote.order().amount_out_net_gas(), &BigUint::from(118u64));
+        assert_eq!(quote.order().post_processed_by(), ["rfq".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_quote_post_processor_request() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let recorder = Arc::clone(&seen);
+        let recording = MockPostProcessor::with_request(move |request, result| {
+            *recorder.lock().unwrap() = Some((
+                request.label().cloned(),
+                request
+                    .exclusions()
+                    .excludes_pool("unused"),
+            ));
+            rfq_route(result)
+        });
+        let mut worker = worker_with_post_processor(recording);
+        worker
+            .market_data
+            .register_labeled_state("overlay".to_string(), FxHashMap::default(), u64::MAX)
+            .await;
+        let params = SolveParams::default()
+            .with_state_label("overlay".to_string())
+            .with_route_filter(
+                RouteExclusionFilter::default().with_excluded_pools(["unused".to_string()]),
+            );
+
+        worker
+            .quote(&a_to_b_order(), params, far_deadline())
+            .await
+            .expect("the routes avoid the excluded pool");
+
+        assert_eq!(*seen.lock().unwrap(), Some((Some("overlay".to_string()), true)));
+    }
+
+    /// The worker stops waiting for post-processors before the task deadline, so the route it had
+    /// still reaches the router in time.
+    #[tokio::test]
+    async fn test_quote_post_processor_deadline() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let recorder = Arc::clone(&seen);
+        let recording = MockPostProcessor::with_request(move |request, result| {
+            *recorder.lock().unwrap() = Some(request.deadline());
+            result
+        });
+        let mut worker = worker_with_post_processor(recording);
+        let deadline = far_deadline();
+
+        worker
+            .quote(&a_to_b_order(), SolveParams::default(), deadline)
+            .await
+            .expect("the algorithm's route is valid");
+
+        assert_eq!(*seen.lock().unwrap(), Some(deadline - POST_PROCESS_DEADLINE_MARGIN));
+    }
+
+    fn disconnected_route(result: RouteResult) -> RouteResult {
+        let (token_c, token_d) = (token(0x03, "C"), token(0x04, "D"));
+        let leg = swap_through(component("p3", &[token_c, token_d]), 80);
+        replace_route(result, vec![direct_swap("rfq:bebop", 90), leg], 80)
+    }
+
+    fn exclusive_route(result: RouteResult) -> RouteResult {
+        let tokens = [token(0x01, "A"), token(0x02, "B")];
+        let mut leg = component("exclusive-leg", &tokens);
+        crate::feed::exclusivity::mark_exclusive(&mut leg);
+        replace_route(result, vec![swap_through(leg, 120)], 118)
+    }
+
+    fn inflated_route(result: RouteResult) -> RouteResult {
+        replace_route(result, vec![direct_swap("rfq:bebop", 120)], 121)
+    }
+
+    #[rstest]
+    #[case::disconnected_swaps(disconnected_route, &[], &[])]
+    #[case::request_excluded_protocol(rfq_route, &[], &["rfq:bebop"])]
+    #[case::pool_excluded_protocol(rfq_route, &["rfq:"], &[])]
+    #[case::exclusive_component(exclusive_route, &[], &[])]
+    #[case::net_above_amount_out(inflated_route, &[], &[])]
+    #[tokio::test]
+    async fn test_quote_with_rejected_post_processed_route(
+        #[case] rewrite: fn(RouteResult) -> RouteResult,
+        #[case] pool_excluded: &[&str],
+        #[case] request_excluded: &[&str],
+    ) {
+        let mut worker = worker_with_post_processor(MockPostProcessor::new(rewrite))
+            .with_exclude_protocols(
+                pool_excluded
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            );
+        let params = SolveParams::default().with_route_filter(
+            RouteExclusionFilter::default().with_excluded_protocols(
+                request_excluded
+                    .iter()
+                    .map(ToString::to_string),
+            ),
+        );
+
+        let quote = worker
+            .quote(&a_to_b_order(), params, far_deadline())
+            .await
+            .expect("a failed post-processor does not fail the quote");
+
+        let route = quote
+            .order()
+            .route()
+            .expect("the quote has a route");
+        let components: Vec<&str> = route
+            .swaps()
+            .iter()
+            .map(|swap| swap.component_id())
+            .collect();
+        assert_eq!(components, ["p1", "p2"]);
+        assert_eq!(quote.order().amount_out_net_gas(), &BigUint::from(192u64));
+        assert!(quote
+            .order()
+            .post_processed_by()
+            .is_empty());
+    }
+
+    /// The value of `worker_pool_post_processed_route_rejected_total` for the test pool.
+    fn rejected_route_count(snapshotter: &metrics_util::debugging::Snapshotter) -> u64 {
+        use metrics_util::debugging::DebugValue;
+
+        let recorded = crate::tests::metrics::recorded_metrics(snapshotter);
+        let (_, labels, value) = recorded
+            .iter()
+            .find(|(name, _, _)| name == "worker_pool_post_processed_route_rejected_total")
+            .expect("the rejection counter is recorded");
+        assert_eq!(labels, &vec!["pool=test_pool".to_string()]);
+        let DebugValue::Counter(count) = value else {
+            panic!("expected counter, got {value:?}");
+        };
+        *count
+    }
+
+    fn fallback_rfq_route(result: RouteResult) -> RouteResult {
+        replace_route(result, vec![direct_swap("fallback:rfq:bebop", 120)], 118)
+    }
+
+    /// A processed route whose fallback leg has no fallback pool is rejected like any other
+    /// failed check: the quote uses the algorithm's route.
+    #[tokio::test]
+    async fn test_quote_post_processed_route_with_unbacked_fallback_leg() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let mut worker = worker_with_post_processor(MockPostProcessor::new(fallback_rfq_route));
+
+        let quote = worker
+            .quote(&a_to_b_order(), SolveParams::default(), far_deadline())
+            .await
+            .expect("a failed post-processor does not fail the quote");
+
+        let components: Vec<&str> = quote
+            .order()
+            .route()
+            .expect("the quote has a route")
+            .swaps()
+            .iter()
+            .map(|swap| swap.component_id())
+            .collect();
+        assert_eq!(components, ["p1", "p2"]);
+        assert!(quote
+            .order()
+            .post_processed_by()
+            .is_empty());
+        assert_eq!(rejected_route_count(&snapshotter), 1);
+    }
+
+    /// The fallback amount of a processed route reaches the quoted route.
+    #[tokio::test]
+    async fn test_quote_post_processed_route_prices_fallback_leg() {
+        let mut worker = worker_with_post_processor(MockPostProcessor::new(fallback_rfq_route));
+        add_fallback_pool(&worker.market_data);
+        worker
+            .market_data
+            .try_write()
+            .expect("uncontended")
+            .update_states([(
+                FALLBACK_POOL.to_string(),
+                Box::new(MockProtocolSim::new(2.0)) as Box<dyn ProtocolSim>,
+            )]);
+
+        let quote = worker
+            .quote(&a_to_b_order(), SolveParams::default(), far_deadline())
+            .await
+            .expect("the fallback leg has a pool");
+
+        let route = quote
+            .order()
+            .route()
+            .expect("the quote has a route");
+        assert_eq!(route.swaps()[0].component_id(), "rfq-leg");
+        assert!(route.fallback_amount_out().is_some());
+        assert_eq!(quote.order().post_processed_by(), ["rfq".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_quote_rejected_post_processed_route_metric() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let mut worker = worker_with_post_processor(MockPostProcessor::new(inflated_route));
+
+        worker
+            .quote(&a_to_b_order(), SolveParams::default(), far_deadline())
+            .await
+            .expect("a failed post-processor does not fail the quote");
+
+        assert_eq!(rejected_route_count(&snapshotter), 1);
+    }
+
+    #[tokio::test]
+    async fn test_quote_post_processor_pool_drops() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let recording = MockPostProcessor::with_request(move |request, result| {
+            let rfq = direct_swap("rfq:bebop", 120);
+            let plain = direct_swap("uniswap_v2", 120);
+            recorder.lock().unwrap().extend([
+                request.drops_component(rfq.protocol_component()),
+                request.drops_component(plain.protocol_component()),
+            ]);
+            result
+        });
+        let mut worker =
+            worker_with_post_processor(recording).with_exclude_protocols(vec!["rfq:".to_string()]);
+
+        worker
+            .quote(&a_to_b_order(), SolveParams::default(), far_deadline())
+            .await
+            .expect("the route is valid");
+
+        assert_eq!(*seen.lock().unwrap(), [true, false]);
+    }
+
+    /// Adds the `rfq:bebop` component `rfq-leg` and its tokens to `market`.
+    fn add_bebop_component(market: &MarketData) -> ProtocolComponent {
+        let tokens = [token(0x01, "A"), token(0x02, "B")];
+        let rfq = component_with_protocol("rfq-leg", "rfq:bebop", &tokens);
+        let mut state = market.try_write().expect("uncontended");
+        state.upsert_tokens(tokens);
+        state.upsert_components([rfq.clone()]);
+        rfq
+    }
+
+    fn has_graph_edge(worker: &SolverWorker<SplitRouteAlgorithm>, component_id: &str) -> bool {
+        worker
+            .graph_manager
+            .graph()
+            .edge_weights()
+            .any(|edge| edge.component_id == component_id)
+    }
+
+    fn worker_on_market(
+        market: MarketData,
+        excluded: &[&str],
+    ) -> SolverWorker<SplitRouteAlgorithm> {
+        SolverWorker::new(
+            market,
+            DerivedData::new_shared(),
+            SplitRouteAlgorithm { reported_spot_price: 2.0 },
+            0,
+            "test_pool".to_string(),
+        )
+        .with_algorithm_exclude_protocols(
+            excluded
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        )
+    }
+
+    /// A component in the market at startup is out of the algorithm's graph when
+    /// `algorithm_exclude_protocols` names it, and in the graph without the key.
+    #[rstest]
+    #[case::excluded(&["rfq:bebop"], false)]
+    #[case::not_excluded(&[], true)]
+    #[tokio::test]
+    async fn test_initialize_graph_algorithm_exclude_protocols(
+        #[case] excluded: &[&str],
+        #[case] in_graph: bool,
+    ) {
+        let (market, _) = setup_market_weighted(vec![]);
+        add_bebop_component(&market);
+        let post_processor = MockPostProcessor::unchanged();
+        let initialize_calls = Arc::clone(&post_processor.initialize_calls);
+        let mut worker = worker_on_market(market, excluded)
+            .with_post_processors(vec![("rfq".to_string(), Box::new(post_processor))]);
+
+        worker.initialize_graph().await;
+
+        assert_eq!(has_graph_edge(&worker, "rfq-leg"), in_graph);
+        assert_eq!(initialize_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A component the algorithm leaves out is out of its graph, but the post-processors still
+    /// receive its market event.
+    #[rstest]
+    #[case::excluded(&["rfq:bebop"], false)]
+    #[case::not_excluded(&[], true)]
+    #[tokio::test]
+    async fn test_process_event_algorithm_exclude_protocols(
+        #[case] excluded: &[&str],
+        #[case] in_graph: bool,
+    ) {
+        let (market, _) = setup_market_weighted(vec![]);
+        let post_processor = MockPostProcessor::unchanged();
+        let added_ids = Arc::clone(&post_processor.added_component_ids);
+        let mut worker = worker_on_market(market, excluded)
+            .with_post_processors(vec![("rfq".to_string(), Box::new(post_processor))]);
+        worker.initialize_graph().await;
+        let rfq = add_bebop_component(&worker.market_data);
+        let event = MarketEvent::MarketUpdated {
+            added_components: FxHashMap::from_iter([("rfq-leg".to_string(), rfq.tokens)]),
+            removed_components: Vec::new(),
+            updated_components: Vec::new(),
+        };
+
+        worker.process_event(event).await;
+
+        assert_eq!(has_graph_edge(&worker, "rfq-leg"), in_graph);
+        assert_eq!(*added_ids.lock().unwrap(), ["rfq-leg".to_string()]);
+    }
+
+    /// The post-processor may put a component into the final quote that the algorithm cannot use.
+    #[tokio::test]
+    async fn test_quote_post_processor_uses_algorithm_excluded_protocol() {
+        let mut worker = worker_with_post_processor(MockPostProcessor::new(rfq_route))
+            .with_algorithm_exclude_protocols(vec!["rfq:bebop".to_string()]);
+
+        let quote = worker
+            .quote(&a_to_b_order(), SolveParams::default(), far_deadline())
+            .await
+            .expect("the processed route is valid");
+
+        let route = quote
+            .order()
+            .route()
+            .expect("the quote has a route");
+        assert_eq!(
+            route.swaps()[0]
+                .protocol_component()
+                .protocol_system,
+            "rfq:bebop"
+        );
+        assert_eq!(quote.order().post_processed_by(), ["rfq".to_string()]);
     }
 }
