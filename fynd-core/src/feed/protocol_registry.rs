@@ -1404,6 +1404,7 @@ mod tests {
     #[case::native_via_fallback_router(Chain::Ethereum, "fallback:rfq:native")]
     #[case::liquorice_off_ethereum(Chain::Base, "rfq:liquorice")]
     #[case::liquorice_via_fallback_router(Chain::Ethereum, "fallback:rfq:liquorice")]
+    #[case::metric_via_fallback_router_on_arbitrum(Chain::Arbitrum, "fallback:rfq:metric")]
     fn test_register_rfq_without_executor(#[case] chain: Chain, #[case] entry: &str) {
         let Err(err) = register_rfq_entries(chain, &[entry]) else {
             panic!("expected {entry} to be rejected on {chain}");
@@ -1436,7 +1437,7 @@ mod tests {
         };
         assert!(
             err.to_string()
-                .contains("only served on base, robinhood, bsc"),
+                .contains("only served on base, robinhood, bsc, arbitrum"),
             "got {err}"
         );
     }
@@ -1445,6 +1446,7 @@ mod tests {
     #[case::base(Chain::Base, "rfq:metric")]
     #[case::robinhood_via_fallback_router(Chain::Robinhood, "fallback:rfq:metric")]
     #[case::bsc_via_fallback_router(Chain::Bsc, "fallback:rfq:metric")]
+    #[case::arbitrum(Chain::Arbitrum, "rfq:metric")]
     fn test_register_rfq_metric_requires_api_key(#[case] chain: Chain, #[case] entry: &str) {
         env::remove_var("METRIC_API_KEY");
         let Err(err) = register_rfq_entries(chain, &[entry]) else {
