@@ -147,8 +147,8 @@ const PRICE_LEVEL_STREAM_CHAIN: Chain = Chain::Ethereum;
 /// An `rfq:metric` or `fallback:rfq:metric` entry on any other chain is rejected at registration.
 /// Each entry must also have its own executor in tycho-execution's `executor_addresses.json`, or
 /// its legs would price from the RFQ stream and then fail to encode: BSC has only the fallback
-/// executor.
-const METRIC_CHAINS: &[Chain] = &[Chain::Base, Chain::Robinhood, Chain::Bsc];
+/// executor and Arbitrum only the direct one.
+const METRIC_CHAINS: &[Chain] = &[Chain::Base, Chain::Robinhood, Chain::Bsc, Chain::Arbitrum];
 
 /// Whether a `--protocols` entry names a Tycho protocol system.
 ///
