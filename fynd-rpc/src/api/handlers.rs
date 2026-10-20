@@ -20,7 +20,7 @@ use crate::api::tokens::{build_token_entries, TokensCache, TokensQuery, TokensRe
 use crate::api::{
     disable_slippage_taking,
     error::{ErrorResponse, RequestValidationError},
-    exclusive_access,
+    exclusive_access, jit_router,
     middleware::ClientInfo,
     record::{self, QuoteRecord, RequestRecord},
     request_capture::{log_request_capture, log_slow_solve, SLOW_SOLVE_THRESHOLD_MS},
@@ -86,6 +86,8 @@ pub async fn quote(
         core_request,
         disable_slippage_taking::from_headers(http_request.headers()),
     );
+    let core_request =
+        jit_router::apply(core_request, jit_router::from_headers(http_request.headers()));
     let request_record = RequestRecord::capture(&core_request, access);
 
     let result = state
@@ -245,6 +247,14 @@ pub async fn info(state: web::Data<AppState>) -> HttpResponse {
             .cloned()
             .map(Into::into),
         state.permit2_address().clone().into(),
+    )
+    .jit_router_address(
+        state
+            .worker_router()
+            .encoder()
+            .jit_router_address()
+            .cloned()
+            .map(Into::into),
     )
     .version(env!("CARGO_PKG_VERSION"))
     .build();
@@ -771,6 +781,17 @@ mod tests {
     }
 
     fn make_test_state_with_emitter(record_emitter: Option<RecordEmitter>) -> AppState {
+        make_test_state_with(record_emitter, None)
+    }
+
+    fn jit_router_address() -> Bytes {
+        Bytes::from(hex::decode("DAa2Fe509DE861D53e81940fDb8353B33126c930").unwrap())
+    }
+
+    fn make_test_state_with(
+        record_emitter: Option<RecordEmitter>,
+        jit_router: Option<Bytes>,
+    ) -> AppState {
         let market_data: MarketData = MarketData::new_shared();
         let derived_data: SharedDerivedDataRef =
             Arc::new(tokio::sync::RwLock::new(Default::default()));
@@ -778,7 +799,12 @@ mod tests {
         let registry = SwapEncoderRegistry::new(Chain::Ethereum)
             .add_default_encoders(None)
             .expect("default encoders should always succeed");
-        let encoder = Encoder::new(Chain::Ethereum, registry).expect("encoder should build");
+        let mut encoder = Encoder::new(Chain::Ethereum, registry).expect("encoder should build");
+        if let Some(jit_router) = jit_router {
+            encoder = encoder
+                .with_jit_router(jit_router)
+                .expect("jit router should configure");
+        }
 
         let router = WorkerPoolRouter::new(vec![], WorkerPoolRouterConfig::default(), encoder);
         let health_tracker = HealthTracker::new(market_data.clone(), Arc::clone(&derived_data));
@@ -1833,6 +1859,32 @@ mod tests {
             addr.contains("fd0b31d2e955fa55e3fa641fe90e08b677188d35"),
             "expected Ethereum Tycho Router address, got {addr}"
         );
+    }
+
+    #[actix_web::test]
+    async fn test_info_reports_jit_router_address() {
+        for jit_router in [Some(jit_router_address()), None] {
+            let state = make_test_state_with(None, jit_router.clone());
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(state))
+                    .route("/v1/info", web::get().to(super::info)),
+            )
+            .await;
+
+            let req = test::TestRequest::get()
+                .uri("/v1/info")
+                .to_request();
+            let body: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+
+            let expected = jit_router.map(|address| format!("0x{}", hex::encode(address)));
+            assert_eq!(
+                body["jit_router_address"]
+                    .as_str()
+                    .map(str::to_lowercase),
+                expected
+            );
+        }
     }
 
     #[actix_web::test]

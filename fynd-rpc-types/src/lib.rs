@@ -1360,6 +1360,16 @@ pub struct InstanceInfo {
         schema(value_type = Option<String>, example = "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35")
     )]
     router_address: Option<Bytes>,
+    /// Address of the chain's `FyndJITRouter`, which fronts the Tycho router with the same
+    /// entrypoints; `null` when this deployment has none. A quote the authenticating proxy
+    /// routes through it carries this address as `transaction.to`, and it is the spender to
+    /// approve for such swaps.
+    #[serde(default)]
+    #[cfg_attr(
+        feature = "openapi",
+        schema(value_type = Option<String>, example = "0xDAa2Fe509DE861D53e81940fDb8353B33126c930")
+    )]
+    jit_router_address: Option<Bytes>,
     /// Address of the canonical Permit2 contract (same on all EVM chains).
     #[cfg_attr(
         feature = "openapi",
@@ -1381,7 +1391,13 @@ impl InstanceInfo {
         router_address: Option<Bytes>,
         permit2_address: Bytes,
     ) -> InstanceInfoBuilder {
-        InstanceInfoBuilder { chain_id, router_address, permit2_address, version: String::new() }
+        InstanceInfoBuilder {
+            chain_id,
+            router_address,
+            jit_router_address: None,
+            permit2_address,
+            version: String::new(),
+        }
     }
 
     /// EIP-155 chain ID.
@@ -1392,6 +1408,11 @@ impl InstanceInfo {
     /// Address of the Tycho Router contract, or `None` on a quote-only chain.
     pub fn router_address(&self) -> Option<&Bytes> {
         self.router_address.as_ref()
+    }
+
+    /// Address of the chain's `FyndJITRouter`, or `None` when this deployment has none.
+    pub fn jit_router_address(&self) -> Option<&Bytes> {
+        self.jit_router_address.as_ref()
     }
 
     /// Address of the canonical Permit2 contract.
@@ -1410,11 +1431,18 @@ impl InstanceInfo {
 pub struct InstanceInfoBuilder {
     chain_id: u64,
     router_address: Option<Bytes>,
+    jit_router_address: Option<Bytes>,
     permit2_address: Bytes,
     version: String,
 }
 
 impl InstanceInfoBuilder {
+    /// Sets the chain's `FyndJITRouter` address.
+    pub fn jit_router_address(mut self, jit_router_address: Option<Bytes>) -> Self {
+        self.jit_router_address = jit_router_address;
+        self
+    }
+
     /// Sets the Fynd binary version.
     pub fn version(mut self, version: impl Into<String>) -> Self {
         self.version = version.into();
@@ -1426,6 +1454,7 @@ impl InstanceInfoBuilder {
         InstanceInfo {
             chain_id: self.chain_id,
             router_address: self.router_address,
+            jit_router_address: self.jit_router_address,
             permit2_address: self.permit2_address,
             version: self.version,
         }
@@ -1717,6 +1746,7 @@ mod wire_format_tests {
         }"#;
 
         let info: InstanceInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.jit_router_address(), None);
         assert_eq!(info.version(), "1.2.3");
         assert_eq!(info.chain_id(), 1);
         assert_eq!(info.router_address().unwrap().as_ref(), [0xAAu8; 20]);
@@ -1727,9 +1757,16 @@ mod wire_format_tests {
     fn instance_info_builder_sets_fields() {
         let info =
             InstanceInfo::builder(1, Some(Bytes::from([0xAAu8; 20])), Bytes::from([0xBBu8; 20]))
+                .jit_router_address(Some(Bytes::from([0xCCu8; 20])))
                 .version("0.1.0")
                 .build();
 
+        assert_eq!(
+            info.jit_router_address()
+                .unwrap()
+                .as_ref(),
+            [0xCCu8; 20]
+        );
         assert_eq!(info.version(), "0.1.0");
         assert_eq!(info.chain_id(), 1);
         assert_eq!(info.router_address().unwrap().as_ref(), [0xAAu8; 20]);

@@ -102,6 +102,7 @@ curl -H "Authorization: $FYND_API_KEY" \
 {
   "chain_id": 1,
   "router_address": "0xda892c989d07a18b5dd3f392d949f00df15c5736",
+  "jit_router_address": "0xdaa2fe509de861d53e81940fdb8353b33126c930",
   "permit2_address": "0x000000000022d473030f116ddee9f6b43ac78ba3",
   "version": "0.97.0"
 }
@@ -109,6 +110,7 @@ curl -H "Authorization: $FYND_API_KEY" \
 
 * `chain_id` — the EVM chain ID this backend serves (e.g. `1` for Ethereum). Corresponds to the `chain` path segment in the request URL.
 * `router_address` — the on-chain contract that executes swaps. Submit your encoded swap transaction to this address (it's already set as `transaction.to` in an encoded quote — you don't set it yourself). It is **chain-specific**: each chain returns its own router address.
+* `jit_router_address` — the chain's `FyndJITRouter`, a contract that fronts the router with the same entrypoints so a block builder can improve the route just in time, or `null` where there is none. An API key enrolled for it receives quotes whose `transaction.to` is this address; the calldata is the same as a router call. Such swaps approve this address instead of `router_address` (ERC-20 approval or Permit2 spender). Client fee signatures still use `router_address` as the EIP-712 verifying contract.
 * `permit2_address` — the [Permit2](https://uniswap.org/blog/permit2) contract address. Used for permit-based token approvals (see [Approvals](#approvals) below).
 * `version` — the Fynd binary version serving this chain (the example value is illustrative). Hosted backends are updated on each production release, so the running version may lag the newest published Fynd release.
 

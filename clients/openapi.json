@@ -7,7 +7,7 @@
       "name": "Fynd License 1.0",
       "url": "https://github.com/propeller-heads/fynd/blob/main/LICENSE.md"
     },
-    "version": "0.107.0"
+    "version": "0.113.0"
   },
   "paths": {
     "/v1/health": {
@@ -687,6 +687,14 @@
             "description": "EIP-155 chain ID (e.g. 1 for Ethereum mainnet).",
             "example": 1,
             "minimum": 0
+          },
+          "jit_router_address": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Address of the chain's `FyndJITRouter`, which fronts the Tycho router with the same\nentrypoints; `null` when this deployment has none. A quote the authenticating proxy\nroutes through it carries this address as `transaction.to`, and it is the spender to\napprove for such swaps.",
+            "example": "0xDAa2Fe509DE861D53e81940fDb8353B33126c930"
           },
           "permit2_address": {
             "type": "string",

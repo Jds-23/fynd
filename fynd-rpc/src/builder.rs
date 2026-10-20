@@ -11,7 +11,10 @@ use fynd_core::{
 };
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
-use tycho_simulation::tycho_common::models::{chain_config::TvlThresholdTier, Chain};
+use tycho_simulation::tycho_common::{
+    models::{chain_config::TvlThresholdTier, Chain},
+    Bytes,
+};
 
 use crate::{
     api::{
@@ -284,6 +287,16 @@ impl FyndRPCBuilder {
         self.fynd_builder = self
             .fynd_builder
             .calldata_watermark(watermark);
+        self
+    }
+
+    /// Sets the chain's `FyndJITRouter`, so a quote request the authenticating proxy marks with
+    /// `x-jit-router: true` is encoded to be sent there instead of to the Tycho router. Default:
+    /// none, and such requests fail to encode.
+    pub fn jit_router_address(mut self, jit_router_address: Bytes) -> Self {
+        self.fynd_builder = self
+            .fynd_builder
+            .jit_router_address(jit_router_address);
         self
     }
 

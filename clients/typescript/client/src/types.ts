@@ -231,6 +231,12 @@ export interface HealthStatus {
 export interface InstanceInfo {
   /** Tycho Router contract address, or `null` on a quote-only chain. */
   routerAddress: Address | null;
+  /**
+   * `FyndJITRouter` contract address, or `null` when the server has none. A quote the server
+   * routes through it carries this address as `transaction.to`, and it is the spender to approve
+   * for such swaps.
+   */
+  jitRouterAddress: Address | null;
   permit2Address: Address;
   chainId: number;
 }

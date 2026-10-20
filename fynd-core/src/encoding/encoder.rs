@@ -16,7 +16,7 @@ use tycho_execution::encoding::{
         utils::{biguint_to_u256, bytes_to_address},
         ROUTER_ETH_ADDRESS,
     },
-    models::{EncodedSolution, Solution, Swap},
+    models::{EncodedSolution, Solution, Swap, UserTransferType},
     tycho_encoder::TychoEncoder,
 };
 use tycho_simulation::tycho_common::{models::Chain, Bytes};
@@ -63,10 +63,14 @@ struct PreparedSolution {
 /// * `router_address` - Address of the Tycho Router contract on this chain, or `None` if Tycho has
 ///   no router deployed there — encoding is then unavailable and `encode()` fails clearly.
 /// * `router_fees` - Router fee configuration, refreshed from chain by a background fetcher.
+/// * `jit_router_address` - Address of the chain's `FyndJITRouter`, or `None` when the deployment
+///   has none. It fronts the router with the same entrypoints, so a transaction sent to it carries
+///   the same calldata.
 pub struct Encoder {
     tycho_encoder: Option<Arc<dyn TychoEncoder>>,
     chain: Chain,
     router_address: Option<Bytes>,
+    jit_router_address: Option<Bytes>,
     router_fees: SharedRouterFees,
     /// Signs exclusive legs. `None` disables signing (no controller key configured).
     exclusive_swap_signer: Option<ExclusiveSwapSigner>,
@@ -262,11 +266,27 @@ impl Encoder {
             tycho_encoder,
             chain,
             router_address,
+            jit_router_address: None,
             router_fees: SharedRouterFees::default(),
             exclusive_swap_signer,
             disable_slippage_taking_signer,
             calldata_watermark: None,
         })
+    }
+
+    /// Sets the chain's `FyndJITRouter`, so a request with [`EncodingOptions::jit_router`] gets a
+    /// transaction sent to it, with the same calldata as a router call. Fails on a chain without
+    /// a router: there is nothing for it to front.
+    pub fn with_jit_router(mut self, jit_router: Bytes) -> Result<Self, SolveError> {
+        if self.router_address.is_none() {
+            return Err(SolveError::EncodingUnavailable(format!(
+                "cannot configure a FyndJITRouter on chain '{}': no Tycho router is deployed \
+                 there for it to front",
+                self.chain
+            )));
+        }
+        self.jit_router_address = Some(jit_router);
+        Ok(self)
     }
 
     /// Sets a watermark appended to every encoded transaction's calldata (e.g. `"fynd"`), so
@@ -301,6 +321,11 @@ impl Encoder {
     /// unavailable because no router is deployed there.
     pub fn router_address(&self) -> Option<&Bytes> {
         self.router_address.as_ref()
+    }
+
+    /// Returns the chain's `FyndJITRouter` address, or `None` when the deployment has none.
+    pub fn jit_router_address(&self) -> Option<&Bytes> {
+        self.jit_router_address.as_ref()
     }
 
     /// Returns the chain this encoder targets.
@@ -360,6 +385,9 @@ impl Encoder {
                 self.chain
             )));
         };
+        if encoding_options.jit_router() {
+            self.check_jit_router_encoding(&encoding_options)?;
+        }
 
         let slippage = encoding_options.slippage();
         if slippage == 0.0 {
@@ -845,13 +873,13 @@ impl Encoder {
 
         let value =
             if token_in == router_eth { solution.amount_in().clone() } else { BigUint::ZERO };
-        let mut transaction = Transaction::new(
-            encoded_solution
+        let to = match (&self.jit_router_address, encoding_options.jit_router()) {
+            (Some(jit_router), true) => jit_router.clone(),
+            (_, _) => encoded_solution
                 .interacting_with()
                 .clone(),
-            value,
-            contract_interaction,
-        );
+        };
+        let mut transaction = Transaction::new(to, value, contract_interaction);
         if encoding_options
             .client_fee_params()
             .is_some()
@@ -860,6 +888,29 @@ impl Encoder {
             transaction = transaction.with_client_fee_signature_offset(offset);
         }
         Ok((transaction, fee_breakdown))
+    }
+
+    /// Rejects a FyndJITRouter request this deployment cannot serve: no FyndJITRouter is
+    /// configured, or the swap is vault-funded. FyndJITRouter has no vault entrypoints, and the
+    /// vault balance the router would debit is FyndJITRouter's, not the user's.
+    fn check_jit_router_encoding(
+        &self,
+        encoding_options: &EncodingOptions,
+    ) -> Result<(), SolveError> {
+        if self.jit_router_address.is_none() {
+            return Err(SolveError::EncodingUnavailable(format!(
+                "FyndJITRouter encoding is unavailable on chain '{}': no FyndJITRouter address \
+                 is configured (--jit-router-address)",
+                self.chain
+            )));
+        }
+        if encoding_options.transfer_type() == &UserTransferType::UseVaultsFunds {
+            return Err(SolveError::FailedEncoding(
+                "vault-funded swaps cannot go through FyndJITRouter: it has no vault entrypoints"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Rejects calldata the router would revert on.
@@ -1168,6 +1219,7 @@ mod tests {
             tycho_encoder: Some(tycho_encoder),
             chain,
             router_address: Some(Bytes::from([0u8; 20].as_ref())),
+            jit_router_address: None,
             router_fees,
             exclusive_swap_signer: None,
             disable_slippage_taking_signer: None,
@@ -1604,6 +1656,79 @@ mod tests {
         assert!(!tx.data().is_empty());
         // Data starts with a 4-byte function selector
         assert!(tx.data().len() > 4);
+    }
+
+    fn jit_router() -> Bytes {
+        Bytes::from([0xDAu8; 20].as_ref())
+    }
+
+    #[tokio::test]
+    async fn test_encode_jit_router_sends_the_same_calldata_to_the_jit_router() {
+        let encoder = real_encoder()
+            .with_jit_router(jit_router())
+            .unwrap();
+        let quote = || {
+            make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]))
+        };
+
+        let through_router = encoder
+            .encode(vec![quote()], EncodingOptions::new(0.01))
+            .await
+            .unwrap();
+        let through_jit_router = encoder
+            .encode(vec![quote()], EncodingOptions::new(0.01).with_jit_router(true))
+            .await
+            .unwrap();
+
+        let router_tx = through_router[0].transaction().unwrap();
+        let jit_tx = through_jit_router[0]
+            .transaction()
+            .unwrap();
+        assert_eq!(router_tx.to(), encoder.router_address().unwrap());
+        assert_eq!(jit_tx.to(), &jit_router());
+        assert_eq!(jit_tx.data(), router_tx.data());
+    }
+
+    #[tokio::test]
+    async fn test_encode_jit_router_fails_when_none_is_configured() {
+        let encoder = real_encoder();
+        let quote = make_order_quote(990)
+            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+
+        let result = encoder
+            .encode(vec![quote], EncodingOptions::new(0.01).with_jit_router(true))
+            .await;
+
+        assert!(matches!(result, Err(SolveError::EncodingUnavailable(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_encode_jit_router_rejects_vault_funding() {
+        let encoder = real_encoder()
+            .with_jit_router(jit_router())
+            .unwrap();
+        let quote = make_order_quote(990)
+            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+        let options = EncodingOptions::new(0.01)
+            .with_jit_router(true)
+            .with_transfer_type(UserTransferType::UseVaultsFunds);
+
+        let result = encoder
+            .encode(vec![quote], options)
+            .await;
+
+        assert!(matches!(result, Err(SolveError::FailedEncoding(_))), "{result:?}");
+    }
+
+    #[test]
+    fn test_with_jit_router_fails_without_a_router() {
+        let registry = SwapEncoderRegistry::new(Chain::Starknet);
+        let encoder = Encoder::new(Chain::Starknet, registry).unwrap();
+
+        let result = encoder.with_jit_router(jit_router());
+
+        assert!(matches!(result, Err(SolveError::EncodingUnavailable(_))));
     }
 
     /// Argument layout of `singleSwap(uint256,address,address,uint256,uint256,address,

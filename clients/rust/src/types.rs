@@ -1125,6 +1125,8 @@ impl Quote {
 pub struct InstanceInfo {
     /// Router contract address (20 raw bytes), or `None` on a quote-only chain.
     router_address: Option<bytes::Bytes>,
+    /// `FyndJITRouter` contract address (20 raw bytes), or `None` when the server has none.
+    jit_router_address: Option<bytes::Bytes>,
     /// Permit2 contract address (20 raw bytes).
     permit2_address: bytes::Bytes,
     /// Chain ID of the network this instance is deployed on.
@@ -1136,16 +1138,24 @@ pub struct InstanceInfo {
 impl InstanceInfo {
     pub(crate) fn new(
         router_address: Option<bytes::Bytes>,
+        jit_router_address: Option<bytes::Bytes>,
         permit2_address: bytes::Bytes,
         chain_id: u64,
         version: String,
     ) -> Self {
-        Self { router_address, permit2_address, chain_id, version }
+        Self { router_address, jit_router_address, permit2_address, chain_id, version }
     }
 
     /// Router contract address (20 raw bytes), or `None` on a quote-only chain.
     pub fn router_address(&self) -> Option<&bytes::Bytes> {
         self.router_address.as_ref()
+    }
+
+    /// `FyndJITRouter` contract address (20 raw bytes), or `None` when the server has none. A
+    /// quote the server routes through it carries this address as `transaction.to`, and it is
+    /// the spender to approve for such swaps.
+    pub fn jit_router_address(&self) -> Option<&bytes::Bytes> {
+        self.jit_router_address.as_ref()
     }
 
     /// Permit2 contract address (20 raw bytes).

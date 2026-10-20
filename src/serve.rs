@@ -397,6 +397,9 @@ async fn setup_solver(
         .unwrap_or_else(|| default_calldata_watermark(args.tycho_api_key.as_deref()));
     info!(watermark, "stamping encoded calldata");
     builder = builder.calldata_watermark(watermark.as_bytes());
+    if let Some(jit_router_address) = &args.jit_router_address {
+        builder = builder.jit_router_address(jit_router_address.clone());
+    }
 
     // Build and start solver
     let solver = configure(builder)

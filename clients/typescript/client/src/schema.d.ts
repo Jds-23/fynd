@@ -402,6 +402,14 @@ export interface components {
              */
             chain_id: number;
             /**
+             * @description Address of the chain's `FyndJITRouter`, which fronts the Tycho router with the same
+             *     entrypoints; `null` when this deployment has none. A quote the authenticating proxy
+             *     routes through it carries this address as `transaction.to`, and it is the spender to
+             *     approve for such swaps.
+             * @example 0xDAa2Fe509DE861D53e81940fDb8353B33126c930
+             */
+            jit_router_address?: string | null;
+            /**
              * @description Address of the canonical Permit2 contract (same on all EVM chains).
              * @example 0x000000000022D473030F116dDEE9F6B43aC78BA3
              */
