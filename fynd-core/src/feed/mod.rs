@@ -59,6 +59,9 @@ pub(crate) struct TychoFeedConfig {
     /// Number of delta messages buffered for each Tycho subscription. When unset, Tycho keeps
     /// its native default.
     pub(crate) subscription_buffer_size: Option<usize>,
+    /// How far, in block time, a `Delayed` protocol may lag the last updated block before its
+    /// pools are excluded from routing.
+    pub(crate) max_sync_lag: Duration,
 }
 
 impl TychoFeedConfig {
@@ -84,6 +87,7 @@ impl TychoFeedConfig {
             blocklisted_components: FxHashSet::default(),
             partial_blocks: false,
             subscription_buffer_size: None,
+            max_sync_lag: crate::solver::defaults::MAX_SYNC_LAG,
         }
     }
 
@@ -119,6 +123,11 @@ impl TychoFeedConfig {
 
     pub(crate) fn subscription_buffer_size(mut self, size: usize) -> Self {
         self.subscription_buffer_size = Some(size);
+        self
+    }
+
+    pub(crate) fn max_sync_lag(mut self, lag: Duration) -> Self {
+        self.max_sync_lag = lag;
         self
     }
 }

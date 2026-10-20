@@ -66,14 +66,15 @@ fn should_drop_component(
 /// The exclusions this request resolves to against `view`, resolved once and shared.
 ///
 /// Every order of one request, in every pool it reaches, wants the same answer, and expanding a
-/// protocol system copies that system's whole component set. The market's component membership is
-/// what the answer depends on, so a cached one stands until a component is added or removed.
+/// protocol system copies that system's whole component set. The answer depends on the market's
+/// components and its unsynced protocols, so a cached one stands until the market's exclusion
+/// generation changes.
 ///
 /// Logs what a non-empty filter resolved to, on the one call per generation that resolves it.
 fn resolve_exclusions(view: &MarketDataView<'_>, params: &SolveParams) -> Arc<RouteExclusions> {
     let generation = view
         .base_market_state()
-        .component_generation();
+        .exclusion_generation();
     let mut cache = params
         .cached_exclusions()
         .lock()
@@ -90,7 +91,7 @@ fn resolve_exclusions(view: &MarketDataView<'_>, params: &SolveParams) -> Arc<Ro
     );
     if !filter.is_empty() {
         debug!(
-            component_generation = generation,
+            exclusion_generation = generation,
             named_pools = filter.excluded_pools().len(),
             named_protocols = filter.excluded_protocols().len(),
             excluded_pools = exclusions.pools.len(),
@@ -102,12 +103,28 @@ fn resolve_exclusions(view: &MarketDataView<'_>, params: &SolveParams) -> Arc<Ro
     exclusions
 }
 
-/// Checks that `route` is valid and that it passes the request's route filter.
-fn check_route(route: &Route, order: &Order, params: &SolveParams) -> Result<(), String> {
+/// Checks that `route` is valid, passes the request's route filter, and uses no unsynced pool.
+fn check_route(
+    route: &Route,
+    order: &Order,
+    filter: &RouteExclusionFilter,
+    exclusions: &RouteExclusions,
+) -> Result<(), String> {
     route
         .validate()
         .map_err(|err| err.to_string())?;
-    validate_route_filter(route, order, params.route_filter())
+    validate_route_filter(route, order, filter)?;
+    for swap in route.swaps() {
+        if exclusions.is_unsynced_pool(swap.component_id()) {
+            return Err(format!(
+                "route uses pool {} of out-of-sync protocol {}",
+                swap.component_id(),
+                swap.protocol_component()
+                    .protocol_system
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Check every leg, including split branches, against the original request filter. Reading
@@ -660,13 +677,15 @@ where
             return (result, Vec::new());
         };
         let ProcessedRoute { route: mut processed_route, post_processed_by } = processed;
-        let mut checked = check_route(processed_route.route(), order, params).and_then(|()| {
-            self.check_processed_route(
-                order,
-                processed_route.route(),
-                processed_route.net_amount_out(),
-            )
-        });
+        let mut checked =
+            check_route(processed_route.route(), order, params.route_filter(), exclusions)
+                .and_then(|()| {
+                    self.check_processed_route(
+                        order,
+                        processed_route.route(),
+                        processed_route.net_amount_out(),
+                    )
+                });
         if checked.is_ok() {
             checked = self
                 .price_fallback_legs(order, params, processed_route.route_mut())
@@ -772,7 +791,9 @@ where
 
         let order_quote = match result {
             Ok(result) => {
-                if let Err(err) = check_route(result.route(), order, &params) {
+                if let Err(err) =
+                    check_route(result.route(), order, params.route_filter(), &exclusions)
+                {
                     error!(
                         order_id = %order.id(),
                         worker_pool = %self.pool_name,
@@ -1223,7 +1244,10 @@ mod tests {
 
     use rstest::rstest;
     use rustc_hash::FxHashMap;
-    use tycho_simulation::tycho_core::simulation::protocol_sim::ProtocolSim;
+    use tycho_simulation::{
+        tycho_client::feed::{BlockHeader, SynchronizerState},
+        tycho_core::simulation::protocol_sim::ProtocolSim,
+    };
 
     use super::*;
     use crate::{
@@ -1606,6 +1630,100 @@ mod tests {
                 assert!(msg.contains("excluded: p1,p2"), "unexpected message: {msg}");
             }
             other => panic!("expected the algorithm's report, got {other:?}"),
+        }
+    }
+
+    /// Sets the sync status of `uniswap_v2`, the protocol of every test pool, with a 15 s lag.
+    async fn set_uniswap_v2_status(market: &MarketData, status: SynchronizerState) {
+        market
+            .write()
+            .await
+            .update_sync_status([("uniswap_v2".to_string(), status)], Duration::from_secs(15));
+    }
+
+    /// One request's cached exclusions follow the protocol going `Stale` and then `Ready` again.
+    #[tokio::test]
+    async fn test_quote_unsynced_protocol() {
+        let token_a = token(0x01, "A");
+        let token_b = token(0x02, "B");
+        let (market, _) = setup_market_weighted(vec![
+            ("p1", &token_a, &token_b, MockProtocolSim::new(2.0)),
+            ("p2", &token_a, &token_b, MockProtocolSim::new(2.0)),
+        ]);
+        let mut worker = SolverWorker::new(
+            market.clone(),
+            DerivedData::new_shared(),
+            ReportExclusionsAlgorithm,
+            0,
+            "test_pool".to_string(),
+        );
+        let ord = order(&token_a, &token_b, 100, OrderSide::Sell);
+        let params = SolveParams::default();
+
+        let mut reported = Vec::new();
+        for status in [
+            SynchronizerState::Ready(BlockHeader { number: 1, ..Default::default() }),
+            SynchronizerState::Stale(BlockHeader::default()),
+            SynchronizerState::Ready(BlockHeader { number: 1, ..Default::default() }),
+        ] {
+            set_uniswap_v2_status(&market, status).await;
+            match worker
+                .quote(&ord, params.clone(), far_deadline())
+                .await
+            {
+                Err(SolveError::AlgorithmError(msg)) => reported.push(msg),
+                other => panic!("expected the algorithm's report, got {other:?}"),
+            }
+        }
+
+        assert!(reported[0].ends_with("excluded: "), "unexpected message: {}", reported[0]);
+        assert!(reported[1].contains("excluded: p1,p2"), "unexpected message: {}", reported[1]);
+        assert!(reported[2].ends_with("excluded: "), "unexpected message: {}", reported[2]);
+    }
+
+    #[tokio::test]
+    async fn test_quote_route_through_unsynced_protocol() {
+        let token_a = token(0x01, "A");
+        let token_b = token(0x02, "B");
+        let (market, _) =
+            setup_market_weighted(vec![("p1", &token_a, &token_b, MockProtocolSim::new(2.0))]);
+        set_uniswap_v2_status(&market, SynchronizerState::Stale(BlockHeader::default())).await;
+        let swap = Swap::new(
+            "p1".to_string(),
+            "uniswap_v2".to_string(),
+            token_a.address.clone(),
+            token_b.address.clone(),
+            BigUint::from(100u64),
+            BigUint::from(90u64),
+            BigUint::from(1u64),
+            component("p1", &[token_a.clone(), token_b.clone()]),
+            Box::new(MockProtocolSim::new(2.0)),
+        );
+        let route = Route::new(vec![swap], FxHashMap::default()).expect("non-empty route");
+        let mut worker = SolverWorker::new(
+            market,
+            DerivedData::new_shared(),
+            FilterIgnoringAlgorithm(route),
+            0,
+            "test_pool".to_string(),
+        );
+
+        let result = worker
+            .quote(
+                &order(&token_a, &token_b, 100, OrderSide::Sell),
+                SolveParams::default(),
+                far_deadline(),
+            )
+            .await;
+
+        match result {
+            Err(SolveError::AlgorithmError(msg)) => {
+                assert!(
+                    msg.contains("pool p1 of out-of-sync protocol uniswap_v2"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected the route to be rejected, got {other:?}"),
         }
     }
 

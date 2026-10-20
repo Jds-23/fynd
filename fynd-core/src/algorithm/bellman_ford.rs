@@ -1268,7 +1268,7 @@ mod tests {
             block_timestamp: 0,
             pricing: GasPrice::Legacy { gas_price: BigUint::from(100u64) },
         });
-        market.update_last_updated(crate::types::BlockInfo::new(1, "0x00".into(), 0));
+        crate::algorithm::test_utils::set_last_updated_block(&mut market, 1, 0);
 
         for (component_id, token_in, token_out, state) in components {
             let tokens = vec![token_in.clone(), token_out.clone()];

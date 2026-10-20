@@ -60,6 +60,13 @@ pub struct ServeArgs {
     #[arg(long, env)]
     pub tycho_subscription_buffer_size: Option<usize>,
 
+    /// How many seconds of block time a protocol Tycho reports as Delayed may lag behind the
+    /// newest block any protocol reported as Ready before its pools are excluded from routing.
+    /// A protocol Tycho reports as Stale is excluded until it catches up; one reported as Ended
+    /// stays excluded.
+    #[arg(long, default_value_t = defaults::MAX_SYNC_LAG.as_secs(), env)]
+    pub max_sync_lag_secs: u64,
+
     /// How far from the gas token the token-pricing pass reaches, in hops. A token within this
     /// many hops gets a gas price; one beyond it is quoted gas-blind even when a worker pool's
     /// `max_hops` can route to it. Each extra hop widens the walk every pass makes. Unset keeps
@@ -283,6 +290,7 @@ mod cli_tests {
         std::env::remove_var("RPC_URL");
         std::env::remove_var("TYCHO_API_KEY");
         std::env::remove_var("TYCHO_SUBSCRIPTION_BUFFER_SIZE");
+        std::env::remove_var("MAX_SYNC_LAG_SECS");
         std::env::remove_var("TYCHO_URL");
         std::env::remove_var("HTTP_HOST");
         std::env::remove_var("HTTP_PORT");
@@ -302,6 +310,7 @@ mod cli_tests {
         assert!(args.protocols.is_empty());
         assert_eq!(args.min_tvl, None);
         assert_eq!(args.tvl_buffer_ratio, 1.1);
+        assert_eq!(args.max_sync_lag_secs, 15);
         assert_eq!(args.gas_refresh_interval_secs, 30);
         assert_eq!(args.reconnect_delay_secs, 5);
         assert_eq!(args.worker_router_timeout_ms, 100);
@@ -327,6 +336,20 @@ mod cli_tests {
 
         std::env::remove_var("TYCHO_SUBSCRIPTION_BUFFER_SIZE");
         assert_eq!(args.tycho_subscription_buffer_size, Some(1024));
+    }
+
+    #[test]
+    fn test_parses_max_sync_lag_secs_from_environment() {
+        let _env_lock = ENV_LOCK
+            .lock()
+            .expect("environment lock poisoned");
+        std::env::set_var("MAX_SYNC_LAG_SECS", "30");
+
+        let cli = Cli::try_parse_from(vec!["fynd", "serve"]).expect("parse errored");
+        let Commands::Serve(args) = cli.command else { panic!("expected Serve command") };
+
+        std::env::remove_var("MAX_SYNC_LAG_SECS");
+        assert_eq!(args.max_sync_lag_secs, 30);
     }
 
     #[test]

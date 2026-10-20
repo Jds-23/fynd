@@ -25,16 +25,13 @@ use crate::{
     algorithm::{
         most_liquid::DepthAndPrice,
         request::SolveRequest,
-        test_utils::{component, token_with_decimals, ConstantProductSim},
+        test_utils::{component, set_last_updated_block, token_with_decimals, ConstantProductSim},
         Algorithm,
     },
     derived::{DerivedData, SharedDerivedDataRef},
     feed::market_data::{MarketData, MarketState},
     graph::{GraphManager, TopologyGraphManager},
-    types::{
-        quote::{Order, OrderSide, Route},
-        BlockInfo,
-    },
+    types::quote::{Order, OrderSide, Route},
 };
 
 /// Returns `(fraction_for_component_1, total_output)` — the theoretically optimal output when
@@ -109,7 +106,7 @@ pub fn two_equal_weth_usdc(gas_price: u64) -> WeightedSplitMarket {
         block_timestamp: 0,
         pricing: GasPrice::Legacy { gas_price: BigUint::from(gas_price) },
     });
-    market.update_last_updated(BlockInfo::new(1, "0x01".to_string(), 0));
+    set_last_updated_block(&mut market, 1, 0);
 
     let tokens = [weth.clone(), usdc.clone()];
     let mut edge_weights = Vec::new();
@@ -242,7 +239,7 @@ impl TestScenario {
             block_timestamp: 0,
             pricing: GasPrice::Legacy { gas_price: BigUint::from(100u64) },
         });
-        market.update_last_updated(BlockInfo::new(1, "0x00".to_string(), 0));
+        set_last_updated_block(&mut market, 1, 0);
 
         let mut edge_weights = Vec::new();
         for scenario in &self.components {

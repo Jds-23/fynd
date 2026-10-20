@@ -238,8 +238,8 @@ fn select_fallback(
     best.ok_or_else(|| FallbackError::SimulationFailed { component_id: leg.to_string() })
 }
 
-/// Whether this candidate pool is ruled out, by the request's own filter or by the worker pool's
-/// `exclude_protocols`.
+/// Whether this candidate pool is ruled out, by the request's own filter, by the worker pool's
+/// `exclude_protocols`, or because its protocol is out of sync.
 ///
 /// The fallback executes as part of the route, so a pool told never to route through a protocol
 /// must not settle its pAMM legs there either.
@@ -255,7 +255,10 @@ fn is_excluded(
 ) -> bool {
     if filter
         .excluded_pools()
-        .contains(candidate)
+        .contains(candidate) ||
+        market
+            .base_market_state()
+            .is_unsynced_pool(candidate)
     {
         return true;
     }
@@ -480,8 +483,11 @@ fn sorted_pair(token_a: &Address, token_b: &Address) -> (Address, Address) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use rstest::rstest;
     use tycho_simulation::{
+        tycho_client::feed::{BlockHeader, SynchronizerState},
         tycho_common::{models::Chain, Bytes},
         tycho_core::simulation::protocol_sim::ProtocolSim,
     };
@@ -934,6 +940,27 @@ mod tests {
             &pool_exclusions,
         )
         .expect("the worse pool is left");
+
+        assert_eq!(fallback.component_id(), WORSE_POOL);
+    }
+
+    /// A leg settles on chain against the fallback pool's live state, so a pool of an
+    /// out-of-sync protocol can't be its fallback.
+    #[tokio::test]
+    async fn test_select_fallback_unsynced_candidates() {
+        let market = market_with_fallback_pools();
+        market.write().await.update_sync_status(
+            [("uniswap_v2".to_string(), SynchronizerState::Stale(BlockHeader::default()))],
+            Duration::from_secs(15),
+        );
+        let view = market
+            .try_read_blocking()
+            .expect("uncontended");
+        let index = FallbackPoolIndex::build(&view);
+
+        let fallback =
+            select_fallback(&pamm_swap(), &view, &index, &RouteExclusionFilter::default(), &[])
+                .expect("the worse pool is left");
 
         assert_eq!(fallback.component_id(), WORSE_POOL);
     }

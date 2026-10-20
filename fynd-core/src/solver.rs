@@ -79,6 +79,10 @@ pub mod defaults {
     /// Multiplier applied to a component's (liquidity pool's) TVL when estimating available
     /// liquidity.
     pub const TVL_BUFFER_RATIO: f64 = 1.1;
+    /// How far, in block time, a protocol Tycho reports `Delayed` may lag the last updated block
+    /// before its pools are excluded from routing. A `Stale` or `Ended` protocol is excluded
+    /// regardless.
+    pub const MAX_SYNC_LAG: Duration = Duration::from_secs(15);
     /// How often the gas price is refreshed from the RPC node.
     pub const GAS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
     /// How often per-protocol market metrics are sampled and exported.
@@ -553,6 +557,7 @@ pub struct FyndBuilder {
     blocklisted_components: FxHashSet<String>,
     partial_blocks: bool,
     tycho_subscription_buffer_size: Option<usize>,
+    max_sync_lag: Duration,
     pricing_max_hops: usize,
     /// Shortest time between two full token-pricing passes; `None` keeps the computation's
     /// default.
@@ -599,6 +604,7 @@ impl FyndBuilder {
             blocklisted_components: FxHashSet::default(),
             partial_blocks: false,
             tycho_subscription_buffer_size: None,
+            max_sync_lag: defaults::MAX_SYNC_LAG,
             pricing_max_hops: defaults::PRICING_MAX_HOPS,
             pricing_max_tokens_per_pass: None,
             pricing_min_pass_interval: None,
@@ -691,6 +697,14 @@ impl FyndBuilder {
     /// unset preserves Tycho's native default.
     pub fn tycho_subscription_buffer_size(mut self, size: usize) -> Self {
         self.tycho_subscription_buffer_size = Some(size);
+        self
+    }
+
+    /// Sets how far, in block time, a protocol Tycho reports `Delayed` may lag the last updated
+    /// block before its pools are excluded from routing (default: [`defaults::MAX_SYNC_LAG`]). A
+    /// `Stale` or `Ended` protocol is excluded regardless.
+    pub fn max_sync_lag(mut self, lag: Duration) -> Self {
+        self.max_sync_lag = lag;
         self
     }
 
@@ -1001,7 +1015,8 @@ impl FyndBuilder {
         .min_token_quality(self.min_token_quality)
         .traded_n_days_ago(self.traded_n_days_ago)
         .blocklisted_components(self.blocklisted_components)
-        .partial_blocks(self.partial_blocks);
+        .partial_blocks(self.partial_blocks)
+        .max_sync_lag(self.max_sync_lag);
 
         let tycho_feed_config = match self.tycho_subscription_buffer_size {
             Some(size) => tycho_feed_config.subscription_buffer_size(size),
