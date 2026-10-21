@@ -45,8 +45,9 @@ pub trait SolutionHook: Debug + Send + Sync + RefUnwindSafe {
 
 /// Edits a quote's router calldata after encoding and before simulation.
 ///
-/// `calldata` is the router call, selector included, without the watermark, so the
-/// `EncodedSolution` byte offsets apply to it. Simulation runs on the edited calldata.
+/// `calldata` is the router call, selector included; the `EncodedSolution` byte offsets apply to
+/// it. The watermark is appended after the hook, so a hook that decodes or hashes `calldata` gets
+/// the same bytes for every client. Simulation runs on the edited calldata.
 ///
 /// The hook must not change the amounts, the receiver or the swaps bytes: the client fee
 /// signature, the disable-slippage-taking signature and the fee breakdown's swaps hash cover them.

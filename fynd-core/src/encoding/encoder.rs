@@ -542,8 +542,8 @@ impl Encoder {
     /// Builds the router call for one encoded solution and writes its transaction, gas estimate,
     /// fee breakdown and amount out to the quote.
     ///
-    /// The calldata hook runs before the watermark is appended, so the `EncodedSolution` offsets
-    /// stay valid.
+    /// The calldata hook runs before the watermark is appended, so it gets only the router call:
+    /// the same bytes whichever client the watermark names.
     fn attach_transaction(
         &self,
         quote: &mut OrderQuote,
