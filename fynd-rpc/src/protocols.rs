@@ -64,8 +64,8 @@ pub async fn fetch_protocol_systems(
 /// nothing is logged as a warning and otherwise ignored.
 ///
 /// Every resolved protocol system is checked against the ones Tycho serves, and an entry naming a
-/// system that is gone is warned about and dropped. A list of RFQ and price level stream entries
-/// only skips the check along with the fetch, since it needs no Tycho protocol stream.
+/// system that is gone is warned about and dropped. A list of only `rfq:` and price level
+/// stream entries skips the check along with the fetch, since it needs no Tycho protocol stream.
 ///
 /// # Errors
 ///
@@ -92,8 +92,8 @@ pub async fn resolve_protocols(
             .any(|p| p == ALL_ONCHAIN);
 
     // Fetched for a list that needs no expansion too, so its entries can be checked against what
-    // Tycho actually serves. A list of RFQ and price level stream entries only names no Tycho
-    // system, so it skips the fetch and needs no reachable Tycho.
+    // Tycho actually serves. A list of only `rfq:` and price level stream entries names no
+    // Tycho system, so it skips the fetch and needs no reachable Tycho.
     let names_tycho_system = explicit
         .iter()
         .any(|protocol| is_tycho_system(&protocol.system));
@@ -196,8 +196,8 @@ fn apply_exclusions(protocols: &mut Vec<ProtocolSpec>, excluded: &[String]) {
 /// than dropping it — the stream registers a synchronizer for a system nothing will ever publish,
 /// which spends the whole startup timeout before going stale.
 ///
-/// RFQ and price level stream entries are left alone: they are served from their own endpoints and
-/// so never appear among Tycho's protocol systems.
+/// `rfq:` and price level stream entries are left alone: they are served from their own
+/// endpoints and so never appear among Tycho's protocol systems.
 fn drop_unserved(protocols: &mut Vec<ProtocolSpec>, available: &[String]) {
     let served: HashSet<&str> = available
         .iter()

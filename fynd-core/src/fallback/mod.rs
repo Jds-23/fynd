@@ -38,7 +38,7 @@ use crate::{
 /// tycho-simulation's price level stream labels every pAMM's components with this prefix; the
 /// direct `pricelevelstream:` label is only for a stream built `without_fallback_router`. Fynd
 /// requests the venue by its `pricelevelstream:{venue}` entry and the stream decides the
-/// label. The Metric, Bebop and Hashflow RFQ clients use this prefix when built
+/// label. The Metric, Bebop and Hashflow book feeds use this prefix when built
 /// `with_fallback_router`.
 pub const FALLBACK_PREFIX: &str = tycho_execution::encoding::evm::FALLBACK_PREFIX;
 
