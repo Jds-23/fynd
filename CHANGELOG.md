@@ -1,4 +1,16 @@
 
+## [0.114.2](https://github.com/propeller-heads/fynd/compare/0.114.1...0.114.2) (2026-10-21)
+
+### Features
+
+* **rpc:** report the address a caller's quotes go to on /v1/info ([fedb32f](https://github.com/propeller-heads/fynd/commit/fedb32f25c58e6ec26049710c34afd2f64bfc831))
+* **encoding:** send opted-in quotes to FyndJITRouter ([e69c799](https://github.com/propeller-heads/fynd/commit/e69c799d78fdee4dd74630ee6081a93f17d197f6))
+
+### Bug Fixes
+
+* **encoding:** keep vault swaps on the router, gate info on the JIT header ([b9cea47](https://github.com/propeller-heads/fynd/commit/b9cea47aca938ea70edae1d251e7d5cb618c6962))
+
+
 ## [0.114.1](https://github.com/propeller-heads/fynd/compare/0.113.0...0.114.1) (2026-10-21)
 
 ### Features
