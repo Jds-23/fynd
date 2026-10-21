@@ -231,12 +231,15 @@ export interface HealthStatus {
 export interface InstanceInfo {
   /** Tycho Router contract address, or `null` on a quote-only chain. */
   routerAddress: Address | null;
-  /**
-   * `FyndJITRouter` contract address, reported only when this client's API key is enrolled for
-   * it; `null` otherwise. An enrolled client's quotes carry it as `transaction.to` (vault-funded
-   * swaps excepted), so `approval()` uses it as the spender and a Permit2 `spender` must name it.
-   */
+  /** `FyndJITRouter` contract address, or `null` when the server has none. */
   jitRouterAddress: Address | null;
+  /**
+   * Contract this client's quotes are sent to as `transaction.to`: the `FyndJITRouter` when this
+   * API key is enrolled for it, else the router (vault-funded swaps always go to the router).
+   * `approval()` uses it as the spender, and a Permit2 `spender` must name it. `null` on a
+   * quote-only chain; equals `routerAddress` when an older server omits it.
+   */
+  toAddress: Address | null;
   permit2Address: Address;
   chainId: number;
 }

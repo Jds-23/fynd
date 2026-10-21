@@ -379,8 +379,13 @@ impl TryFrom<fynd_rpc_types::InstanceInfo> for crate::types::InstanceInfo {
         let jit_router = dto
             .jit_router_address()
             .map(|r| bytes::Bytes::copy_from_slice(r.as_ref()));
+        let to = dto
+            .to_address()
+            .map(|r| bytes::Bytes::copy_from_slice(r.as_ref()));
         let permit2 = bytes::Bytes::copy_from_slice(dto.permit2_address().as_ref());
-        for (name, address) in [("router_address", &router), ("jit_router_address", &jit_router)] {
+        for (name, address) in
+            [("router_address", &router), ("jit_router_address", &jit_router), ("to_address", &to)]
+        {
             if let Some(address) = address {
                 if address.len() != 20 {
                     return Err(FyndError::Protocol(format!(
@@ -399,6 +404,7 @@ impl TryFrom<fynd_rpc_types::InstanceInfo> for crate::types::InstanceInfo {
         Ok(crate::types::InstanceInfo::new(
             router,
             jit_router,
+            to,
             permit2,
             dto.chain_id(),
             dto.version().to_string(),

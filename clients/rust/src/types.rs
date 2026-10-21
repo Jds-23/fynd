@@ -1127,6 +1127,9 @@ pub struct InstanceInfo {
     router_address: Option<bytes::Bytes>,
     /// `FyndJITRouter` contract address (20 raw bytes), or `None` when the server has none.
     jit_router_address: Option<bytes::Bytes>,
+    /// Contract this client's quotes are sent to (20 raw bytes), or `None` on a quote-only
+    /// chain or from an older server.
+    to_address: Option<bytes::Bytes>,
     /// Permit2 contract address (20 raw bytes).
     permit2_address: bytes::Bytes,
     /// Chain ID of the network this instance is deployed on.
@@ -1139,11 +1142,12 @@ impl InstanceInfo {
     pub(crate) fn new(
         router_address: Option<bytes::Bytes>,
         jit_router_address: Option<bytes::Bytes>,
+        to_address: Option<bytes::Bytes>,
         permit2_address: bytes::Bytes,
         chain_id: u64,
         version: String,
     ) -> Self {
-        Self { router_address, jit_router_address, permit2_address, chain_id, version }
+        Self { router_address, jit_router_address, to_address, permit2_address, chain_id, version }
     }
 
     /// Router contract address (20 raw bytes), or `None` on a quote-only chain.
@@ -1151,12 +1155,20 @@ impl InstanceInfo {
         self.router_address.as_ref()
     }
 
-    /// `FyndJITRouter` contract address (20 raw bytes), reported only when this client's API key
-    /// is enrolled for it; `None` otherwise. An enrolled client's quotes carry it as
-    /// `transaction.to` (vault-funded swaps excepted), so [`approval`](crate::FyndClient::approval)
-    /// uses it as the spender and a Permit2 `spender` must name it.
+    /// `FyndJITRouter` contract address (20 raw bytes), or `None` when the server has none.
     pub fn jit_router_address(&self) -> Option<&bytes::Bytes> {
         self.jit_router_address.as_ref()
+    }
+
+    /// Contract this client's quotes are sent to as `transaction.to`: the `FyndJITRouter` when
+    /// this API key is enrolled for it, else the router (vault-funded swaps always go to the
+    /// router). [`approval`](crate::FyndClient::approval) uses it as the spender, and a Permit2
+    /// `spender` must name it. `None` on a quote-only chain; falls back to
+    /// [`router_address`](Self::router_address) when an older server omits it.
+    pub fn to_address(&self) -> Option<&bytes::Bytes> {
+        self.to_address
+            .as_ref()
+            .or(self.router_address.as_ref())
     }
 
     /// Permit2 contract address (20 raw bytes).

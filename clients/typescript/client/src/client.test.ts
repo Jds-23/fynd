@@ -840,14 +840,14 @@ describe('FyndClient.approval', () => {
     expect(payload!.amount).toBe(500n);
   });
 
-  it('sets spender to jitRouterAddress when info reports one', async () => {
+  it('sets spender to toAddress when info reports one', async () => {
     const provider = makeMockProvider();
     const jitRouter = '0xdaa2fe509de861d53e81940fdb8353b33126c930';
     const client = makeClientWithHttpMock(
       { status: 200, data: wireSolution },
       undefined,
       { provider },
-      { status: 200, data: { ...wireInstanceInfo, jit_router_address: jitRouter } },
+      { status: 200, data: { ...wireInstanceInfo, jit_router_address: jitRouter, to_address: jitRouter } },
     );
     const payload = await client.approval({ token: TOKEN_IN_ADDR, amount: 500n });
     expect(payload!.spender).toBe(jitRouter);

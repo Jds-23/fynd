@@ -238,6 +238,7 @@ export function fromWireInstanceInfo(wire: WireInstanceInfo): InstanceInfo {
   return {
     routerAddress:  (wire.router_address ?? null) as Address | null,
     jitRouterAddress: (wire.jit_router_address ?? null) as Address | null,
+    toAddress:        (wire.to_address ?? wire.router_address ?? null) as Address | null,
     permit2Address: wire.permit2_address as Address,
     chainId:        wire.chain_id,
   };

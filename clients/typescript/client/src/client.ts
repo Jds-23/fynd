@@ -528,13 +528,12 @@ export class FyndClient {
     if (params.transferType === 'transfer_from_permit2') {
       spender = info.permit2Address;
     } else {
-      const routerSpender = info.jitRouterAddress ?? info.routerAddress;
-      if (routerSpender === null) {
+      if (info.toAddress === null) {
         throw FyndError.config(
           "server has no routerAddress; encoding is unavailable on this chain",
         );
       }
-      spender = routerSpender;
+      spender = info.toAddress;
     }
 
     const provider = this.options.provider;

@@ -232,9 +232,9 @@ pub async fn health(state: web::Data<AppState>) -> HttpResponse {
 
 /// GET /v1/info - Return static metadata about this Fynd instance.
 ///
-/// `jit_router_address` is reported only on a request the authenticating proxy marks with
-/// `x-jit-router: true`, so a caller learns before quoting whether its swaps go to the
-/// FyndJITRouter and which spender to approve.
+/// `to_address` is the contract this caller's quotes are sent to: the FyndJITRouter on a request
+/// the authenticating proxy marks with `x-jit-router: true`, the Tycho router otherwise. A caller
+/// learns the spender to approve, and the Permit2 spender to sign, before quoting.
 #[utoipa::path(
     get,
     path = "/v1/info",
@@ -244,25 +244,26 @@ pub async fn health(state: web::Data<AppState>) -> HttpResponse {
     )
 )]
 pub async fn info(state: web::Data<AppState>, http_request: HttpRequest) -> HttpResponse {
-    let jit_router_address = if jit_router::from_headers(http_request.headers()) {
-        state
-            .worker_router()
-            .encoder()
-            .jit_router_address()
-            .cloned()
-            .map(Into::into)
+    let router_address = state.router_address().cloned();
+    let jit_router_address = state
+        .worker_router()
+        .encoder()
+        .jit_router_address()
+        .cloned();
+    let to_address = if jit_router::from_headers(http_request.headers()) {
+        jit_router_address
+            .clone()
+            .or(router_address.clone())
     } else {
-        None
+        router_address.clone()
     };
     let body = dto::InstanceInfo::builder(
         state.chain_id(),
-        state
-            .router_address()
-            .cloned()
-            .map(Into::into),
+        router_address.map(Into::into),
         state.permit2_address().clone().into(),
     )
-    .jit_router_address(jit_router_address)
+    .jit_router_address(jit_router_address.map(Into::into))
+    .to_address(to_address.map(Into::into))
     .version(env!("CARGO_PKG_VERSION"))
     .build();
     HttpResponse::Ok().json(body)
@@ -1878,14 +1879,15 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn test_info_reports_jit_router_address_only_with_the_header() {
+    async fn test_info_reports_to_address_from_the_header() {
+        let router = Bytes::from(hex::decode("fD0b31d2E955fA55e3fa641Fe90e08b677188d35").unwrap());
         let cases = [
-            (Some(jit_router_address()), true, Some(jit_router_address())),
-            (Some(jit_router_address()), false, None),
-            (None, true, None),
+            (Some(jit_router_address()), true, jit_router_address()),
+            (Some(jit_router_address()), false, router.clone()),
+            (None, true, router.clone()),
         ];
-        for (configured, header, expected) in cases {
-            let state = make_test_state_with(None, configured);
+        for (configured, header, expected_to) in cases {
+            let state = make_test_state_with(None, configured.clone());
             let app = test::init_service(
                 App::new()
                     .app_data(web::Data::new(state))
@@ -1900,12 +1902,18 @@ mod tests {
             let body: serde_json::Value =
                 test::call_and_read_body_json(&app, req.to_request()).await;
 
-            let expected = expected.map(|address| format!("0x{}", hex::encode(address)));
+            let lower = |address: &Bytes| format!("0x{}", hex::encode(address));
+            assert_eq!(
+                body["to_address"]
+                    .as_str()
+                    .map(str::to_lowercase),
+                Some(lower(&expected_to))
+            );
             assert_eq!(
                 body["jit_router_address"]
                     .as_str()
                     .map(str::to_lowercase),
-                expected
+                configured.as_ref().map(lower)
             );
         }
     }

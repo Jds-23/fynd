@@ -1361,16 +1361,24 @@ pub struct InstanceInfo {
     )]
     router_address: Option<Bytes>,
     /// Address of the chain's `FyndJITRouter`, which fronts the Tycho router with the same
-    /// entrypoints. Reported only to a caller whose API key is enrolled for it; `null`
-    /// otherwise, and where this deployment has none. An enrolled caller's quotes carry this
-    /// address as `transaction.to` (vault-funded swaps excepted), so it is the spender to
-    /// approve, and the Permit2 `spender`, for such swaps.
+    /// entrypoints so a block builder can improve a route just in time; `null` where this
+    /// deployment has none.
     #[serde(default)]
     #[cfg_attr(
         feature = "openapi",
         schema(value_type = Option<String>, example = "0xDAa2Fe509DE861D53e81940fDb8353B33126c930")
     )]
     jit_router_address: Option<Bytes>,
+    /// Contract this caller's quotes are sent to as `transaction.to`: `jit_router_address` when
+    /// the caller's API key is enrolled for it, `router_address` otherwise (vault-funded swaps
+    /// always go to `router_address`). Approve this address, and name it as the Permit2
+    /// `spender`. `null` on a quote-only chain, and absent from older servers.
+    #[serde(default)]
+    #[cfg_attr(
+        feature = "openapi",
+        schema(value_type = Option<String>, example = "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35")
+    )]
+    to_address: Option<Bytes>,
     /// Address of the canonical Permit2 contract (same on all EVM chains).
     #[cfg_attr(
         feature = "openapi",
@@ -1396,6 +1404,7 @@ impl InstanceInfo {
             chain_id,
             router_address,
             jit_router_address: None,
+            to_address: None,
             permit2_address,
             version: String::new(),
         }
@@ -1416,6 +1425,12 @@ impl InstanceInfo {
         self.jit_router_address.as_ref()
     }
 
+    /// Contract this caller's quotes are sent to, or `None` on a quote-only chain or from an
+    /// older server.
+    pub fn to_address(&self) -> Option<&Bytes> {
+        self.to_address.as_ref()
+    }
+
     /// Address of the canonical Permit2 contract.
     pub fn permit2_address(&self) -> &Bytes {
         &self.permit2_address
@@ -1433,6 +1448,7 @@ pub struct InstanceInfoBuilder {
     chain_id: u64,
     router_address: Option<Bytes>,
     jit_router_address: Option<Bytes>,
+    to_address: Option<Bytes>,
     permit2_address: Bytes,
     version: String,
 }
@@ -1441,6 +1457,12 @@ impl InstanceInfoBuilder {
     /// Sets the chain's `FyndJITRouter` address.
     pub fn jit_router_address(mut self, jit_router_address: Option<Bytes>) -> Self {
         self.jit_router_address = jit_router_address;
+        self
+    }
+
+    /// Sets the contract this caller's quotes are sent to.
+    pub fn to_address(mut self, to_address: Option<Bytes>) -> Self {
+        self.to_address = to_address;
         self
     }
 
@@ -1456,6 +1478,7 @@ impl InstanceInfoBuilder {
             chain_id: self.chain_id,
             router_address: self.router_address,
             jit_router_address: self.jit_router_address,
+            to_address: self.to_address,
             permit2_address: self.permit2_address,
             version: self.version,
         }
@@ -1748,6 +1771,7 @@ mod wire_format_tests {
 
         let info: InstanceInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.jit_router_address(), None);
+        assert_eq!(info.to_address(), None);
         assert_eq!(info.version(), "1.2.3");
         assert_eq!(info.chain_id(), 1);
         assert_eq!(info.router_address().unwrap().as_ref(), [0xAAu8; 20]);
@@ -1759,9 +1783,11 @@ mod wire_format_tests {
         let info =
             InstanceInfo::builder(1, Some(Bytes::from([0xAAu8; 20])), Bytes::from([0xBBu8; 20]))
                 .jit_router_address(Some(Bytes::from([0xCCu8; 20])))
+                .to_address(Some(Bytes::from([0xCCu8; 20])))
                 .version("0.1.0")
                 .build();
 
+        assert_eq!(info.to_address().unwrap().as_ref(), [0xCCu8; 20]);
         assert_eq!(
             info.jit_router_address()
                 .unwrap()
