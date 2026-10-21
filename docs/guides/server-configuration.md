@@ -58,8 +58,8 @@ fynd serve \
 
 * RFQ protocols cannot run alone. At least one on-chain protocol is required.
 * When encoding is enabled (`encoding_options` in the quote request), `rfq:bebop`, `rfq:hashflow`, `rfq:native` and `rfq:liquorice` quotes require an additional round-trip to the RFQ provider to fetch a signed quote. This can add significant tail latency to solve times. If you are using these protocols, consider quoting first without encoding to evaluate the price, and only request encoding once you are confident the quote is worth executing. `rfq:metric` encodes locally and needs no such round-trip — its executor reads the on-chain oracle Metric updates every block.
-* Metric runs on Base, Robinhood and BSC only. Each entry also needs its executor on the chain: `rfq:metric` runs on Base and Robinhood, and `fallback:rfq:metric` on all three. BSC has only the fallback executor. Naming an entry where its executor is missing fails at startup rather than producing quotes that cannot be encoded.
-* Metric is reached by a different entry per chain: `pricelevelstream:metric` on Ethereum, `rfq:metric` or `fallback:rfq:metric` on Base, Robinhood and BSC. Each is gated on its own chains — the price level stream is Ethereum-only — so the two never serve the same deployment and cannot double-count the liquidity.
+* Metric runs on Base, Robinhood, BSC and Arbitrum only. Each entry also needs its executor on the chain: `rfq:metric` runs on Base, Robinhood and Arbitrum, and `fallback:rfq:metric` on Base, Robinhood and BSC. BSC has only the fallback executor and Arbitrum only the direct one. Naming an entry where its executor is missing fails at startup rather than producing quotes that cannot be encoded.
+* Metric is reached by a different entry per chain: `pricelevelstream:metric` on Ethereum, `rfq:metric` or `fallback:rfq:metric` on Base, Robinhood, BSC and Arbitrum. Each is gated on its own chains — the price level stream is Ethereum-only — so the two never serve the same deployment and cannot double-count the liquidity.
 
 **Environment variables:**
 
@@ -74,7 +74,7 @@ Serve a proprietary AMM from Titan's pAMM price level stream instead of simulati
 
 Name a venue with the `pricelevelstream:` prefix. The served venues are `fermiswap`, `kipseli`, `metric`, `bebop`, and `taurusfi`:
 
-The stream serves Ethereum only. On Base, Robinhood and BSC, Metric is reached through `rfq:metric` or `fallback:rfq:metric` instead — see [Including RFQ Protocols](#including-rfq-protocols).
+The stream serves Ethereum only. On Base, Robinhood, BSC and Arbitrum, Metric is reached through `rfq:metric` or `fallback:rfq:metric` instead — see [Including RFQ Protocols](#including-rfq-protocols).
 
 ```bash
 fynd serve \
