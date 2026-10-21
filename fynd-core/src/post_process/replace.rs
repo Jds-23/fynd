@@ -18,14 +18,14 @@ use crate::{
     types::{ComponentId, Route, RouteResult, Swap},
 };
 
-/// The RFQ components of the market, by token.
+/// The components of the market that a replacer may use, by token.
 #[derive(Default)]
-pub(super) struct RfqIndex {
+pub(super) struct ComponentIndex {
     by_token: FxHashMap<Address, BTreeSet<ComponentId>>,
     tokens_of: FxHashMap<ComponentId, Vec<Address>>,
 }
 
-impl RfqIndex {
+impl ComponentIndex {
     pub(super) fn is_empty(&self) -> bool {
         self.tokens_of.is_empty()
     }
@@ -77,20 +77,22 @@ impl RfqIndex {
     }
 }
 
-/// What a search reads from the market, copied under the read lock so the search holds no lock.
-pub(super) struct Snapshot {
-    /// One swap with zero amounts for each RFQ component the search may use, in id order. Its
-    /// token pair is a placeholder: `Search` sets the pair and the split before it simulates.
-    rfq: Vec<Swap>,
+/// The swaps the search may use as replacements for one route, and the route's tokens. Copied
+/// from the market so the search holds no lock.
+pub(super) struct ReplacementSnapshot {
+    /// One swap with zero amounts for each component the search may use, in id order. Its
+    /// token pair is a placeholder: `ReplacementSearcher` sets the pair and the split before it
+    /// simulates.
+    swaps: Vec<Swap>,
     /// The tokens of the route.
     tokens: FxHashMap<Address, Token>,
 }
 
-impl Snapshot {
-    /// Copies the tokens of `route` and the RFQ components containing at least two of those
+impl ReplacementSnapshot {
+    /// Copies the tokens of `route` and the components of `index` containing at least two of those
     /// tokens. Omits components the request excludes or the pool drops.
     pub(super) fn take(
-        index: &RfqIndex,
+        index: &ComponentIndex,
         view: &MarketDataView<'_>,
         request: &PostProcessRequest<'_>,
         route: &Route,
@@ -107,7 +109,7 @@ impl Snapshot {
                 }
             }
         }
-        let mut rfq = Vec::new();
+        let mut swaps = Vec::new();
         for id in index.find_touching(&route_tokens) {
             if request.exclusions().excludes_pool(id) {
                 continue;
@@ -123,7 +125,7 @@ impl Snapshot {
             if request.drops_component(component) {
                 continue;
             }
-            rfq.push(Swap::new(
+            swaps.push(Swap::new(
                 id.clone(),
                 component.protocol_system.clone(),
                 token_in.clone(),
@@ -135,7 +137,7 @@ impl Snapshot {
                 state.clone_box(),
             ));
         }
-        Self { rfq, tokens }
+        Self { swaps, tokens }
     }
 }
 
@@ -166,29 +168,31 @@ impl GasPricing {
     }
 }
 
-/// The swaps to replace, and the pair of tokens the replacement swap connects.
+/// The part of a route that one replacement takes the place of: one swap, or a segment of swaps
+/// between two tokens that every path of the route passes through.
 #[derive(Clone)]
-pub(super) struct Target {
+pub(super) struct ReplacementTarget {
     /// Positions of the swaps to replace, in ascending order.
     pub(super) replaced: Vec<usize>,
     pub(super) token_in: Address,
     pub(super) token_out: Address,
-    /// The split of the RFQ swap; `0.0` takes what remains of `token_in`.
+    /// The split of the replacement swap; `0.0` takes what remains of `token_in`.
     split: f64,
 }
 
-/// A target with the RFQ swap that replaces it.
-pub(super) struct Candidate {
-    target: Target,
-    rfq: Swap,
+/// A route with one replacement applied and simulated, which the search keeps if it beats the
+/// current route.
+pub(super) struct CandidateRoute {
+    target: ReplacementTarget,
+    swap: Swap,
     simulated: SimulatedRoute,
     net_amount_out: BigInt,
 }
 
-/// Searches one route for RFQ swaps that raise the net amount out.
-pub(super) struct Search<'a> {
+/// Searches one route for replacements that raise the net amount out.
+pub(super) struct ReplacementSearcher<'a> {
     original: &'a RouteResult,
-    rfq: Vec<Swap>,
+    swaps: Vec<Swap>,
     deadline: Instant,
     pricing: GasPricing,
     tokens: FxHashMap<Address, Token>,
@@ -197,11 +201,11 @@ pub(super) struct Search<'a> {
     total_in: BigUint,
 }
 
-impl<'a> Search<'a> {
+impl<'a> ReplacementSearcher<'a> {
     /// Prepares a search of `original` on `snapshot`. `None` when the route cannot be searched:
     /// it has no swaps, it starts and ends on one token, or it uses no gas.
     pub(super) fn new(
-        snapshot: Snapshot,
+        snapshot: ReplacementSnapshot,
         request: &PostProcessRequest<'_>,
         original: &'a RouteResult,
     ) -> Option<Self> {
@@ -213,7 +217,7 @@ impl<'a> Search<'a> {
         let pricing = GasPricing::of(original, &output_token)?;
         Some(Self {
             original,
-            rfq: snapshot.rfq,
+            swaps: snapshot.swaps,
             deadline: request.deadline(),
             pricing,
             tokens: snapshot.tokens,
@@ -236,7 +240,7 @@ impl<'a> Search<'a> {
             if self.deadline_passed() {
                 break;
             }
-            let Some(candidate) = self.best_candidate(&swaps, &net_amount_out) else {
+            let Some(candidate) = self.best_route(&swaps, &net_amount_out) else {
                 break;
             };
             net_amount_out = candidate.net_amount_out.clone();
@@ -271,31 +275,33 @@ impl<'a> Search<'a> {
 
     /// The candidate with the highest net amount out, if it beats `current_net`. Stops at the
     /// deadline with the best so far.
-    fn best_candidate(&mut self, swaps: &[Swap], current_net: &BigInt) -> Option<Candidate> {
-        let mut best: Option<Candidate> = None;
+    fn best_route(&mut self, route_swaps: &[Swap], current_net: &BigInt) -> Option<CandidateRoute> {
+        let mut best: Option<CandidateRoute> = None;
         let mut best_net = current_net.clone();
-        for target in build_targets(swaps) {
-            for position in 0..self.rfq.len() {
-                if !super::rfq::fits(&self.rfq[position], &target, swaps, &self.input_token) {
+        for target in build_targets(route_swaps) {
+            for position in 0..self.swaps.len() {
+                if !super::rfq::fits(&self.swaps[position], &target, route_swaps, &self.input_token)
+                {
                     continue;
                 }
                 if self.deadline_passed() {
                     return best;
                 }
-                self.rfq[position].retarget(
+                self.swaps[position].retarget(
                     target.token_in.clone(),
                     target.token_out.clone(),
                     target.split,
                 );
-                let rfq = &self.rfq[position];
-                let Some((simulated, net_amount_out)) = self.evaluate(swaps, &target, rfq) else {
+                let swap = &self.swaps[position];
+                let Some((simulated, net_amount_out)) = self.evaluate(route_swaps, &target, swap)
+                else {
                     continue;
                 };
                 if net_amount_out > best_net {
                     best_net = net_amount_out.clone();
-                    best = Some(Candidate {
+                    best = Some(CandidateRoute {
                         target: target.clone(),
-                        rfq: rfq.clone(),
+                        swap: swap.clone(),
                         simulated,
                         net_amount_out,
                     });
@@ -305,20 +311,20 @@ impl<'a> Search<'a> {
         best
     }
 
-    /// Simulates the route with `rfq` in place of the target swaps.
+    /// Simulates the route with `swap` in place of the target route_swaps.
     /// `None` when a swap simulation fails.
     fn evaluate(
         &self,
-        swaps: &[Swap],
-        target: &Target,
-        rfq: &Swap,
+        route_swaps: &[Swap],
+        target: &ReplacementTarget,
+        swap: &Swap,
     ) -> Option<(SimulatedRoute, BigInt)> {
-        let ordered = splice(swaps, &target.replaced, rfq);
+        let ordered = splice(route_swaps, &target.replaced, swap);
         let simulated = self
             .simulate(&ordered)
             .inspect_err(|error| {
                 trace!(
-                    component = rfq.component_id(),
+                    component = swap.component_id(),
                     %error,
                     "dropped RFQ candidate: route simulation failed"
                 );
@@ -344,52 +350,56 @@ impl<'a> Search<'a> {
         )
     }
 
-    /// The swaps after the replacement, with the amounts and gas of the simulation.
-    fn apply(&self, swaps: &[Swap], candidate: Candidate) -> Vec<Swap> {
-        let Candidate { target, rfq, simulated, .. } = candidate;
-        let ordered = splice(swaps, &target.replaced, &rfq);
+    /// The route_swaps after the replacement, with the amounts and gas of the simulation.
+    fn apply(&self, route_swaps: &[Swap], candidate: CandidateRoute) -> Vec<Swap> {
+        let CandidateRoute { target, swap, simulated, .. } = candidate;
+        let ordered = splice(route_swaps, &target.replaced, &swap);
         let mut replaced = Vec::with_capacity(ordered.len());
-        for (swap, simulated) in ordered.into_iter().zip(simulated.swaps) {
+        for (route_swap, simulated) in ordered.into_iter().zip(simulated.swaps) {
             replaced.push(
                 Swap::new(
-                    swap.component_id().to_string(),
-                    swap.protocol().to_string(),
-                    swap.token_in().clone(),
-                    swap.token_out().clone(),
+                    route_swap.component_id().to_string(),
+                    route_swap.protocol().to_string(),
+                    route_swap.token_in().clone(),
+                    route_swap.token_out().clone(),
                     simulated.amount_in,
                     simulated.amount_out,
                     simulated.gas,
-                    swap.protocol_component().clone(),
-                    swap.protocol_state().clone_box(),
+                    route_swap.protocol_component().clone(),
+                    route_swap.protocol_state().clone_box(),
                 )
-                .with_split(*swap.split()),
+                .with_split(*route_swap.split()),
             );
         }
         replaced
     }
 }
 
-/// Returns `swaps` with the positions in `replaced` removed and `rfq` inserted at the first
-/// removed position. The result keeps a topological order: `rfq` consumes only tokens that the
-/// swaps before it make.
-pub(super) fn splice<'a>(swaps: &'a [Swap], replaced: &[usize], rfq: &'a Swap) -> Vec<&'a Swap> {
+/// Returns `swaps` with the positions in `replaced` removed and `replacement` inserted at the first
+/// removed position. The result keeps a topological order: `replacement` consumes only tokens that
+/// the swaps before it make.
+pub(super) fn splice<'a>(
+    swaps: &'a [Swap],
+    replaced: &[usize],
+    replacement: &'a Swap,
+) -> Vec<&'a Swap> {
     let mut ordered = Vec::with_capacity(swaps.len());
-    for (position, swap) in swaps.iter().enumerate() {
+    for (position, route_swap) in swaps.iter().enumerate() {
         if replaced.first() == Some(&position) {
-            ordered.push(rfq);
+            ordered.push(replacement);
         }
         if !replaced.contains(&position) {
-            ordered.push(swap);
+            ordered.push(route_swap);
         }
     }
     ordered
 }
 
 /// Returns replacement targets for individual swaps, followed by targets for segments.
-pub(super) fn build_targets(swaps: &[Swap]) -> Vec<Target> {
+pub(super) fn build_targets(swaps: &[Swap]) -> Vec<ReplacementTarget> {
     let mut targets = Vec::new();
     for (position, swap) in swaps.iter().enumerate() {
-        targets.push(Target {
+        targets.push(ReplacementTarget {
             replaced: vec![position],
             token_in: swap.token_in().clone(),
             token_out: swap.token_out().clone(),
@@ -402,7 +412,7 @@ pub(super) fn build_targets(swaps: &[Swap]) -> Vec<Target> {
 
 /// One target for each pair of cut tokens with more than one swap in the segment between them.
 /// The pair of the order's input and output token covers the whole route.
-pub(super) fn build_segment_targets(swaps: &[Swap]) -> Vec<Target> {
+pub(super) fn build_segment_targets(swaps: &[Swap]) -> Vec<ReplacementTarget> {
     let cuts = find_cut_tokens(swaps);
     let forward: Vec<FxHashSet<Address>> = cuts
         .iter()
@@ -424,7 +434,7 @@ pub(super) fn build_segment_targets(swaps: &[Swap]) -> Vec<Target> {
                 .map(|(position, _)| position)
                 .collect();
             if replaced.len() > 1 {
-                targets.push(Target {
+                targets.push(ReplacementTarget {
                     replaced,
                     token_in: token_in.clone(),
                     token_out: token_out.clone(),
