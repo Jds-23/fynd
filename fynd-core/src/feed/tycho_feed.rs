@@ -21,23 +21,20 @@ use tycho_simulation::{
     },
     protocol::models::Update,
     rfq::stream::RFQStreamBuilder,
-    tycho_client::feed::{component_tracker::ComponentFilter, SynchronizerState},
+    tycho_client::feed::component_tracker::ComponentFilter,
     tycho_common::traits::TxDeltaIndexer,
     tycho_core::Bytes,
     utils::load_all_tokens,
 };
 
-use crate::{
-    feed::{
-        events::MarketEvent,
-        market_data::MarketData,
-        protocol_registry::{
-            has_rfq_protocols, has_tycho_protocols, open_price_level_stream, register_exchanges,
-            register_rfq,
-        },
-        DataFeedError, TychoFeedConfig,
+use crate::feed::{
+    events::MarketEvent,
+    market_data::MarketData,
+    protocol_registry::{
+        has_rfq_protocols, has_tycho_protocols, open_price_level_stream, register_exchanges,
+        register_rfq,
     },
-    types::BlockInfo,
+    DataFeedError, TychoFeedConfig,
 };
 
 /// The Tycho indexer that keeps market data synchronized.
@@ -601,23 +598,6 @@ impl TychoFeed {
         let maybe_new_tokens = added_components
             .values()
             .flat_map(|component| component.tokens.iter().cloned());
-        // TODO: how do we handle delayed and stale states? Should the feed or the solvers handle
-        // this?
-        let latest_block_info = sync_states
-            .values()
-            .filter_map(|status| {
-                if let SynchronizerState::Ready(header) = status {
-                    Some(BlockInfo::new(header.number, header.hash.to_string(), header.timestamp))
-                } else {
-                    None
-                }
-            })
-            .max_by_key(|b| b.number());
-        // Captured before `latest_block_info` moves into the `apply_block_update` closure below.
-        let latest_block_fields = latest_block_info
-            .as_ref()
-            .map(|block_info| (block_info.number(), block_info.timestamp()));
-
         info!(
             "received block/timestamp {} with {} new components, {} removed, {} updated",
             msg.block_number_or_timestamp,
@@ -630,6 +610,8 @@ impl TychoFeed {
         let update_start = Instant::now();
         let mut latest_component_count = 0;
         let mut token_count = 0;
+        let mut unsynced_protocol_count = 0;
+        let mut latest_block_fields = None;
         self.market_data
             .apply_block_update(new_block_number, |market_data| {
                 market_data.upsert_components(
@@ -660,16 +642,14 @@ impl TychoFeed {
                 market_data.remove_components(removed_components.keys());
                 market_data.upsert_tokens(maybe_new_tokens);
                 market_data.update_states(updated_or_new_states);
-                market_data.update_protocol_sync_status(sync_states);
-
-                // Update the last updated block info if one of the protocols reported "Ready"
-                // status.
-                if let Some(block_info) = latest_block_info {
-                    market_data.update_last_updated(block_info);
-                }
+                market_data.update_sync_status(sync_states, self.config.max_sync_lag);
 
                 latest_component_count = market_data.component_count();
                 token_count = market_data.token_count();
+                unsynced_protocol_count = market_data.unsynced_protocols().len();
+                latest_block_fields = market_data
+                    .last_updated()
+                    .map(|block_info| (block_info.number(), block_info.timestamp()));
             })
             .instrument(span!(Level::DEBUG, "data_feed_write_lock"))
             .await;
@@ -680,6 +660,7 @@ impl TychoFeed {
         // dashboards and alerts keep working.
         gauge!("market_pools").set(latest_component_count as f64);
         gauge!("market_tokens").set(token_count as f64);
+        gauge!("market_unsynced_protocols").set(unsynced_protocol_count as f64);
         if let Some((block_number, block_timestamp)) = latest_block_fields {
             gauge!("market_current_block").set(block_number as f64);
             gauge!("market_last_update_timestamp_seconds").set(block_timestamp as f64);
@@ -727,6 +708,7 @@ mod tests {
     use rustc_hash::FxHashMap;
     use tycho_simulation::{
         protocol::models::{ProtocolComponent, Update},
+        tycho_client::feed::{BlockHeader, SynchronizerState},
         tycho_common::{
             models::{token::Token, Chain},
             Bytes,
@@ -1360,6 +1342,50 @@ mod tests {
         }
     }
 
+    /// A `Delayed` protocol is measured against the newest `Ready` block in the same update.
+    #[tokio::test]
+    async fn test_handle_message_delayed_protocol() {
+        let market_data = new_shared_market_data();
+        let feed = TychoFeed::new(create_test_config(), market_data.clone());
+        let _event_rx = feed.subscribe();
+        let component_id = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let token1 = create_test_token("0x1111111111111111111111111111111111111111", "TKN1");
+        let token2 = create_test_token("0x2222222222222222222222222222222222222222", "TKN2");
+        let new_pairs = HashMap::from([(
+            component_id.to_string(),
+            create_test_component(component_id, vec![token1, token2]),
+        )]);
+        let sync_states = HashMap::from([
+            (
+                "uniswap_v2".to_string(),
+                SynchronizerState::Delayed(BlockHeader {
+                    number: 98,
+                    timestamp: 1176,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "uniswap_v3".to_string(),
+                SynchronizerState::Ready(BlockHeader {
+                    number: 100,
+                    timestamp: 1200,
+                    ..Default::default()
+                }),
+            ),
+        ]);
+        let update = Update::new(100, HashMap::new(), new_pairs).set_sync_states(sync_states);
+
+        feed.handle_tycho_message(update)
+            .await
+            .expect("message handled");
+
+        assert!(market_data
+            .read()
+            .await
+            .base_market_state()
+            .is_unsynced_pool(component_id));
+    }
+
     #[tokio::test]
     async fn test_handle_message_empty_update() {
         let config = create_test_config();
@@ -1539,12 +1565,12 @@ mod tests {
                     component_id.to_string(),
                     create_test_component(component_id, vec![token1, token2]),
                 );
-                // Ready sync state is required for `latest_block_fields` to be `Some`, which
-                // gates the `market_current_block`/`market_last_update_timestamp_seconds` gauges.
+                // A Ready sync state sets the last updated block, which the
+                // `market_current_block`/`market_last_update_timestamp_seconds` gauges report.
                 let mut sync_states = HashMap::new();
                 sync_states.insert(
                     "uniswap_v2".to_string(),
-                    SynchronizerState::Ready(tycho_simulation::tycho_client::feed::BlockHeader {
+                    SynchronizerState::Ready(BlockHeader {
                         number: block_number,
                         timestamp: block_timestamp,
                         ..Default::default()
