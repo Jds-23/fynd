@@ -14,11 +14,11 @@
 //! `MarketState` lock. This decouples overlay writes from base-state reads: a TychoFeed block
 //! update no longer stalls overlay registrations and vice versa.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{info, warn};
 use tycho_simulation::{
     tycho_client::feed::SynchronizerState,
     tycho_common::{
@@ -399,12 +399,18 @@ pub struct MarketState {
     /// Block info for the last update (only updated when protocols reported "Ready" status).
     /// None if no block has been processed yet.
     last_updated: Option<BlockInfo>,
+    /// Protocol systems excluded from routing because they are out of sync; see
+    /// [`MarketState::update_sync_status`].
+    unsynced_protocols: FxHashSet<String>,
+    /// The components of `unsynced_protocols`, shared with every request's [`RouteExclusions`].
+    unsynced_pools: Arc<FxHashSet<ComponentId>>,
     /// The components of each protocol system, maintained on upsert/remove so a quote that
     /// excludes a protocol names that system's pools without scanning the component map, and so
     /// the metrics sampler can count them without one either.
     components_by_protocol: FxHashMap<String, FxHashSet<ComponentId>>,
-    /// Changes only when a component is added or removed, not when its state changes.
-    component_generation: u64,
+    /// Changes when a component is added or removed or `unsynced_protocols` changes, the two
+    /// things a resolved [`RouteExclusions`] depends on. Not when a component's state changes.
+    exclusion_generation: u64,
 }
 
 impl MarketState {
@@ -430,7 +436,11 @@ impl MarketState {
                 );
             }
         }
-        RouteExclusions { pools, tokens: filter.excluded_tokens().clone() }
+        RouteExclusions {
+            pools,
+            tokens: filter.excluded_tokens().clone(),
+            unsynced_pools: Arc::clone(&self.unsynced_pools),
+        }
     }
 
     /// Creates a new empty MarketState.
@@ -443,8 +453,10 @@ impl MarketState {
             gas_price: None,
             protocol_sync_status: FxHashMap::default(),
             last_updated: None,
+            unsynced_protocols: FxHashSet::default(),
+            unsynced_pools: Arc::default(),
             components_by_protocol: FxHashMap::default(),
-            component_generation: 0,
+            exclusion_generation: 0,
         }
     }
 
@@ -453,9 +465,21 @@ impl MarketState {
         &self.label
     }
 
-    /// Returns the generation of the component membership index.
-    pub fn component_generation(&self) -> u64 {
-        self.component_generation
+    /// Returns the generation of what route exclusions depend on: the component set and the
+    /// unsynced protocols.
+    pub fn exclusion_generation(&self) -> u64 {
+        self.exclusion_generation
+    }
+
+    /// Returns the protocol systems excluded from routing because they are out of sync.
+    pub fn unsynced_protocols(&self) -> &FxHashSet<String> {
+        &self.unsynced_protocols
+    }
+
+    /// Whether this component's protocol is out of sync and so excluded from routing.
+    pub fn is_unsynced_pool(&self, component_id: &str) -> bool {
+        self.unsynced_pools
+            .contains(component_id)
     }
 
     /// Returns the block info for the last update.
@@ -565,13 +589,19 @@ impl MarketState {
                 .contains_key(&component_id);
             self.components
                 .insert(component_id.clone(), Arc::new(component));
+            if is_new &&
+                self.unsynced_protocols
+                    .contains(&protocol_system)
+            {
+                Arc::make_mut(&mut self.unsynced_pools).insert(component_id.clone());
+            }
             self.components_by_protocol
                 .entry(protocol_system)
                 .or_default()
                 .insert(component_id);
             if is_new {
-                self.component_generation = self
-                    .component_generation
+                self.exclusion_generation = self
+                    .exclusion_generation
                     .wrapping_add(1);
             }
         }
@@ -585,24 +615,104 @@ impl MarketState {
         }
     }
 
-    /// Updates the protocol sync status.
-    pub fn update_protocol_sync_status(
+    /// Applies the sync status Tycho reports for each protocol, then recomputes which protocols
+    /// are out of sync. Does nothing for an update that carries no sync status, such as an RFQ or
+    /// price level update.
+    ///
+    /// The newest `Ready` block in the update becomes the last updated block. A protocol is out
+    /// of sync when Tycho reports it `Stale` or `Ended`, or `Delayed` with a block whose timestamp
+    /// is more than `max_sync_lag` behind the last updated block's. Its components are
+    /// excluded from routing until it is back in sync.
+    pub fn update_sync_status(
         &mut self,
         sync_states: impl IntoIterator<Item = (String, SynchronizerState)>,
+        max_sync_lag: Duration,
     ) {
+        let mut has_status = false;
+        let mut newest_ready: Option<BlockInfo> = None;
         for (protocol_system, status) in sync_states {
+            has_status = true;
+            if let SynchronizerState::Ready(header) = &status {
+                if newest_ready
+                    .as_ref()
+                    .is_none_or(|newest| header.number > newest.number())
+                {
+                    newest_ready = Some(BlockInfo::new(
+                        header.number,
+                        header.hash.to_string(),
+                        header.timestamp,
+                    ));
+                }
+            }
             self.protocol_sync_status
                 .insert(protocol_system, status);
         }
+        if !has_status {
+            return;
+        }
+        if let Some(block_info) = newest_ready {
+            self.last_updated = Some(block_info);
+        }
+        self.refresh_unsynced_protocols(max_sync_lag);
+    }
+
+    /// Recomputes which protocol systems are out of sync and which of their components are
+    /// excluded from routing.
+    fn refresh_unsynced_protocols(&mut self, max_sync_lag: Duration) {
+        let last_updated_timestamp = self
+            .last_updated
+            .as_ref()
+            .map(BlockInfo::timestamp);
+        let unsynced: FxHashSet<String> = self
+            .protocol_sync_status
+            .iter()
+            .filter(|(_, status)| is_unsynced(status, last_updated_timestamp, max_sync_lag))
+            .map(|(protocol_system, _)| protocol_system.clone())
+            .collect();
+        if unsynced == self.unsynced_protocols {
+            return;
+        }
+        for protocol_system in unsynced.difference(&self.unsynced_protocols) {
+            warn!(
+                protocol_system,
+                status = ?self.protocol_sync_status.get(protocol_system),
+                last_updated_timestamp,
+                pools = self
+                    .components_by_protocol(protocol_system)
+                    .count(),
+                "protocol out of sync, excluding its pools from routing"
+            );
+        }
+        for protocol_system in self
+            .unsynced_protocols
+            .difference(&unsynced)
+        {
+            info!(protocol_system, "protocol back in sync, routing through its pools again");
+        }
+        let mut unsynced_pools = FxHashSet::default();
+        for protocol_system in &unsynced {
+            unsynced_pools.extend(
+                self.components_by_protocol(protocol_system)
+                    .cloned(),
+            );
+        }
+        self.unsynced_protocols = unsynced;
+        self.unsynced_pools = Arc::new(unsynced_pools);
+        self.exclusion_generation = self
+            .exclusion_generation
+            .wrapping_add(1);
     }
 
     /// Removes a component.
     pub fn remove_components<'a>(&mut self, ids: impl IntoIterator<Item = &'a ComponentId>) {
         for id in ids {
             if let Some(component) = self.components.remove(id) {
-                self.component_generation = self
-                    .component_generation
+                self.exclusion_generation = self
+                    .exclusion_generation
                     .wrapping_add(1);
+                if self.unsynced_pools.contains(id) {
+                    Arc::make_mut(&mut self.unsynced_pools).remove(id);
+                }
                 if let Some(ids) = self
                     .components_by_protocol
                     .get_mut(&component.protocol_system)
@@ -629,11 +739,6 @@ impl MarketState {
         self.gas_price = Some(gas_price);
     }
 
-    /// Updates the last updated block info.
-    pub fn update_last_updated(&mut self, block_info: BlockInfo) {
-        self.last_updated = Some(block_info);
-    }
-
     /// Creates a filtered subset containing only data needed for the given components.
     ///
     /// This is used to create a local snapshot of market data that can be used for
@@ -642,6 +747,7 @@ impl MarketState {
     /// - Simulation states for those components (cloned via `clone_box`)
     /// - Tokens referenced by those components
     /// - Gas price and block info
+    /// - The unsynced protocols and their pools
     pub fn extract_subset(&self, component_ids: &FxHashSet<&ComponentId>) -> MarketState {
         let mut components =
             FxHashMap::with_capacity_and_hasher(component_ids.len(), rustc_hash::FxBuildHasher);
@@ -682,8 +788,10 @@ impl MarketState {
             gas_price: self.gas_price.clone(),
             protocol_sync_status: FxHashMap::default(), // Not needed for simulation
             last_updated: self.last_updated.clone(),
+            unsynced_protocols: self.unsynced_protocols.clone(),
+            unsynced_pools: Arc::clone(&self.unsynced_pools),
             components_by_protocol,
-            component_generation: self.component_generation,
+            exclusion_generation: self.exclusion_generation,
         }
     }
 
@@ -696,6 +804,23 @@ impl MarketState {
         self.simulation_states
             .extend(other.simulation_states);
         self.tokens.extend(other.tokens);
+    }
+}
+
+/// Whether `status` excludes a protocol from routing. See [`MarketState::update_sync_status`].
+fn is_unsynced(
+    status: &SynchronizerState,
+    last_updated_timestamp: Option<u64>,
+    max_sync_lag: Duration,
+) -> bool {
+    match status {
+        SynchronizerState::Started |
+        SynchronizerState::Ready(_) |
+        SynchronizerState::Advanced(_) => false,
+        SynchronizerState::Stale(_) | SynchronizerState::Ended(_) => true,
+        SynchronizerState::Delayed(header) => last_updated_timestamp.is_some_and(|last_updated| {
+            Duration::from_secs(last_updated.saturating_sub(header.timestamp)) > max_sync_lag
+        }),
     }
 }
 
@@ -716,11 +841,11 @@ fn index_by_protocol(
 #[cfg(test)]
 mod tests {
     use num_bigint::BigUint;
-    use tycho_simulation::tycho_ethereum::gas::GasPrice;
+    use tycho_simulation::{tycho_client::feed::BlockHeader, tycho_ethereum::gas::GasPrice};
 
     use super::*;
     use crate::algorithm::test_utils::{
-        component, component_with_protocol, token, MockProtocolSim,
+        component, component_with_protocol, set_last_updated_block, token, MockProtocolSim,
     };
 
     #[test]
@@ -852,7 +977,7 @@ mod tests {
             block_timestamp: 0,
             pricing: GasPrice::Legacy { gas_price: BigUint::from(1u64) },
         });
-        market.update_last_updated(BlockInfo::new(12345, "0xabc".to_string(), 0));
+        set_last_updated_block(&mut market, 12345, 0);
 
         // Extract only component_ab
         let component_ab = "component_ab".to_string();
@@ -896,6 +1021,119 @@ mod tests {
             .is_empty());
     }
 
+    const MAX_SYNC_LAG: Duration = Duration::from_secs(15);
+
+    /// A header on a chain with 12-second blocks.
+    fn header(number: u64) -> BlockHeader {
+        BlockHeader { number, timestamp: number * 12, ..Default::default() }
+    }
+
+    /// A market at block 100 with a `uniswap_v2` pool reporting `Ready` and a `uniswap_v3` pool
+    /// reporting `v3_status`, updated with `MAX_SYNC_LAG`.
+    fn market_with_v3_status(v3_status: SynchronizerState) -> MarketState {
+        let a = token(0x01, "A");
+        let b = token(0x02, "B");
+        let mut market = MarketState::new();
+        market.upsert_components([
+            component_with_protocol("v2_pool", "uniswap_v2", &[a.clone(), b.clone()]),
+            component_with_protocol("v3_pool", "uniswap_v3", &[a, b]),
+        ]);
+        market.update_sync_status(
+            [
+                ("uniswap_v2".to_string(), SynchronizerState::Ready(header(100))),
+                ("uniswap_v3".to_string(), v3_status),
+            ],
+            MAX_SYNC_LAG,
+        );
+        market
+    }
+
+    #[rstest::rstest]
+    #[case::ready(SynchronizerState::Ready(header(100)), false)]
+    #[case::started(SynchronizerState::Started, false)]
+    #[case::advanced(SynchronizerState::Advanced(header(101)), false)]
+    #[case::delayed_within_max_lag(SynchronizerState::Delayed(header(99)), false)]
+    #[case::delayed_beyond_max_lag(SynchronizerState::Delayed(header(98)), true)]
+    #[case::stale(SynchronizerState::Stale(header(99)), true)]
+    #[case::ended(SynchronizerState::Ended("closed".to_string()), true)]
+    fn test_update_sync_status(#[case] status: SynchronizerState, #[case] excluded: bool) {
+        let market = market_with_v3_status(status);
+
+        let exclusions = market.resolve_route_filter(&RouteExclusionFilter::default());
+        assert_eq!(exclusions.excludes_pool("v3_pool"), excluded);
+        assert_eq!(
+            market
+                .unsynced_protocols()
+                .contains("uniswap_v3"),
+            excluded
+        );
+        assert!(!exclusions.excludes_pool("v2_pool"));
+    }
+
+    /// RFQ and price level updates carry no sync status.
+    #[test]
+    fn test_update_sync_status_without_states() {
+        let mut market = market_with_v3_status(SynchronizerState::Stale(header(90)));
+        let generation = market.exclusion_generation();
+
+        market.update_sync_status([], MAX_SYNC_LAG);
+
+        assert!(market.is_unsynced_pool("v3_pool"));
+        assert_eq!(market.exclusion_generation(), generation);
+    }
+
+    #[test]
+    fn test_unsynced_protocol_recovery() {
+        let mut market = market_with_v3_status(SynchronizerState::Stale(header(90)));
+        let generation = market.exclusion_generation();
+
+        market.update_sync_status(
+            [("uniswap_v3".to_string(), SynchronizerState::Ready(header(100)))],
+            MAX_SYNC_LAG,
+        );
+
+        assert_ne!(market.exclusion_generation(), generation);
+        assert!(market
+            .resolve_route_filter(&RouteExclusionFilter::default())
+            .is_empty());
+    }
+
+    /// A stuck protocol keeps reporting the same `Delayed` header while the chain moves on.
+    #[test]
+    fn test_delayed_protocol_falling_behind() {
+        let mut market = market_with_v3_status(SynchronizerState::Delayed(header(99)));
+
+        market.update_sync_status(
+            [("uniswap_v2".to_string(), SynchronizerState::Ready(header(102)))],
+            MAX_SYNC_LAG,
+        );
+
+        assert!(market.is_unsynced_pool("v3_pool"));
+    }
+
+    #[test]
+    fn test_unsynced_pools_new_components() {
+        let mut market = market_with_v3_status(SynchronizerState::Stale(header(90)));
+        let tokens = [token(0x01, "A"), token(0x03, "C")];
+
+        market.upsert_components([
+            component_with_protocol("new_v3_pool", "uniswap_v3", &tokens),
+            component_with_protocol("new_v2_pool", "uniswap_v2", &tokens),
+        ]);
+
+        assert!(market.is_unsynced_pool("new_v3_pool"));
+        assert!(!market.is_unsynced_pool("new_v2_pool"));
+    }
+
+    #[test]
+    fn test_unsynced_pools_removed_component() {
+        let mut market = market_with_v3_status(SynchronizerState::Stale(header(90)));
+
+        market.remove_components(["v3_pool".to_string()].iter());
+
+        assert!(!market.is_unsynced_pool("v3_pool"));
+    }
+
     fn market_with_two_components() -> MarketState {
         let mut market = MarketState::new();
         let token_a = token(0x0A, "A");
@@ -916,7 +1154,7 @@ mod tests {
                 Box::new(MockProtocolSim::new(3.0)) as Box<dyn ProtocolSim>,
             ),
         ]);
-        market.update_last_updated(BlockInfo::new(12345, "0xabc".to_string(), 0));
+        set_last_updated_block(&mut market, 12345, 0);
         market
     }
 
@@ -1272,7 +1510,7 @@ mod tests {
 
         market_ref
             .apply_block_update(1, |data| {
-                data.update_last_updated(BlockInfo::new(1, "0xabc".to_string(), 0));
+                set_last_updated_block(data, 1, 0);
             })
             .await;
 

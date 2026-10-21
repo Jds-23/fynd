@@ -400,10 +400,24 @@ mod health_tracker_tests {
     async fn test_tycho_head_status() {
         let market_data = MarketData::new_shared();
         let timestamp = 1_700_000_000;
+        let head_hash = Bytes::from("0x1234abcd");
         market_data
             .write()
             .await
-            .update_last_updated(BlockInfo::new(42, "0xfull-head-hash".into(), timestamp));
+            .update_sync_status(
+                [(
+                    "uniswap_v2".to_string(),
+                    tycho_simulation::tycho_client::feed::SynchronizerState::Ready(
+                        tycho_simulation::tycho_client::feed::BlockHeader {
+                            number: 42,
+                            hash: head_hash.clone(),
+                            timestamp,
+                            ..Default::default()
+                        },
+                    ),
+                )],
+                std::time::Duration::ZERO,
+            );
         let tracker = test_tracker(market_data);
         let age_before = block_age_ms_at_time(timestamp, SystemTime::now());
         let status = tracker
@@ -413,7 +427,7 @@ mod health_tracker_tests {
         let age_after = block_age_ms_at_time(timestamp, SystemTime::now());
 
         assert_eq!(status.head.number(), 42);
-        assert_eq!(status.head.hash(), "0xfull-head-hash");
+        assert_eq!(status.head.hash(), head_hash.to_string());
         assert_eq!(status.head.timestamp(), timestamp);
         assert!(status.last_update_ms >= age_before);
         assert!(status.last_update_ms <= age_after);

@@ -1,11 +1,14 @@
 //! Shared test utilities for algorithm tests.
 
+use std::time::Duration;
+
 use chrono::NaiveDateTime;
 use num_bigint::BigUint;
 use num_rational::BigRational;
 use num_traits::{ToPrimitive, Zero};
 use rustc_hash::FxHashMap;
 use tycho_simulation::{
+    tycho_client::feed::{BlockHeader, SynchronizerState},
     tycho_core::{
         dto::ProtocolStateDelta,
         models::{protocol::ProtocolComponent, token::Token, Address, Chain},
@@ -25,8 +28,20 @@ use crate::{
     algorithm::most_liquid::DepthAndPrice,
     feed::market_data::{MarketData, MarketState},
     graph::{petgraph::PetgraphStableDiGraphManager, GraphManager, TopologyGraphManager},
-    types::{quote::OrderSide, BlockInfo, Order},
+    types::{quote::OrderSide, Order},
 };
+
+/// Sets the last updated block of `market` by reporting a `Ready` block for `test_protocol`, a
+/// protocol no test market holds a pool of.
+pub fn set_last_updated_block(market: &mut MarketState, number: u64, timestamp: u64) {
+    market.update_sync_status(
+        [(
+            "test_protocol".to_string(),
+            SynchronizerState::Ready(BlockHeader { number, timestamp, ..Default::default() }),
+        )],
+        Duration::ZERO,
+    );
+}
 
 /// Use amounts in wei scale (10^18) to exceed gas costs in tests.
 pub const ONE_ETH: u128 = 1_000_000_000_000_000_000;
@@ -559,7 +574,7 @@ pub fn setup_market_weighted_boxed(
         block_timestamp: 0,
         pricing: GasPrice::Legacy { gas_price: BigUint::from(100u64) },
     });
-    market.update_last_updated(BlockInfo::new(1, "0x00".into(), 0));
+    set_last_updated_block(&mut market, 1, 0);
 
     for (component_id, token_in, token_out, state) in components {
         let tokens = vec![token_in.clone(), token_out.clone()];
@@ -614,7 +629,7 @@ fn unweighted_market(components: Vec<(&str, &Token, &Token, Box<dyn ProtocolSim>
         block_timestamp: 0,
         pricing: GasPrice::Legacy { gas_price: BigUint::from(100u64) },
     });
-    market.update_last_updated(BlockInfo::new(1, "0x00".into(), 0));
+    set_last_updated_block(&mut market, 1, 0);
 
     for (component_id, token_in, token_out, state) in components {
         let tokens = vec![token_in.clone(), token_out.clone()];

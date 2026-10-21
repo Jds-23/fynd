@@ -897,11 +897,20 @@ mod tests {
             .market_data
             .write()
             .await
-            .update_last_updated(fynd_core::BlockInfo::new(
-                19_000_001,
-                "0xprices-head".to_string(),
-                1_700_000_000,
-            ));
+            .update_sync_status(
+                [(
+                    "uniswap_v2".to_string(),
+                    tycho_simulation::tycho_client::feed::SynchronizerState::Ready(
+                        tycho_simulation::tycho_client::feed::BlockHeader {
+                            number: 19_000_001,
+                            hash: Bytes::from("0x5eed"),
+                            timestamp: 1_700_000_000,
+                            ..Default::default()
+                        },
+                    ),
+                )],
+                std::time::Duration::ZERO,
+            );
     }
 
     #[cfg(feature = "experimental")]
@@ -1101,7 +1110,7 @@ mod tests {
 
         let tycho_status = &body["data_status"]["tycho"];
         assert_eq!(tycho_status["head"]["number"], 19_000_001);
-        assert_eq!(tycho_status["head"]["hash"], "0xprices-head");
+        assert_eq!(tycho_status["head"]["hash"], "0x5eed");
         assert_eq!(tycho_status["head"]["timestamp"], 1_700_000_000);
         let tycho_age = tycho_status["last_update_ms"]
             .as_u64()

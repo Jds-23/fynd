@@ -152,10 +152,14 @@ impl RouteExclusionFilter {
 ///
 /// A token here is excluded as an intermediate only: the order's own two tokens stay allowed,
 /// because every route touches them.
+///
+/// Every solve also excludes the pools of protocols the market marks out of sync; see
+/// [`MarketState::update_sync_status`](crate::feed::market_data::MarketState::update_sync_status).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RouteExclusions {
     pub(crate) pools: FxHashSet<ComponentId>,
     pub(crate) tokens: FxHashSet<Address>,
+    pub(crate) unsynced_pools: Arc<FxHashSet<ComponentId>>,
 }
 
 impl RouteExclusions {
@@ -184,13 +188,20 @@ impl RouteExclusions {
     /// Whether nothing is excluded.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.pools.is_empty() && self.tokens.is_empty()
+        self.pools.is_empty() && self.tokens.is_empty() && self.unsynced_pools.is_empty()
     }
 
     /// Whether this pool is excluded.
     #[must_use]
     pub fn excludes_pool(&self, component_id: &str) -> bool {
-        self.pools.contains(component_id)
+        self.pools.contains(component_id) || self.is_unsynced_pool(component_id)
+    }
+
+    /// Whether this pool belongs to a protocol the market marks out of sync.
+    #[must_use]
+    pub(crate) fn is_unsynced_pool(&self, component_id: &str) -> bool {
+        self.unsynced_pools
+            .contains(component_id)
     }
 
     /// Whether routes through this token are excluded.

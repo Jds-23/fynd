@@ -248,6 +248,14 @@ impl FyndRPCBuilder {
         self
     }
 
+    /// Sets how far, in block time, a protocol Tycho reports `Delayed` may lag the last updated
+    /// block before its pools are excluded from routing (default: [`defaults::MAX_SYNC_LAG`]). A
+    /// `Stale` or `Ended` protocol is excluded regardless.
+    pub fn max_sync_lag(mut self, lag: Duration) -> Self {
+        self.fynd_builder = self.fynd_builder.max_sync_lag(lag);
+        self
+    }
+
     /// Sets how far from the gas token the token pricing pass reaches. Leaving this unset keeps
     /// the computation's default.
     pub fn set_pricing_max_hops(mut self, max_hops: usize) -> Self {

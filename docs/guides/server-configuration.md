@@ -58,8 +58,8 @@ fynd serve \
 
 * RFQ protocols cannot run alone. At least one on-chain protocol is required.
 * When encoding is enabled (`encoding_options` in the quote request), `rfq:bebop`, `rfq:hashflow`, `rfq:native` and `rfq:liquorice` quotes require an additional round-trip to the RFQ provider to fetch a signed quote. This can add significant tail latency to solve times. If you are using these protocols, consider quoting first without encoding to evaluate the price, and only request encoding once you are confident the quote is worth executing. `rfq:metric` encodes locally and needs no such round-trip — its executor reads the on-chain oracle Metric updates every block.
-* Metric runs on Base, Robinhood and BSC only. Each entry also needs its executor on the chain: `rfq:metric` runs on Base and Robinhood, and `fallback:rfq:metric` on all three. BSC has only the fallback executor. Naming an entry where its executor is missing fails at startup rather than producing quotes that cannot be encoded.
-* Metric is reached by a different entry per chain: `pricelevelstream:metric` on Ethereum, `rfq:metric` or `fallback:rfq:metric` on Base, Robinhood and BSC. Each is gated on its own chains — the price level stream is Ethereum-only — so the two never serve the same deployment and cannot double-count the liquidity.
+* Metric runs on Base, Robinhood, BSC and Arbitrum only. Each entry also needs its executor on the chain: `rfq:metric` runs on Base, Robinhood and Arbitrum, and `fallback:rfq:metric` on Base, Robinhood and BSC. BSC has only the fallback executor and Arbitrum only the direct one. Naming an entry where its executor is missing fails at startup rather than producing quotes that cannot be encoded.
+* Metric is reached by a different entry per chain: `pricelevelstream:metric` on Ethereum, `rfq:metric` or `fallback:rfq:metric` on Base, Robinhood, BSC and Arbitrum. Each is gated on its own chains — the price level stream is Ethereum-only — so the two never serve the same deployment and cannot double-count the liquidity.
 
 **Environment variables:**
 
@@ -74,7 +74,7 @@ Serve a proprietary AMM from Titan's pAMM price level stream instead of simulati
 
 Name a venue with the `pricelevelstream:` prefix. The served venues are `fermiswap`, `kipseli`, `metric`, `bebop`, and `taurusfi`:
 
-The stream serves Ethereum only. On Base, Robinhood and BSC, Metric is reached through `rfq:metric` or `fallback:rfq:metric` instead — see [Including RFQ Protocols](#including-rfq-protocols).
+The stream serves Ethereum only. On Base, Robinhood, BSC and Arbitrum, Metric is reached through `rfq:metric` or `fallback:rfq:metric` instead — see [Including RFQ Protocols](#including-rfq-protocols).
 
 ```bash
 fynd serve \
@@ -142,6 +142,7 @@ Run `fynd serve --help` for the full list.
 | `--rpc-url`                        | `RPC_URL`             | `https://eth.llamarpc.com` | Node RPC endpoint for the target chain. Use a dedicated endpoint in production.                                                                                                                                |
 | `--tycho-url`                      | `TYCHO_URL`           | _(chain-specific)_         | Tycho URL. Defaults to the [Fynd hosted endpoint](https://docs.propellerheads.xyz/tycho/for-solvers/hosted-endpoints#tycho-fynd) for the selected chain.                                                       |
 | `--tycho-subscription-buffer-size` | `TYCHO_SUBSCRIPTION_BUFFER_SIZE` | _(unset; Tycho native default)_ | Number of delta messages buffered for each Tycho subscription. Leave unset to preserve Tycho's native default. |
+| `--max-sync-lag-secs`           | `MAX_SYNC_LAG_SECS` | `15`                      | Seconds of block time a protocol Tycho reports as `Delayed` may lag the newest block any protocol reported as `Ready` before its pools are excluded from routing. A protocol Tycho reports as `Stale` is excluded until it catches up; one reported as `Ended` stays excluded. |
 | `--chain`                          | —                     | `Ethereum`                 | Target chain                                                                                                                                                                                                   |
 | `--chains-config`                  | `TYCHO_CHAINS_CONFIG` | _(none)_                   | Path to the custom-chains `chains.yaml`. Required for a chain Tycho does not know as a built-in.                                                                                                              |
 | `-p, --protocols`                  | —                     | _(all on-chain)_           | Protocols to index (comma-separated). If omitted, all on-chain protocols available on your configured Tycho endpoint are fetched. Use `all_onchain` to combine auto-fetched protocols with explicit entries (e.g. `all_onchain,rfq:bebop`), and the `exclude:` prefix to drop one (e.g. `all_onchain,exclude:vm:fermiswap`). |

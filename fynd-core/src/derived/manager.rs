@@ -695,10 +695,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        algorithm::test_utils::{component, setup_market_weighted, token, MockProtocolSim},
+        algorithm::test_utils::{
+            component, set_last_updated_block, setup_market_weighted, token, MockProtocolSim,
+        },
         derived::computation::{ComputationOutput, FailedItem, FailedItemError},
         feed::market_data::{MarketData, MarketState},
-        types::BlockInfo,
     };
 
     /// Drains all currently-pending events from a broadcast receiver into a Vec.
@@ -1442,7 +1443,7 @@ mod tests {
         let component = component("component", &[eth.clone(), usdc.clone()]);
 
         let mut market = MarketState::new();
-        market.update_last_updated(BlockInfo::new(10, "0xhash".into(), 0));
+        set_last_updated_block(&mut market, 10, 0);
         market.upsert_components(std::iter::once(component));
         market.upsert_tokens([eth, usdc]);
         MarketData::new(std::sync::Arc::new(tokio::sync::RwLock::new(market)))
@@ -1459,7 +1460,7 @@ mod tests {
         let component2 = component("eth_dai", &[eth.clone(), dai.clone()]);
 
         let mut market = MarketState::new();
-        market.update_last_updated(BlockInfo::new(10, "0xhash".into(), 0));
+        set_last_updated_block(&mut market, 10, 0);
         market.upsert_components([component1, component2]);
         // Only component1 has simulation state; component2 intentionally has none
         market
