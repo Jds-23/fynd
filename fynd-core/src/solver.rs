@@ -79,9 +79,9 @@ pub mod defaults {
     /// Multiplier applied to a component's (liquidity pool's) TVL when estimating available
     /// liquidity.
     pub const TVL_BUFFER_RATIO: f64 = 1.1;
-    /// How far, in block time, a protocol Tycho reports `Delayed` may lag the last updated block
-    /// before its pools are excluded from routing. A `Stale` or `Ended` protocol is excluded
-    /// regardless.
+    /// Default maximum lag for a protocol Tycho reports as `Delayed`. Once its latest block's
+    /// timestamp is more than this far behind the last updated block's, its pools are excluded
+    /// from routing. `Stale` and `Ended` protocols are excluded regardless.
     pub const MAX_SYNC_LAG: Duration = Duration::from_secs(15);
     /// How often the gas price is refreshed from the RPC node.
     pub const GAS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
