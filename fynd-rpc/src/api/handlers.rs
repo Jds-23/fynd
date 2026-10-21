@@ -231,6 +231,10 @@ pub async fn health(state: web::Data<AppState>) -> HttpResponse {
 }
 
 /// GET /v1/info - Return static metadata about this Fynd instance.
+///
+/// `jit_router_address` is reported only on a request the authenticating proxy marks with
+/// `x-jit-router: true`, so a caller learns before quoting whether its swaps go to the
+/// FyndJITRouter and which spender to approve.
 #[utoipa::path(
     get,
     path = "/v1/info",
@@ -239,7 +243,17 @@ pub async fn health(state: web::Data<AppState>) -> HttpResponse {
         (status = 200, description = "Instance info", body = dto::InstanceInfo),
     )
 )]
-pub async fn info(state: web::Data<AppState>) -> HttpResponse {
+pub async fn info(state: web::Data<AppState>, http_request: HttpRequest) -> HttpResponse {
+    let jit_router_address = if jit_router::from_headers(http_request.headers()) {
+        state
+            .worker_router()
+            .encoder()
+            .jit_router_address()
+            .cloned()
+            .map(Into::into)
+    } else {
+        None
+    };
     let body = dto::InstanceInfo::builder(
         state.chain_id(),
         state
@@ -248,14 +262,7 @@ pub async fn info(state: web::Data<AppState>) -> HttpResponse {
             .map(Into::into),
         state.permit2_address().clone().into(),
     )
-    .jit_router_address(
-        state
-            .worker_router()
-            .encoder()
-            .jit_router_address()
-            .cloned()
-            .map(Into::into),
-    )
+    .jit_router_address(jit_router_address)
     .version(env!("CARGO_PKG_VERSION"))
     .build();
     HttpResponse::Ok().json(body)
@@ -1862,9 +1869,14 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn test_info_reports_jit_router_address() {
-        for jit_router in [Some(jit_router_address()), None] {
-            let state = make_test_state_with(None, jit_router.clone());
+    async fn test_info_reports_jit_router_address_only_with_the_header() {
+        let cases = [
+            (Some(jit_router_address()), true, Some(jit_router_address())),
+            (Some(jit_router_address()), false, None),
+            (None, true, None),
+        ];
+        for (configured, header, expected) in cases {
+            let state = make_test_state_with(None, configured);
             let app = test::init_service(
                 App::new()
                     .app_data(web::Data::new(state))
@@ -1872,12 +1884,14 @@ mod tests {
             )
             .await;
 
-            let req = test::TestRequest::get()
-                .uri("/v1/info")
-                .to_request();
-            let body: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+            let mut req = test::TestRequest::get().uri("/v1/info");
+            if header {
+                req = req.insert_header(("x-jit-router", "true"));
+            }
+            let body: serde_json::Value =
+                test::call_and_read_body_json(&app, req.to_request()).await;
 
-            let expected = jit_router.map(|address| format!("0x{}", hex::encode(address)));
+            let expected = expected.map(|address| format!("0x{}", hex::encode(address)));
             assert_eq!(
                 body["jit_router_address"]
                     .as_str()

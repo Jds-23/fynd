@@ -1098,7 +1098,8 @@ where
     /// Build an unsigned EIP-1559 `approve(spender, amount)` transaction for the given token,
     /// or `None` if the allowance is already sufficient.
     ///
-    /// 1. Calls [`info()`](Self::info) to resolve the spender address from `params.transfer_type`.
+    /// 1. Calls [`info()`](Self::info) to resolve the spender address from `params.transfer_type`:
+    ///    the `FyndJITRouter` when the server reports one for this API key, else the router.
     /// 2. If `params.allowance_check` is [`AllowanceCheck::AtLeast`], checks the current ERC-20
     ///    allowance and returns `None` if it meets the threshold (skipping nonce and fee
     ///    resolution). With [`AllowanceCheck::Skip`] the check is skipped and the approval payload
@@ -1118,13 +1119,16 @@ where
         let info = self.info().await?;
         let spender_addr = match params.transfer_type {
             UserTransferType::TransferFrom => {
-                let router_address = info.router_address().ok_or_else(|| {
-                    FyndError::Config(
-                        "server has no router_address; encoding is unavailable on this chain"
-                            .into(),
-                    )
-                })?;
-                mapping::bytes_to_alloy_address(router_address)?
+                let spender = info
+                    .jit_router_address()
+                    .or(info.router_address())
+                    .ok_or_else(|| {
+                        FyndError::Config(
+                            "server has no router_address; encoding is unavailable on this chain"
+                                .into(),
+                        )
+                    })?;
+                mapping::bytes_to_alloy_address(spender)?
             }
             UserTransferType::TransferFromPermit2 => {
                 mapping::bytes_to_alloy_address(info.permit2_address())?

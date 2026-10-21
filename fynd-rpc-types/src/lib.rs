@@ -1361,9 +1361,10 @@ pub struct InstanceInfo {
     )]
     router_address: Option<Bytes>,
     /// Address of the chain's `FyndJITRouter`, which fronts the Tycho router with the same
-    /// entrypoints; `null` when this deployment has none. A quote the authenticating proxy
-    /// routes through it carries this address as `transaction.to`, and it is the spender to
-    /// approve for such swaps.
+    /// entrypoints. Reported only to a caller whose API key is enrolled for it; `null`
+    /// otherwise, and where this deployment has none. An enrolled caller's quotes carry this
+    /// address as `transaction.to` (vault-funded swaps excepted), so it is the spender to
+    /// approve, and the Permit2 `spender`, for such swaps.
     #[serde(default)]
     #[cfg_attr(
         feature = "openapi",

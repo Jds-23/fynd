@@ -232,9 +232,9 @@ export interface InstanceInfo {
   /** Tycho Router contract address, or `null` on a quote-only chain. */
   routerAddress: Address | null;
   /**
-   * `FyndJITRouter` contract address, or `null` when the server has none. A quote the server
-   * routes through it carries this address as `transaction.to`, and it is the spender to approve
-   * for such swaps.
+   * `FyndJITRouter` contract address, reported only when this client's API key is enrolled for
+   * it; `null` otherwise. An enrolled client's quotes carry it as `transaction.to` (vault-funded
+   * swaps excepted), so `approval()` uses it as the spender and a Permit2 `spender` must name it.
    */
   jitRouterAddress: Address | null;
   permit2Address: Address;

@@ -386,7 +386,7 @@ impl Encoder {
             )));
         };
         if encoding_options.jit_router() {
-            self.check_jit_router_encoding(&encoding_options)?;
+            self.check_jit_router_encoding()?;
         }
 
         let slippage = encoding_options.slippage();
@@ -873,8 +873,13 @@ impl Encoder {
 
         let value =
             if token_in == router_eth { solution.amount_in().clone() } else { BigUint::ZERO };
+        // FyndJITRouter has no vault entrypoints: a vault-funded swap keeps going to the router.
         let to = match (&self.jit_router_address, encoding_options.jit_router()) {
-            (Some(jit_router), true) => jit_router.clone(),
+            (Some(jit_router), true)
+                if encoding_options.transfer_type() != &UserTransferType::UseVaultsFunds =>
+            {
+                jit_router.clone()
+            }
             (_, _) => encoded_solution
                 .interacting_with()
                 .clone(),
@@ -890,25 +895,14 @@ impl Encoder {
         Ok((transaction, fee_breakdown))
     }
 
-    /// Rejects a FyndJITRouter request this deployment cannot serve: no FyndJITRouter is
-    /// configured, or the swap is vault-funded. FyndJITRouter has no vault entrypoints, and the
-    /// vault balance the router would debit is FyndJITRouter's, not the user's.
-    fn check_jit_router_encoding(
-        &self,
-        encoding_options: &EncodingOptions,
-    ) -> Result<(), SolveError> {
+    /// Rejects a FyndJITRouter request when this deployment has no FyndJITRouter configured.
+    fn check_jit_router_encoding(&self) -> Result<(), SolveError> {
         if self.jit_router_address.is_none() {
             return Err(SolveError::EncodingUnavailable(format!(
                 "FyndJITRouter encoding is unavailable on chain '{}': no FyndJITRouter address \
                  is configured (--jit-router-address)",
                 self.chain
             )));
-        }
-        if encoding_options.transfer_type() == &UserTransferType::UseVaultsFunds {
-            return Err(SolveError::FailedEncoding(
-                "vault-funded swaps cannot go through FyndJITRouter: it has no vault entrypoints"
-                    .to_string(),
-            ));
         }
         Ok(())
     }
@@ -1704,7 +1698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_encode_jit_router_rejects_vault_funding() {
+    async fn test_encode_jit_router_keeps_vault_funded_swaps_on_the_router() {
         let encoder = real_encoder()
             .with_jit_router(jit_router())
             .unwrap();
@@ -1716,9 +1710,12 @@ mod tests {
 
         let result = encoder
             .encode(vec![quote], options)
-            .await;
+            .await
+            .unwrap();
 
-        assert!(matches!(result, Err(SolveError::FailedEncoding(_))), "{result:?}");
+        let tx = result[0].transaction().unwrap();
+        assert_eq!(tx.to(), encoder.router_address().unwrap());
+        assert!(tx.data().len() > 4);
     }
 
     #[test]

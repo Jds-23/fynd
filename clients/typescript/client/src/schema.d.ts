@@ -31,7 +31,12 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** GET /v1/info - Return static metadata about this Fynd instance. */
+        /**
+         * GET /v1/info - Return static metadata about this Fynd instance.
+         * @description `jit_router_address` is reported only on a request the authenticating proxy marks with
+         *     `x-jit-router: true`, so a caller learns before quoting whether its swaps go to the
+         *     FyndJITRouter and which spender to approve.
+         */
         get: operations["info"];
         put?: never;
         post?: never;
@@ -403,9 +408,10 @@ export interface components {
             chain_id: number;
             /**
              * @description Address of the chain's `FyndJITRouter`, which fronts the Tycho router with the same
-             *     entrypoints; `null` when this deployment has none. A quote the authenticating proxy
-             *     routes through it carries this address as `transaction.to`, and it is the spender to
-             *     approve for such swaps.
+             *     entrypoints. Reported only to a caller whose API key is enrolled for it; `null`
+             *     otherwise, and where this deployment has none. An enrolled caller's quotes carry this
+             *     address as `transaction.to` (vault-funded swaps excepted), so it is the spender to
+             *     approve, and the Permit2 `spender`, for such swaps.
              * @example 0xDAa2Fe509DE861D53e81940fDb8353B33126c930
              */
             jit_router_address?: string | null;
