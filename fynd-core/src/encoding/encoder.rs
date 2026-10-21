@@ -186,8 +186,8 @@ fn slippage_bps(slippage: f64) -> u32 {
         .clamp(0.0, 10_000.0) as u32
 }
 
-/// Returns the name of the first field other than the amounts out where `hooked` differs from
-/// `original`.
+/// Returns the name of the first field other than `expected_amount_out` where `hooked` differs
+/// from `original`.
 fn changed_solution_field(original: &Solution, hooked: &Solution) -> Option<&'static str> {
     let unchanged = [
         ("sender", original.sender() == hooked.sender()),
@@ -195,6 +195,7 @@ fn changed_solution_field(original: &Solution, hooked: &Solution) -> Option<&'st
         ("token_in", original.token_in() == hooked.token_in()),
         ("token_out", original.token_out() == hooked.token_out()),
         ("amount_in", original.amount_in() == hooked.amount_in()),
+        ("min_amount_out", original.min_amount_out() == hooked.min_amount_out()),
         ("user_transfer_type", original.user_transfer_type() == hooked.user_transfer_type()),
         ("origin", original.origin() == hooked.origin()),
         ("swaps", same_swaps(original.swaps(), hooked.swaps())),
@@ -507,45 +508,35 @@ impl Encoder {
                 solution
             }
         };
-        let (solution, fee_breakdown) = match encoding_options.solution_hook() {
-            Some(hook) => Self::apply_solution_hook(hook, quote, solution, fee_breakdown)?,
-            None => (solution, fee_breakdown),
+        let solution = match encoding_options.solution_hook() {
+            Some(hook) => Self::apply_solution_hook(hook, quote, solution)?,
+            None => solution,
         };
         Ok(PreparedSolution { solution, fee_breakdown, fee_rates })
     }
 
-    /// Runs `hook` and checks the `Solution` it returns: only its amounts out may change, and
-    /// `min_amount_out` must be nonzero and at most `expected_amount_out`. The returned fee
-    /// breakdown reports the hooked `min_amount_out`, which the calldata carries.
+    /// Runs `hook` and checks the `Solution` it returns: only `expected_amount_out` may change, and
+    /// it must stay at or above `min_amount_out`.
     fn apply_solution_hook(
         hook: &dyn SolutionHook,
         quote: &OrderQuote,
         solution: Solution,
-        fee_breakdown: FeeBreakdown,
-    ) -> Result<(Solution, FeeBreakdown), SolveError> {
+    ) -> Result<Solution, SolveError> {
         let hooked = hook.apply(quote, solution.clone())?;
-        Self::check_min_amount_out(hooked.min_amount_out())?;
-        if hooked.min_amount_out() > hooked.expected_amount_out() {
-            return Err(SolveError::FailedEncoding(format!(
-                "the solution hook set min_amount_out {} above expected_amount_out {}; the router \
-                 rejects it",
-                hooked.min_amount_out(),
-                hooked.expected_amount_out()
-            )));
-        }
         if let Some(field) = changed_solution_field(&solution, &hooked) {
             return Err(SolveError::FailedEncoding(format!(
-                "the solution hook changed {field}; it may change only expected_amount_out and \
-                 min_amount_out"
+                "the solution hook changed {field}; it may change only expected_amount_out"
             )));
         }
-        let fee_breakdown = FeeBreakdown::new(
-            fee_breakdown.router_fee().clone(),
-            fee_breakdown.client_fee().clone(),
-            fee_breakdown.max_slippage().clone(),
-            hooked.min_amount_out().clone(),
-        );
-        Ok((hooked, fee_breakdown))
+        if hooked.expected_amount_out() < hooked.min_amount_out() {
+            return Err(SolveError::FailedEncoding(format!(
+                "the solution hook set expected_amount_out {} below min_amount_out {}; the router \
+                 rejects it",
+                hooked.expected_amount_out(),
+                hooked.min_amount_out()
+            )));
+        }
+        Ok(hooked)
     }
 
     /// Builds the router call for one encoded solution and writes its transaction, gas estimate,
@@ -2771,20 +2762,32 @@ mod tests {
         }
     }
 
-    /// Replaces the solution's amounts out.
+    /// Replaces the solution's expected amount out.
     #[derive(Debug)]
-    struct SetAmountsOut {
-        expected: BigUint,
-        min: BigUint,
-    }
+    struct SetExpectedAmountOut(BigUint);
 
-    impl SolutionHook for SetAmountsOut {
+    impl SolutionHook for SetExpectedAmountOut {
         fn apply(&self, _quote: &OrderQuote, solution: Solution) -> Result<Solution, SolveError> {
             Ok(rebuilt_solution(
                 &solution,
                 solution.receiver().clone(),
-                self.expected.clone(),
-                self.min.clone(),
+                self.0.clone(),
+                solution.min_amount_out().clone(),
+            ))
+        }
+    }
+
+    /// Replaces the solution's minimum amount out.
+    #[derive(Debug)]
+    struct SetMinAmountOut(BigUint);
+
+    impl SolutionHook for SetMinAmountOut {
+        fn apply(&self, _quote: &OrderQuote, solution: Solution) -> Result<Solution, SolveError> {
+            Ok(rebuilt_solution(
+                &solution,
+                solution.receiver().clone(),
+                solution.expected_amount_out().clone(),
+                self.0.clone(),
             ))
         }
     }
@@ -2875,11 +2878,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_solution_hook_changes_amounts() {
+    async fn test_solution_hook_changes_expected_amount_out() {
         let encoder = real_encoder();
         let quote = make_order_quote(990)
             .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let hook = SetAmountsOut { expected: BigUint::from(1_500u64), min: BigUint::from(900u64) };
+        let hook = SetExpectedAmountOut(BigUint::from(1_500u64));
         let opts = EncodingOptions::new(0.01)
             .with_client_fee_params(make_client_fee(100))
             .with_solution_hook(Arc::new(hook));
@@ -2895,14 +2898,12 @@ mod tests {
             <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
         assert_eq!(expected_amount_out, U256::from(1_500u64));
         assert_eq!(*result[0].amount_out(), BigUint::from(1_500u64));
-        assert_eq!(min_amount_out, U256::from(900u64));
-        assert_eq!(
-            *result[0]
-                .fee_breakdown()
-                .unwrap()
-                .min_amount_received(),
-            BigUint::from(900u64)
-        );
+        let min_amount_received = result[0]
+            .fee_breakdown()
+            .unwrap()
+            .min_amount_received();
+        assert_eq!(min_amount_out, biguint_to_u256(min_amount_received));
+        assert!(*min_amount_received < BigUint::from(990u64));
     }
 
     #[tokio::test]
@@ -2938,14 +2939,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case::zero_min(Arc::new(SetAmountsOut {
-        expected: BigUint::from(990u64),
-        min: BigUint::ZERO,
-    }))]
-    #[case::min_above_expected(Arc::new(SetAmountsOut {
-        expected: BigUint::from(900u64),
-        min: BigUint::from(901u64),
-    }))]
+    #[case::changed_min(Arc::new(SetMinAmountOut(BigUint::from(1u64))))]
+    #[case::expected_below_min(Arc::new(SetExpectedAmountOut(BigUint::from(1u64))))]
     #[case::changed_receiver(Arc::new(SetReceiver(Bytes::from(make_address(0xCC).as_ref()))))]
     #[tokio::test]
     async fn test_solution_hook_invalid_output(#[case] hook: Arc<dyn SolutionHook>) {
@@ -2971,10 +2966,7 @@ mod tests {
         let encoder = real_encoder().with_disable_slippage_taking_signer(signer);
         let quote = make_order_quote(1_000_000_000)
             .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let hook = SetAmountsOut {
-            expected: BigUint::from(1_500_000_000u64),
-            min: BigUint::from(900_000_000u64),
-        };
+        let hook = SetExpectedAmountOut(BigUint::from(1_500_000_000u64));
         let opts = EncodingOptions::new(0.01)
             .with_disable_slippage_taking(true)
             .with_solution_hook(Arc::new(hook));

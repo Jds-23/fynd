@@ -27,15 +27,14 @@ use crate::{OrderQuote, SolveError};
 /// Adjusts the tycho `Solution` built for a quote, just before it is encoded.
 ///
 /// It receives the `Solution` with the fee-adjusted `min_amount_out` already set. The router call
-/// reads its amounts from the returned `Solution`, so a changed `expected_amount_out` or
-/// `min_amount_out` reaches the calldata.
+/// reads `expected_amount_out` from the returned `Solution`.
 ///
-/// The hook may change only `expected_amount_out` and `min_amount_out`. Any other change, a zero
-/// `min_amount_out`, or a `min_amount_out` above `expected_amount_out` fails the quote.
+/// The hook may change only `expected_amount_out`, and not below `min_amount_out`. Any other
+/// change fails the quote.
 ///
-/// The quote reports the hooked `expected_amount_out` as `amount_out`, moves `amount_out_net_gas`
-/// by the same difference, and reports the hooked `min_amount_out` as the fee breakdown's
-/// `min_amount_received`. The per-swap amounts of the route stay route-only.
+/// The quote reports the hooked `expected_amount_out` as `amount_out` and moves
+/// `amount_out_net_gas` by the same difference. The fee breakdown and the per-swap amounts of the
+/// route stay as computed before the hook.
 pub trait SolutionHook: Debug + Send + Sync + RefUnwindSafe {
     /// Returns the `Solution` to encode for `quote`.
     ///
