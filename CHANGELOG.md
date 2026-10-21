@@ -1,4 +1,32 @@
 
+## [0.114.1](https://github.com/propeller-heads/fynd/compare/0.113.0...0.114.1) (2026-10-21)
+
+### Features
+
+* migrate to Tycho 0.472.1 book feeds ([d76e16f](https://github.com/propeller-heads/fynd/commit/d76e16feae33718fbe1f42b15af75a5a9be4e5ac))
+* Exclude out-of-sync protocols from routing ([16111b5](https://github.com/propeller-heads/fynd/commit/16111b5dda72d115148871cc305873320476cd86))
+* **metrics:** export the RFQ signed quote deviation as a histogram ([fa8bd5b](https://github.com/propeller-heads/fynd/commit/fa8bd5b5a198e1ee6f6ab39fec06845a80a982bb))
+* **core:** serve Metric on Arbitrum ([22d9b7f](https://github.com/propeller-heads/fynd/commit/22d9b7f10b0d326dd39a5c8e20b7e6663a944a5c))
+
+### Bug Fixes
+
+* use default Hashflow book polling ([a8545b8](https://github.com/propeller-heads/fynd/commit/a8545b88233f27c150d226e98d1df276bcc7c353))
+
+
+## [0.114.0](https://github.com/propeller-heads/fynd/compare/0.113.0...0.114.0) (2026-10-21)
+
+### Features
+
+* migrate to Tycho 0.472.1 book feeds ([d76e16f](https://github.com/propeller-heads/fynd/commit/d76e16feae33718fbe1f42b15af75a5a9be4e5ac))
+* Exclude out-of-sync protocols from routing ([16111b5](https://github.com/propeller-heads/fynd/commit/16111b5dda72d115148871cc305873320476cd86))
+* **metrics:** export the RFQ signed quote deviation as a histogram ([fa8bd5b](https://github.com/propeller-heads/fynd/commit/fa8bd5b5a198e1ee6f6ab39fec06845a80a982bb))
+* **core:** serve Metric on Arbitrum ([22d9b7f](https://github.com/propeller-heads/fynd/commit/22d9b7f10b0d326dd39a5c8e20b7e6663a944a5c))
+
+### Bug Fixes
+
+* use default Hashflow book polling ([a8545b8](https://github.com/propeller-heads/fynd/commit/a8545b88233f27c150d226e98d1df276bcc7c353))
+
+
 ## [0.113.0](https://github.com/propeller-heads/fynd/compare/0.112.4...0.113.0) (2026-10-19)
 
 ### Features

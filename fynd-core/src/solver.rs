@@ -688,7 +688,7 @@ impl FyndBuilder {
     /// Enables partial block (flashblock) updates from the Tycho stream (default: `false`).
     ///
     /// When enabled, the stream delivers component state updates mid-block rather than only at
-    /// finalization, reducing latency. Only supported for on-chain protocols; RFQ streams are
+    /// finalization, reducing latency. Only supported for on-chain protocols; book feeds are
     /// unaffected.
     pub fn partial_blocks(mut self, enabled: bool) -> Self {
         self.partial_blocks = enabled;
