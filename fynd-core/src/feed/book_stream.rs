@@ -11,7 +11,6 @@ use std::{
     collections::{HashMap, HashSet},
     str::FromStr,
     sync::Arc,
-    time::Duration,
 };
 
 use alloy::primitives::Address;
@@ -169,14 +168,12 @@ impl BookStream {
                     books.add_feed(entry, feed);
                 }
                 hashflow::PROTOCOL_SYSTEM => {
-                    let feed_config = hashflow_feed_config();
                     let mut builder = HashflowFeedBuilder::new(
                         book_config.clone(),
                         Arc::clone(&usd_quote_tokens),
                         get_env("HASHFLOW_USER")?,
                         get_env("HASHFLOW_KEY")?,
-                    )
-                    .feed_config(feed_config);
+                    );
                     if venue.uses_fallback_router() {
                         builder = builder.with_fallback_router();
                     }
@@ -372,17 +369,6 @@ fn get_env(var: &str) -> Result<String, DataFeedError> {
     std::env::var(var).map_err(|_| DataFeedError::Config(format!("{var} env var not set")))
 }
 
-/// Hashflow keeps the established 30-second polling cadence. The snapshot lifetime must also
-/// outlast a poll that runs to its deadline; otherwise a healthy feed withdraws every book at the
-/// poll boundary and restores them only after the request answers.
-fn hashflow_feed_config() -> tycho_simulation::snapshot_feed::http::HttpFeedConfig {
-    tycho_simulation::snapshot_feed::http::HttpFeedConfig {
-        poll_interval: Duration::from_secs(30),
-        max_snapshot_age: Some(Duration::from_secs(60)),
-        ..HashflowFeedBuilder::default_feed_config()
-    }
-}
-
 /// Trims an optional environment value and treats an empty one as absent.
 fn trimmed_non_empty(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
@@ -512,19 +498,6 @@ mod tests {
 
         assert_eq!(update.added.len(), 1);
         assert!(update.removed.is_empty());
-    }
-
-    #[test]
-    fn test_hashflow_snapshot_outlives_a_slow_poll() {
-        let config = hashflow_feed_config();
-        assert_eq!(config.poll_interval, Duration::from_secs(30));
-        assert!(
-            config
-                .max_snapshot_age
-                .expect("Hashflow snapshots expire") >
-                config.poll_interval + config.request_timeout,
-            "a healthy poll must refresh the snapshot before it is withdrawn"
-        );
     }
 
     #[test]
