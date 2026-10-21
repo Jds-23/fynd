@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use fynd_rpc::config::defaults;
+use tycho_simulation::tycho_core::Bytes;
 
 #[cfg(feature = "metrics")]
 pub(crate) const METRICS_PORT: u16 = 9898;
@@ -201,6 +202,12 @@ pub struct ServeArgs {
     /// API key when one is configured.
     #[arg(long, env)]
     pub calldata_watermark: Option<String>,
+
+    /// Address of the chain's FyndJITRouter. A quote request that the authenticating proxy
+    /// marks with `x-jit-router: true` is encoded to be sent there instead of to the Tycho
+    /// router, with the same calldata. Unset by default: such requests then fail to encode.
+    #[arg(long, env)]
+    pub jit_router_address: Option<Bytes>,
 
     /// URL of the hosted gateway fronting this instance. When set, a second Swagger UI is served
     /// at /docs/hosted/, describing the gateway's per-chain paths and API-key auth. When unset,

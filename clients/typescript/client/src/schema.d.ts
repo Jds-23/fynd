@@ -31,7 +31,12 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** GET /v1/info - Return static metadata about this Fynd instance. */
+        /**
+         * GET /v1/info - Return static metadata about this Fynd instance.
+         * @description `to_address` is the contract this caller's quotes are sent to: the FyndJITRouter on a request
+         *     the authenticating proxy marks with `x-jit-router: true`, the Tycho router otherwise. A caller
+         *     learns the spender to approve, and the Permit2 spender to sign, before quoting.
+         */
         get: operations["info"];
         put?: never;
         post?: never;
@@ -402,6 +407,13 @@ export interface components {
              */
             chain_id: number;
             /**
+             * @description Address of the chain's `FyndJITRouter`, which fronts the Tycho router with the same
+             *     entrypoints so a block builder can improve a route just in time; `null` where this
+             *     deployment has none.
+             * @example 0xDAa2Fe509DE861D53e81940fDb8353B33126c930
+             */
+            jit_router_address?: string | null;
+            /**
              * @description Address of the canonical Permit2 contract (same on all EVM chains).
              * @example 0x000000000022D473030F116dDEE9F6B43aC78BA3
              */
@@ -411,6 +423,14 @@ export interface components {
              * @example 0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35
              */
             router_address?: string | null;
+            /**
+             * @description Contract this caller's quotes are sent to as `transaction.to`: `jit_router_address` when
+             *     the caller's API key is enrolled for it, `router_address` otherwise (vault-funded swaps
+             *     always go to `router_address`). Approve this address, and name it as the Permit2
+             *     `spender`. `null` on a quote-only chain, and absent from older servers.
+             * @example 0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35
+             */
+            to_address?: string | null;
             /**
              * @description Fynd binary version (Cargo package version, e.g. "0.89.1").
              *

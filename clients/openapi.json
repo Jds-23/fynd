@@ -48,6 +48,7 @@
           "solver"
         ],
         "summary": "GET /v1/info - Return static metadata about this Fynd instance.",
+        "description": "`to_address` is the contract this caller's quotes are sent to: the FyndJITRouter on a request\nthe authenticating proxy marks with `x-jit-router: true`, the Tycho router otherwise. A caller\nlearns the spender to approve, and the Permit2 spender to sign, before quoting.",
         "operationId": "info",
         "responses": {
           "200": {
@@ -688,6 +689,14 @@
             "example": 1,
             "minimum": 0
           },
+          "jit_router_address": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Address of the chain's `FyndJITRouter`, which fronts the Tycho router with the same\nentrypoints so a block builder can improve a route just in time; `null` where this\ndeployment has none.",
+            "example": "0xDAa2Fe509DE861D53e81940fDb8353B33126c930"
+          },
           "permit2_address": {
             "type": "string",
             "description": "Address of the canonical Permit2 contract (same on all EVM chains).",
@@ -699,6 +708,14 @@
               "null"
             ],
             "description": "Address of the Tycho Router contract on this chain; `null` on a quote-only chain.",
+            "example": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35"
+          },
+          "to_address": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Contract this caller's quotes are sent to as `transaction.to`: `jit_router_address` when\nthe caller's API key is enrolled for it, `router_address` otherwise (vault-funded swaps\nalways go to `router_address`). Approve this address, and name it as the Permit2\n`spender`. `null` on a quote-only chain, and absent from older servers.",
             "example": "0xfD0b31d2E955fA55e3fa641Fe90e08b677188d35"
           },
           "version": {

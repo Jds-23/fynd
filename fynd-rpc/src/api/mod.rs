@@ -12,6 +12,8 @@ pub mod error;
 pub mod exclusive_access;
 /// Request handlers for `/v1/quote`, `/v1/health`, and `/v1/info`.
 pub mod handlers;
+
+pub mod jit_router;
 /// HTTP metrics middleware recording request duration and per-client usage.
 pub(crate) mod middleware;
 #[cfg(feature = "experimental")]

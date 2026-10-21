@@ -568,6 +568,7 @@ pub struct FyndBuilder {
     encoding_retry_budget: Duration,
     encoder: Option<Encoder>,
     calldata_watermark: Option<Vec<u8>>,
+    jit_router_address: Option<Bytes>,
     pools: Vec<PoolEntry>,
     price_guard_enabled: bool,
     simulation_enabled: bool,
@@ -613,6 +614,7 @@ impl FyndBuilder {
             encoding_retry_budget: defaults::ENCODING_RETRY_BUDGET,
             encoder: None,
             calldata_watermark: None,
+            jit_router_address: None,
             pools: Vec::new(),
             price_guard_enabled: false,
             simulation_enabled: false,
@@ -768,6 +770,14 @@ impl FyndBuilder {
     /// at build time, whether default or overridden. Default: no watermark.
     pub fn calldata_watermark(mut self, watermark: impl Into<Vec<u8>>) -> Self {
         self.calldata_watermark = Some(watermark.into());
+        self
+    }
+
+    /// Sets the chain's `FyndJITRouter`, so a quote request asking for it is encoded to be sent
+    /// there instead of to the Tycho router. Applied to the encoder at build time, whether
+    /// default or overridden. Default: none, and such requests fail to encode.
+    pub fn jit_router_address(mut self, jit_router_address: Bytes) -> Self {
+        self.jit_router_address = Some(jit_router_address);
         self
     }
 
@@ -1163,6 +1173,12 @@ impl FyndBuilder {
         };
         let encoder = match self.calldata_watermark {
             Some(watermark) => encoder.with_calldata_watermark(watermark),
+            None => encoder,
+        };
+        let encoder = match self.jit_router_address {
+            Some(jit_router) => encoder
+                .with_jit_router(jit_router)
+                .map_err(|e| SolverBuildError::Encoder(e.to_string()))?,
             None => encoder,
         };
 

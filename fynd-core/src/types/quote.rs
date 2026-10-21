@@ -609,6 +609,12 @@ pub struct EncodingOptions {
     /// wire format and is not captured for replay.
     #[serde(skip)]
     calldata_watermark: Option<Vec<u8>>,
+    /// Send the transaction to the chain's `FyndJITRouter` instead of the Tycho router, with
+    /// the same calldata, so a block builder can improve the route just in time. Set by the
+    /// serving layer from request context (never by the caller), so it is not part of the
+    /// wire format.
+    #[serde(skip)]
+    jit_router: bool,
 }
 
 impl EncodingOptions {
@@ -624,6 +630,7 @@ impl EncodingOptions {
             price_guard: PriceGuardConfig::default(),
             simulate: false,
             calldata_watermark: None,
+            jit_router: false,
         }
     }
 
@@ -687,6 +694,17 @@ impl EncodingOptions {
     /// Returns the per-request calldata watermark, if set.
     pub fn calldata_watermark(&self) -> Option<&[u8]> {
         self.calldata_watermark.as_deref()
+    }
+
+    /// Sets whether the transaction is sent to the chain's `FyndJITRouter`.
+    pub fn with_jit_router(mut self, jit_router: bool) -> Self {
+        self.jit_router = jit_router;
+        self
+    }
+
+    /// Returns whether the transaction is sent to the chain's `FyndJITRouter`.
+    pub fn jit_router(&self) -> bool {
+        self.jit_router
     }
 
     /// Returns the permit2 authorization, if set.
@@ -3259,6 +3277,17 @@ mod tests {
             100
         );
         assert!((deserialized.slippage() - 0.005).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_encoding_options_jit_router_not_serialized() {
+        let opts = EncodingOptions::new(0.005).with_jit_router(true);
+        assert!(opts.jit_router());
+
+        let json = serde_json::to_string(&opts).unwrap();
+        assert!(!json.contains("jit_router"), "jit_router leaked onto the wire: {json}");
+        let deserialized: EncodingOptions = serde_json::from_str(&json).unwrap();
+        assert!(!deserialized.jit_router());
     }
 
     #[test]
