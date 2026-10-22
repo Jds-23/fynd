@@ -1,4 +1,11 @@
 
+## [0.114.4](https://github.com/propeller-heads/fynd/compare/0.114.3...0.114.4) (2026-10-22)
+
+### Features
+
+* **core:** let tests in other crates attach a route to a quote ([1986935](https://github.com/propeller-heads/fynd/commit/19869355f8fbf9c93fab2e76452d88111137055f))
+
+
 ## [0.114.3](https://github.com/propeller-heads/fynd/compare/0.114.2...0.114.3) (2026-10-22)
 
 ### Features
