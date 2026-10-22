@@ -2101,8 +2101,6 @@ mod tests {
         assert_eq!(fallback_fees.max_slippage(), venue_fees.max_slippage());
     }
 
-    // ==================== Signature Offset Tests ====================
-
     /// The pAMM address tycho's `FallbackSwapEncoder` reads off the component, and the Uniswap V3
     /// pool `select_fallback` stamped on the leg.
     const PAMM_ADDRESS: &str = "0x1111111111111111111111111111111111111111";
@@ -2192,66 +2190,6 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn test_encode_with_client_fee_returns_signature_offset() {
-        let encoder = real_encoder();
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let tx = result[0].transaction().unwrap();
-        tx.client_fee_signature_offset()
-            .expect("client_fee_signature_offset must be present with client fee");
-    }
-
-    #[tokio::test]
-    async fn test_encode_without_client_fee_has_no_signature_offset() {
-        let encoder = real_encoder();
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01);
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let tx = result[0].transaction().unwrap();
-        assert!(tx
-            .client_fee_signature_offset()
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn test_signature_offset_allows_patching() {
-        let encoder = real_encoder();
-        let real_sig = vec![0xFF; 65];
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let tx = result[0].transaction().unwrap();
-        let offset = tx
-            .client_fee_signature_offset()
-            .unwrap();
-
-        let mut calldata = tx.data().to_vec();
-        calldata[offset..offset + 65].copy_from_slice(&real_sig);
-        assert_eq!(&calldata[offset..offset + 65], &real_sig[..]);
-    }
-
-    // ==================== Disable-Slippage-Taking Tests ====================
-
     const DISABLE_SLIPPAGE_TAKING_KEY: &str =
         "0x3333333333333333333333333333333333333333333333333333333333333333";
     const SIGNER_CHAIN_ID: u64 = 1;
@@ -2268,384 +2206,457 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn test_encode_disable_slippage_taking() {
-        let signer = disable_slippage_taking_signer();
-        let signer_address = signer.receiver();
-        let encoder = real_encoder().with_disable_slippage_taking_signer(signer);
-        let quote = make_order_quote(1_000_000_000)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_disable_slippage_taking(true);
+    /// FeeCalculator precision used in these tests: 100% = 100,000,000 fee units.
+    const FEE_SCALE: u64 = 100_000_000;
 
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
+    mod signature_offset {
+        use super::*;
 
-        let tx = result[0].transaction().unwrap();
-        // The signature is final at encode time, so there is nothing for the caller to patch.
-        assert!(tx
-            .client_fee_signature_offset()
-            .is_none());
-        let (
-            amount_in,
-            token_in,
-            token_out,
-            expected_amount_out,
-            min_amount_out,
-            receiver,
-            client_fee,
-            swaps,
-        ) = <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
-        let (fee_units, fee_receiver, max_contribution, deadline, signature) = client_fee;
+        #[tokio::test]
+        async fn test_encode_with_client_fee_returns_signature_offset() {
+            let encoder = real_encoder();
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
 
-        assert_eq!(fee_units, 0, "the params must carry no fee");
-        assert_eq!(fee_receiver, signer_address);
-        assert_eq!(max_contribution, U256::ZERO);
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
 
-        // The embedded signature must recover to the signer over a hash rebuilt from the decoded
-        // calldata, proving the encoder signed the values it actually encoded.
-        let signing_hash = router_signing_hash(
-            fee_receiver,
-            &SwapIntent {
+            let tx = result[0].transaction().unwrap();
+            tx.client_fee_signature_offset()
+                .expect("client_fee_signature_offset must be present with client fee");
+        }
+
+        #[tokio::test]
+        async fn test_encode_without_client_fee_has_no_signature_offset() {
+            let encoder = real_encoder();
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01);
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            assert!(tx
+                .client_fee_signature_offset()
+                .is_none());
+        }
+
+        #[tokio::test]
+        async fn test_signature_offset_allows_patching() {
+            let encoder = real_encoder();
+            let real_sig = vec![0xFF; 65];
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            let offset = tx
+                .client_fee_signature_offset()
+                .unwrap();
+
+            let mut calldata = tx.data().to_vec();
+            calldata[offset..offset + 65].copy_from_slice(&real_sig);
+            assert_eq!(&calldata[offset..offset + 65], &real_sig[..]);
+        }
+    }
+
+    mod disable_slippage_taking {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_encode_disable_slippage_taking() {
+            let signer = disable_slippage_taking_signer();
+            let signer_address = signer.receiver();
+            let encoder = real_encoder().with_disable_slippage_taking_signer(signer);
+            let quote = make_order_quote(1_000_000_000)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_disable_slippage_taking(true);
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            // The signature is final at encode time, so there is nothing for the caller to patch.
+            assert!(tx
+                .client_fee_signature_offset()
+                .is_none());
+            let (
                 amount_in,
                 token_in,
                 token_out,
                 expected_amount_out,
                 min_amount_out,
                 receiver,
-                swaps: &swaps,
-            },
-            deadline.to::<u64>(),
-            SIGNER_CHAIN_ID,
-            SIGNER_ROUTER,
-        );
-        let recovered = Signature::try_from(signature.as_ref())
-            .unwrap()
-            .recover_address_from_prehash(&signing_hash)
-            .unwrap();
-        assert_eq!(recovered, signer_address);
-    }
+                client_fee,
+                swaps,
+            ) = <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
+            let (fee_units, fee_receiver, max_contribution, deadline, signature) = client_fee;
 
-    #[tokio::test]
-    async fn test_encode_disable_slippage_taking_without_signer() {
-        let encoder = real_encoder();
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_disable_slippage_taking(true);
+            assert_eq!(fee_units, 0, "the params must carry no fee");
+            assert_eq!(fee_receiver, signer_address);
+            assert_eq!(max_contribution, U256::ZERO);
 
-        let err = encoder
-            .prepare_solution(&quote, &opts, &encoder.router_fees().snapshot())
-            .expect_err("encoding must fail without a signing key");
-        assert!(
-            err.to_string()
-                .contains(ENV_DISABLE_SLIPPAGE_TAKING_KEY),
-            "error must name the missing env var, got {err:?}"
-        );
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .expect("a failing order is reported on the order, not on the call");
-        assert_eq!(result[0].status(), QuoteStatus::EncodingFailed);
-        assert!(result[0].transaction().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_encode_client_fee_params_precedence() {
-        let signer = disable_slippage_taking_signer();
-        let signer_receiver = signer.receiver();
-        let encoder = real_encoder().with_disable_slippage_taking_signer(signer);
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let client_fee = make_client_fee(100);
-        let client_receiver = bytes_to_address(client_fee.receiver()).unwrap();
-        let opts = EncodingOptions::new(0.01)
-            .with_client_fee_params(client_fee)
-            .with_disable_slippage_taking(true);
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let tx = result[0].transaction().unwrap();
-        assert!(tx
-            .client_fee_signature_offset()
-            .is_some());
-        let (_, _, _, _, _, _, client_fee, _) =
-            <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
-        let (fee_units, fee_receiver, _, _, _) = client_fee;
-
-        assert_ne!(fee_units, 0, "explicit client fee bps must be encoded");
-        assert_eq!(fee_receiver, client_receiver);
-        assert_ne!(fee_receiver, signer_receiver);
-    }
-
-    #[tokio::test]
-    async fn test_encode_disable_slippage_taking_fee_rates() {
-        let signer = disable_slippage_taking_signer();
-        let signer_client = Bytes::from(signer.receiver().as_slice());
-        let encoder = real_encoder().with_disable_slippage_taking_signer(signer);
-        // Default 1% router fee on output; the signer's address pays no router fees at all.
-        let custom = FxHashMap::from_iter([(signer_client, (0u32, 0u32))]);
-        encoder
-            .router_fees()
-            .set(RouterFees::new(FEE_SCALE, 1_000_000, 20_000_000, custom));
-        let quote = make_order_quote(1_000_000_000)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.0).with_disable_slippage_taking(true);
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let breakdown = result[0].fee_breakdown().unwrap();
-        assert_eq!(*breakdown.router_fee(), BigUint::ZERO);
-        assert_eq!(*breakdown.client_fee(), BigUint::ZERO);
-    }
-
-    // ==================== Calldata Watermark Tests ====================
-
-    #[tokio::test]
-    async fn test_encode_appends_calldata_watermark() {
-        let encoder = real_encoder().with_calldata_watermark("fynd");
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-
-        let result = encoder
-            .encode(vec![quote], EncodingOptions::new(0.01))
-            .await
-            .unwrap();
-
-        let tx = result[0].transaction().unwrap();
-        assert!(
-            tx.data().ends_with(b"fynd"),
-            "calldata must end with the watermark bytes, got suffix {:?}",
-            &tx.data()[tx.data().len().saturating_sub(4)..]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_encode_without_watermark_leaves_calldata_unchanged() {
-        let make_quote = || {
-            make_order_quote(990)
-                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]))
-        };
-
-        let plain = real_encoder()
-            .encode(vec![make_quote()], EncodingOptions::new(0.01))
-            .await
-            .unwrap();
-        let watermarked = real_encoder()
-            .with_calldata_watermark("fynd")
-            .encode(vec![make_quote()], EncodingOptions::new(0.01))
-            .await
-            .unwrap();
-
-        let plain_data = plain[0].transaction().unwrap().data();
-        let watermarked_data = watermarked[0]
-            .transaction()
-            .unwrap()
-            .data();
-        // The watermark is a pure suffix: stripping it yields the unwatermarked calldata.
-        assert_eq!(*plain_data, watermarked_data[..watermarked_data.len() - 4]);
-    }
-
-    #[tokio::test]
-    async fn test_request_watermark_replaces_encoder_watermark() {
-        let encoder = real_encoder().with_calldata_watermark("fynd");
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_calldata_watermark("propeller/acme");
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let data = result[0].transaction().unwrap().data();
-        assert!(data.ends_with(b"propeller/acme"), "request watermark must be the suffix");
-        let before_suffix = &data[..data.len() - b"propeller/acme".len()];
-        assert!(!before_suffix.ends_with(b"fynd"), "encoder watermark must not be stamped too");
-    }
-
-    #[tokio::test]
-    async fn test_request_watermark_applies_without_encoder_watermark() {
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_calldata_watermark("propeller/acme");
-
-        let result = real_encoder()
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let data = result[0].transaction().unwrap().data();
-        assert!(data.ends_with(b"propeller/acme"));
-    }
-
-    #[tokio::test]
-    async fn test_watermarked_calldata_still_decodes() {
-        let encoder = real_encoder().with_calldata_watermark("fynd");
-        let quote = make_order_quote(1_000_000_000)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let amount_in = quote.amount_in().clone();
-        let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let tx = result[0].transaction().unwrap();
-        // Solidity's ABI decoder ignores trailing calldata, so decoding the args without the
-        // 4-byte watermark suffix must still work.
-        let (encoded_amount_in, _, _, _, _, _, _, _) =
-            <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..tx.data().len() - 4])
+            // The embedded signature must recover to the signer over a hash rebuilt from the
+            // decoded calldata, proving the encoder signed the values it actually encoded.
+            let signing_hash = router_signing_hash(
+                fee_receiver,
+                &SwapIntent {
+                    amount_in,
+                    token_in,
+                    token_out,
+                    expected_amount_out,
+                    min_amount_out,
+                    receiver,
+                    swaps: &swaps,
+                },
+                deadline.to::<u64>(),
+                SIGNER_CHAIN_ID,
+                SIGNER_ROUTER,
+            );
+            let recovered = Signature::try_from(signature.as_ref())
+                .unwrap()
+                .recover_address_from_prehash(&signing_hash)
                 .unwrap();
-        assert_eq!(encoded_amount_in, biguint_to_u256(&amount_in));
-    }
+            assert_eq!(recovered, signer_address);
+        }
 
-    #[tokio::test]
-    async fn test_signature_offset_unaffected_by_watermark() {
-        let encoder = real_encoder().with_calldata_watermark("fynd");
-        let real_sig = vec![0xFF; 65];
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
+        #[tokio::test]
+        async fn test_encode_disable_slippage_taking_without_signer() {
+            let encoder = real_encoder();
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_disable_slippage_taking(true);
 
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
+            let err = encoder
+                .prepare_solution(&quote, &opts, &encoder.router_fees().snapshot())
+                .expect_err("encoding must fail without a signing key");
+            assert!(
+                err.to_string()
+                    .contains(ENV_DISABLE_SLIPPAGE_TAKING_KEY),
+                "error must name the missing env var, got {err:?}"
+            );
 
-        let tx = result[0].transaction().unwrap();
-        let offset = tx
-            .client_fee_signature_offset()
-            .unwrap();
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .expect("a failing order is reported on the order, not on the call");
+            assert_eq!(result[0].status(), QuoteStatus::EncodingFailed);
+            assert!(result[0].transaction().is_none());
+        }
 
-        let mut calldata = tx.data().to_vec();
-        calldata[offset..offset + 65].copy_from_slice(&real_sig);
-        assert_eq!(&calldata[offset..offset + 65], &real_sig[..]);
-        assert!(calldata.ends_with(b"fynd"));
-    }
+        #[tokio::test]
+        async fn test_encode_client_fee_params_precedence() {
+            let signer = disable_slippage_taking_signer();
+            let signer_receiver = signer.receiver();
+            let encoder = real_encoder().with_disable_slippage_taking_signer(signer);
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let client_fee = make_client_fee(100);
+            let client_receiver = bytes_to_address(client_fee.receiver()).unwrap();
+            let opts = EncodingOptions::new(0.01)
+                .with_client_fee_params(client_fee)
+                .with_disable_slippage_taking(true);
 
-    // ==================== Fee Breakdown Tests ====================
-
-    /// FeeCalculator precision used in these tests: 100% = 100,000,000 fee units.
-    const FEE_SCALE: u64 = 100_000_000;
-
-    #[test]
-    fn test_calculate_fee_breakdown() {
-        // 10 bps router fee on output, 20% router share of the client fee, 1% client fee.
-        let rates = FeeRates::new(100_000, 20_000_000, FEE_SCALE);
-
-        let breakdown =
-            Encoder::calculate_fee_breakdown(&BigUint::from(1_000_000u64), 100, 0.0, rates)
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
                 .unwrap();
 
-        // total client fee = 1% of 1_000_000 = 10_000; router takes 20% of it = 2_000.
-        // router fee on output = 0.1% of 1_000_000 = 1_000.
-        assert_eq!(*breakdown.client_fee(), BigUint::from(8_000u64));
-        assert_eq!(*breakdown.router_fee(), BigUint::from(3_000u64));
-        assert_eq!(*breakdown.min_amount_received(), BigUint::from(989_000u64));
+            let tx = result[0].transaction().unwrap();
+            assert!(tx
+                .client_fee_signature_offset()
+                .is_some());
+            let (_, _, _, _, _, _, client_fee, _) =
+                <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
+            let (fee_units, fee_receiver, _, _, _) = client_fee;
+
+            assert_ne!(fee_units, 0, "explicit client fee bps must be encoded");
+            assert_eq!(fee_receiver, client_receiver);
+            assert_ne!(fee_receiver, signer_receiver);
+        }
+
+        #[tokio::test]
+        async fn test_encode_disable_slippage_taking_fee_rates() {
+            let signer = disable_slippage_taking_signer();
+            let signer_client = Bytes::from(signer.receiver().as_slice());
+            let encoder = real_encoder().with_disable_slippage_taking_signer(signer);
+            // Default 1% router fee on output; the signer's address pays no router fees at all.
+            let custom = FxHashMap::from_iter([(signer_client, (0u32, 0u32))]);
+            encoder
+                .router_fees()
+                .set(RouterFees::new(FEE_SCALE, 1_000_000, 20_000_000, custom));
+            let quote = make_order_quote(1_000_000_000)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.0).with_disable_slippage_taking(true);
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let breakdown = result[0].fee_breakdown().unwrap();
+            assert_eq!(*breakdown.router_fee(), BigUint::ZERO);
+            assert_eq!(*breakdown.client_fee(), BigUint::ZERO);
+        }
     }
 
-    #[test]
-    fn test_calculate_fee_breakdown_zero_fees() {
-        let rates = FeeRates::new(0, 0, FEE_SCALE);
+    mod calldata_watermark {
+        use super::*;
 
-        let breakdown =
-            Encoder::calculate_fee_breakdown(&BigUint::from(1_000_000u64), 0, 0.0, rates).unwrap();
+        #[tokio::test]
+        async fn test_encode_appends_calldata_watermark() {
+            let encoder = real_encoder().with_calldata_watermark("fynd");
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
 
-        assert_eq!(*breakdown.client_fee(), BigUint::ZERO);
-        assert_eq!(*breakdown.router_fee(), BigUint::ZERO);
-        assert_eq!(*breakdown.min_amount_received(), BigUint::from(1_000_000u64));
+            let result = encoder
+                .encode(vec![quote], EncodingOptions::new(0.01))
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            assert!(
+                tx.data().ends_with(b"fynd"),
+                "calldata must end with the watermark bytes, got suffix {:?}",
+                &tx.data()[tx.data().len().saturating_sub(4)..]
+            );
+        }
+
+        #[tokio::test]
+        async fn test_encode_without_watermark_leaves_calldata_unchanged() {
+            let make_quote = || {
+                make_order_quote(990)
+                    .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]))
+            };
+
+            let plain = real_encoder()
+                .encode(vec![make_quote()], EncodingOptions::new(0.01))
+                .await
+                .unwrap();
+            let watermarked = real_encoder()
+                .with_calldata_watermark("fynd")
+                .encode(vec![make_quote()], EncodingOptions::new(0.01))
+                .await
+                .unwrap();
+
+            let plain_data = plain[0].transaction().unwrap().data();
+            let watermarked_data = watermarked[0]
+                .transaction()
+                .unwrap()
+                .data();
+            // The watermark is a pure suffix: stripping it yields the unwatermarked calldata.
+            assert_eq!(*plain_data, watermarked_data[..watermarked_data.len() - 4]);
+        }
+
+        #[tokio::test]
+        async fn test_request_watermark_replaces_encoder_watermark() {
+            let encoder = real_encoder().with_calldata_watermark("fynd");
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_calldata_watermark("propeller/acme");
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let data = result[0].transaction().unwrap().data();
+            assert!(data.ends_with(b"propeller/acme"), "request watermark must be the suffix");
+            let before_suffix = &data[..data.len() - b"propeller/acme".len()];
+            assert!(!before_suffix.ends_with(b"fynd"), "encoder watermark must not be stamped too");
+        }
+
+        #[tokio::test]
+        async fn test_request_watermark_applies_without_encoder_watermark() {
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_calldata_watermark("propeller/acme");
+
+            let result = real_encoder()
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let data = result[0].transaction().unwrap().data();
+            assert!(data.ends_with(b"propeller/acme"));
+        }
+
+        #[tokio::test]
+        async fn test_watermarked_calldata_still_decodes() {
+            let encoder = real_encoder().with_calldata_watermark("fynd");
+            let quote = make_order_quote(1_000_000_000)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let amount_in = quote.amount_in().clone();
+            let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            // Solidity's ABI decoder ignores trailing calldata, so decoding the args without the
+            // 4-byte watermark suffix must still work.
+            let (encoded_amount_in, _, _, _, _, _, _, _) =
+                <SingleSwapCalldata as SolValue>::abi_decode_params(
+                    &tx.data()[4..tx.data().len() - 4],
+                )
+                .unwrap();
+            assert_eq!(encoded_amount_in, biguint_to_u256(&amount_in));
+        }
+
+        #[tokio::test]
+        async fn test_signature_offset_unaffected_by_watermark() {
+            let encoder = real_encoder().with_calldata_watermark("fynd");
+            let real_sig = vec![0xFF; 65];
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            let offset = tx
+                .client_fee_signature_offset()
+                .unwrap();
+
+            let mut calldata = tx.data().to_vec();
+            calldata[offset..offset + 65].copy_from_slice(&real_sig);
+            assert_eq!(&calldata[offset..offset + 65], &real_sig[..]);
+            assert!(calldata.ends_with(b"fynd"));
+        }
     }
 
-    #[test]
-    fn test_calculate_fee_breakdown_fee_too_high() {
-        // 100% client fee plus any router fee on output exceeds the maximum.
-        let rates = FeeRates::new(1, 0, FEE_SCALE);
+    mod fee_breakdown {
+        use super::*;
 
-        let result =
-            Encoder::calculate_fee_breakdown(&BigUint::from(1_000_000u64), 10_000, 0.0, rates);
+        #[test]
+        fn test_calculate_fee_breakdown() {
+            // 10 bps router fee on output, 20% router share of the client fee, 1% client fee.
+            let rates = FeeRates::new(100_000, 20_000_000, FEE_SCALE);
 
-        assert!(result.is_err());
-    }
+            let breakdown =
+                Encoder::calculate_fee_breakdown(&BigUint::from(1_000_000u64), 100, 0.0, rates)
+                    .unwrap();
 
-    #[tokio::test]
-    async fn test_encode_uses_custom_fees_for_client_fee_receiver() {
-        let encoder = real_encoder();
-        // Default 1% router fee on output; receiver 0xBB pays no router fees at all.
-        let custom =
-            FxHashMap::from_iter([(Bytes::from(make_address(0xBB).as_ref()), (0u32, 0u32))]);
-        encoder
-            .router_fees()
-            .set(RouterFees::new(FEE_SCALE, 1_000_000, 20_000_000, custom));
-        let quote = make_order_quote(1_000_000_000)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.0).with_client_fee_params(make_client_fee(100));
+            // total client fee = 1% of 1_000_000 = 10_000; router takes 20% of it = 2_000.
+            // router fee on output = 0.1% of 1_000_000 = 1_000.
+            assert_eq!(*breakdown.client_fee(), BigUint::from(8_000u64));
+            assert_eq!(*breakdown.router_fee(), BigUint::from(3_000u64));
+            assert_eq!(*breakdown.min_amount_received(), BigUint::from(989_000u64));
+        }
 
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
+        #[test]
+        fn test_calculate_fee_breakdown_zero_fees() {
+            let rates = FeeRates::new(0, 0, FEE_SCALE);
 
-        let breakdown = result[0].fee_breakdown().unwrap();
-        assert_eq!(*breakdown.router_fee(), BigUint::ZERO);
-        // Client keeps the full 1% fee since the router's share is overridden to zero.
-        assert_eq!(*breakdown.client_fee(), BigUint::from(10_000_000u64));
-    }
+            let breakdown =
+                Encoder::calculate_fee_breakdown(&BigUint::from(1_000_000u64), 0, 0.0, rates)
+                    .unwrap();
 
-    #[tokio::test]
-    async fn test_encode_falls_back_to_sender() {
-        let encoder = real_encoder();
-        // The order sender (0xAA) has a custom zero router fee on output; client-fee share
-        // inherits the 20% default.
-        let custom = FxHashMap::from_iter([(
-            Bytes::from(make_address(0xAA).as_ref()),
-            (0u32, 20_000_000u32),
-        )]);
-        encoder
-            .router_fees()
-            .set(RouterFees::new(FEE_SCALE, 1_000_000, 20_000_000, custom));
-        let quote = make_order_quote(1_000_000_000)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            assert_eq!(*breakdown.client_fee(), BigUint::ZERO);
+            assert_eq!(*breakdown.router_fee(), BigUint::ZERO);
+            assert_eq!(*breakdown.min_amount_received(), BigUint::from(1_000_000u64));
+        }
 
-        let result = encoder
-            .encode(vec![quote], EncodingOptions::new(0.0))
-            .await
-            .unwrap();
+        #[test]
+        fn test_calculate_fee_breakdown_fee_too_high() {
+            // 100% client fee plus any router fee on output exceeds the maximum.
+            let rates = FeeRates::new(1, 0, FEE_SCALE);
 
-        let breakdown = result[0].fee_breakdown().unwrap();
-        assert_eq!(*breakdown.router_fee(), BigUint::ZERO);
-    }
+            let result =
+                Encoder::calculate_fee_breakdown(&BigUint::from(1_000_000u64), 10_000, 0.0, rates);
 
-    #[tokio::test]
-    async fn test_encode_unknown_client() {
-        let encoder = real_encoder();
-        encoder
-            .router_fees()
-            .set(RouterFees::new(
-                FEE_SCALE,
-                1_000_000,
-                20_000_000,
-                rustc_hash::FxHashMap::default(),
-            ));
-        let quote = make_order_quote(1_000_000_000)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            assert!(result.is_err());
+        }
 
-        let result = encoder
-            .encode(vec![quote], EncodingOptions::new(0.0))
-            .await
-            .unwrap();
+        #[tokio::test]
+        async fn test_encode_uses_custom_fees_for_client_fee_receiver() {
+            let encoder = real_encoder();
+            // Default 1% router fee on output; receiver 0xBB pays no router fees at all.
+            let custom =
+                FxHashMap::from_iter([(Bytes::from(make_address(0xBB).as_ref()), (0u32, 0u32))]);
+            encoder
+                .router_fees()
+                .set(RouterFees::new(FEE_SCALE, 1_000_000, 20_000_000, custom));
+            let quote = make_order_quote(1_000_000_000)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.0).with_client_fee_params(make_client_fee(100));
 
-        let breakdown = result[0].fee_breakdown().unwrap();
-        // 1% of 1_000_000_000.
-        assert_eq!(*breakdown.router_fee(), BigUint::from(10_000_000u64));
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let breakdown = result[0].fee_breakdown().unwrap();
+            assert_eq!(*breakdown.router_fee(), BigUint::ZERO);
+            // Client keeps the full 1% fee since the router's share is overridden to zero.
+            assert_eq!(*breakdown.client_fee(), BigUint::from(10_000_000u64));
+        }
+
+        #[tokio::test]
+        async fn test_encode_falls_back_to_sender() {
+            let encoder = real_encoder();
+            // The order sender (0xAA) has a custom zero router fee on output; client-fee share
+            // inherits the 20% default.
+            let custom = FxHashMap::from_iter([(
+                Bytes::from(make_address(0xAA).as_ref()),
+                (0u32, 20_000_000u32),
+            )]);
+            encoder
+                .router_fees()
+                .set(RouterFees::new(FEE_SCALE, 1_000_000, 20_000_000, custom));
+            let quote = make_order_quote(1_000_000_000)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+
+            let result = encoder
+                .encode(vec![quote], EncodingOptions::new(0.0))
+                .await
+                .unwrap();
+
+            let breakdown = result[0].fee_breakdown().unwrap();
+            assert_eq!(*breakdown.router_fee(), BigUint::ZERO);
+        }
+
+        #[tokio::test]
+        async fn test_encode_unknown_client() {
+            let encoder = real_encoder();
+            encoder
+                .router_fees()
+                .set(RouterFees::new(
+                    FEE_SCALE,
+                    1_000_000,
+                    20_000_000,
+                    rustc_hash::FxHashMap::default(),
+                ));
+            let quote = make_order_quote(1_000_000_000)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+
+            let result = encoder
+                .encode(vec![quote], EncodingOptions::new(0.0))
+                .await
+                .unwrap();
+
+            let breakdown = result[0].fee_breakdown().unwrap();
+            // 1% of 1_000_000_000.
+            assert_eq!(*breakdown.router_fee(), BigUint::from(10_000_000u64));
+        }
     }
 
     #[rstest]
