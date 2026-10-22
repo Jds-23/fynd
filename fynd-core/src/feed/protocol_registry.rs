@@ -134,8 +134,7 @@ const PRICE_LEVEL_STREAM_CHAIN: Chain = Chain::Ethereum;
 /// An `rfq:metric` or `fallback:rfq:metric` entry on any other chain is rejected at registration.
 /// Each entry must also have its own executor in tycho-execution's `executor_addresses.json`, or
 /// its legs would price from the book feed and then fail to encode: Ethereum and BSC have only the
-/// fallback executor and Arbitrum only the direct one, and Polygon's entries are rejected until
-/// the tycho-execution release Fynd depends on lists its executors.
+/// fallback executor.
 pub(crate) const METRIC_CHAINS: &[Chain] =
     &[Chain::Ethereum, Chain::Base, Chain::Robinhood, Chain::Bsc, Chain::Arbitrum, Chain::Polygon];
 
@@ -1346,7 +1345,6 @@ mod tests {
     #[case::native_via_fallback_router(Chain::Ethereum, "fallback:rfq:native")]
     #[case::liquorice_off_ethereum(Chain::Base, "rfq:liquorice")]
     #[case::liquorice_via_fallback_router(Chain::Ethereum, "fallback:rfq:liquorice")]
-    #[case::metric_via_fallback_router_on_arbitrum(Chain::Arbitrum, "fallback:rfq:metric")]
     #[case::metric_direct_on_ethereum(Chain::Ethereum, "rfq:metric")]
     fn test_open_book_without_executor(#[case] chain: Chain, #[case] entry: &str) {
         let Err(err) = open_book_stream(chain, &[entry]) else {
@@ -1391,6 +1389,10 @@ mod tests {
     #[case::robinhood_via_fallback_router(Chain::Robinhood, "fallback:rfq:metric")]
     #[case::bsc_via_fallback_router(Chain::Bsc, "fallback:rfq:metric")]
     #[case::arbitrum(Chain::Arbitrum, "rfq:metric")]
+    #[case::arbitrum_via_fallback_router(Chain::Arbitrum, "fallback:rfq:metric")]
+    #[case::polygon(Chain::Polygon, "rfq:metric")]
+    // Polygon has no curated USD stablecoin set, which Metric's feed does not need.
+    #[case::polygon_via_fallback_router(Chain::Polygon, "fallback:rfq:metric")]
     fn test_open_book_metric_requires_api_key(#[case] chain: Chain, #[case] entry: &str) {
         env::remove_var("METRIC_API_KEY");
         let Err(err) = open_book_stream(chain, &[entry]) else {
