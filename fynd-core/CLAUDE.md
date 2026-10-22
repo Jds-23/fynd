@@ -232,7 +232,9 @@ loses its entries and failures.
 
 `MarketState::upsert_components` compares the directions on every call. A re-sent component with the
 same directions reaches `MarketEvent` as `updated_components`, like a state update. A new component,
-or one with other directions, reaches `added_components`.
+or one with other directions, reaches `added_components`. The Tycho feed and the book feed both upsert every
+component they receive, so a book venue that keeps its id and changes its directions is reported
+as added.
 
 ## Exclusive Liquidity (restricted)
 

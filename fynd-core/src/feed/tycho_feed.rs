@@ -585,19 +585,18 @@ impl TychoFeed {
     /// market's block label nor invalidate a simulation overlay built against the current one.
     #[instrument(skip(self, update), fields(protocol_system = %update.protocol_system))]
     async fn handle_book_update(&self, update: BookUpdate) -> Result<(), DataFeedError> {
-        let BookUpdate { protocol_system, added, removed, updated: updated_components, states } =
-            update;
+        let BookUpdate { protocol_system, added, removed, updated, states } = update;
 
         info!(
             "received {} books from {protocol_system}: {} new components, {} removed, {} updated",
             states.len(),
             added.len(),
             removed.len(),
-            updated_components.len()
+            updated.len()
         );
 
         let update_start = Instant::now();
-        let added_ids: Vec<ComponentId> = added
+        let refreshed_ids: Vec<ComponentId> = updated
             .iter()
             .map(|component| component.id.to_string())
             .collect();
@@ -612,15 +611,30 @@ impl TychoFeed {
                     .iter()
                     .flat_map(|component| component.tokens.iter().cloned()),
             );
-            market_data.upsert_components(added.into_iter().map(market_component));
+            let upserted = market_data.upsert_components(
+                added
+                    .into_iter()
+                    .chain(updated)
+                    .map(market_component),
+            );
             market_data.remove_components(removed.iter());
             market_data.update_states(states);
-            let added_topology: FxHashMap<ComponentId, ComponentTopology> = added_ids
-                .iter()
-                .filter_map(|id| Some((id.clone(), market_data.topology_of(id)?)))
+            let added_topology: FxHashMap<ComponentId, ComponentTopology> = upserted
+                .new
+                .into_iter()
+                .chain(upserted.reshaped)
+                .filter_map(|id| {
+                    let topology = market_data.topology_of(&id)?;
+                    Some((id, topology))
+                })
                 .collect();
             (added_topology, market_data.component_count(), market_data.token_count())
         };
+        // A refreshed component whose swap directions changed is reported as added.
+        let updated_components = refreshed_ids
+            .into_iter()
+            .filter(|id| !added_topology.contains_key(id))
+            .collect();
 
         histogram!("market_update_duration_seconds").record(update_start.elapsed().as_secs_f64());
         gauge!("market_pools").set(component_count as f64);

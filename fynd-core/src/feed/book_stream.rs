@@ -51,8 +51,9 @@ pub struct BookUpdate {
     pub added: Vec<ProtocolComponent>,
     /// Components the market has that the venue no longer serves.
     pub removed: Vec<ComponentId>,
-    /// The ids whose state the venue refreshed, the added ones excluded.
-    pub updated: Vec<ComponentId>,
+    /// Components the market has whose state the venue refreshed. Each comes with its component,
+    /// because an all-pairs venue keeps its id while the swap directions it lists change.
+    pub updated: Vec<ProtocolComponent>,
     /// The state of every book the venue currently serves, the added ones included.
     pub states: HashMap<ComponentId, Box<dyn ProtocolSim>>,
 }
@@ -332,7 +333,7 @@ impl BookStream {
         let mut current = HashSet::with_capacity(books.len());
         for (id, book) in books.iter() {
             if served.contains(id) {
-                updated.push(id.clone());
+                updated.push(book.component.clone());
             } else {
                 added.push(book.component.clone());
             }
