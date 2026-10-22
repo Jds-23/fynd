@@ -217,6 +217,14 @@ Tycho one with an `exclude:` entry rather than streaming both. `EXCLUDE_PREFIX` 
 `parse_exclusion` live here with the other entry prefixes; `fynd_rpc::protocols` applies them
 after expanding `all_onchain`.
 
+## RFQ aggregation
+
+`--aggregate-rfqs` makes `BookStream::open` stream Bebop and Hashflow (direct and `fallback:rfq:`) as
+one component per venue instead of one per token pair. A route may take one quote from Bebop, and
+one quote per market maker from Hashflow (`QuoteRule::OncePerMaker`). Metric, Native and Liquorice
+always stream per pair. The venue lists the swap directions it quotes in its `swap_directions`
+static attribute.
+
 ## Exclusive Liquidity (restricted)
 
 A limited, opt-in service for specific deployments — **not** part of the normal routing path. With no

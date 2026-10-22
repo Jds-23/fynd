@@ -73,6 +73,8 @@ pub(crate) struct TychoFeedConfig {
     /// How far, in block time, a `Delayed` protocol may lag the last updated block before its
     /// pools are excluded from routing.
     pub(crate) max_sync_lag: Duration,
+    /// Stream each Bebop and Hashflow venue as one component instead of one per token pair.
+    pub(crate) aggregate_rfqs: bool,
 }
 
 impl TychoFeedConfig {
@@ -99,6 +101,7 @@ impl TychoFeedConfig {
             partial_blocks: false,
             subscription_buffer_size: None,
             max_sync_lag: crate::solver::defaults::MAX_SYNC_LAG,
+            aggregate_rfqs: false,
         }
     }
 
@@ -139,6 +142,11 @@ impl TychoFeedConfig {
 
     pub(crate) fn max_sync_lag(mut self, lag: Duration) -> Self {
         self.max_sync_lag = lag;
+        self
+    }
+
+    pub(crate) fn aggregate_rfqs(mut self, enabled: bool) -> Self {
+        self.aggregate_rfqs = enabled;
         self
     }
 }

@@ -19,8 +19,8 @@ use itertools::Itertools;
 use tracing::{debug, info, warn};
 use tycho_simulation::{
     book::{
-        quote_tokens::usd_stablecoins_for_chain, BookFeedConfig, BookFeedEvent, BookFeedStreams,
-        BookSnapshot, ReceivedAt,
+        all_pairs::QuoteRule, quote_tokens::usd_stablecoins_for_chain, BookFeedConfig,
+        BookFeedEvent, BookFeedStreams, BookSnapshot, ReceivedAt,
     },
     evm::tycho_models::Chain,
     pamm::protocols::metric::{self, feed::MetricFeedBuilder},
@@ -81,7 +81,8 @@ impl BookStream {
     /// Subscribes to every `rfq:` entry in `protocols`, or `None` when it names none.
     ///
     /// The venues price their books' TVL in USD stablecoins, so `min_tvl_usd` is a USD amount —
-    /// unlike the native-token threshold the Tycho component filter takes.
+    /// unlike the native-token threshold the Tycho component filter takes. With `aggregate_rfqs`,
+    /// Bebop and Hashflow each stream as one component for all their pairs.
     ///
     /// # Errors
     ///
@@ -92,6 +93,7 @@ impl BookStream {
         min_tvl_usd: f64,
         protocols: &[String],
         tokens: HashMap<Bytes, Token>,
+        aggregate_rfqs: bool,
     ) -> Result<Option<Self>, DataFeedError> {
         let mut venues = Vec::new();
         for (entry, venue) in parse_rfq_entries(protocols)? {
@@ -159,6 +161,9 @@ impl BookStream {
                     if let Ok(source) = std::env::var("BEBOP_ORIGIN_SOURCE") {
                         builder = builder.origin_source(source);
                     }
+                    if aggregate_rfqs {
+                        builder = builder.all_pairs();
+                    }
                     if venue.uses_fallback_router() {
                         builder = builder.with_fallback_router();
                     }
@@ -174,6 +179,9 @@ impl BookStream {
                         get_env("HASHFLOW_USER")?,
                         get_env("HASHFLOW_KEY")?,
                     );
+                    if aggregate_rfqs {
+                        builder = builder.all_pairs(QuoteRule::OncePerMaker);
+                    }
                     if venue.uses_fallback_router() {
                         builder = builder.with_fallback_router();
                     }

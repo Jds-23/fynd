@@ -558,6 +558,7 @@ pub struct FyndBuilder {
     partial_blocks: bool,
     tycho_subscription_buffer_size: Option<usize>,
     max_sync_lag: Duration,
+    aggregate_rfqs: bool,
     pricing_max_hops: usize,
     /// Shortest time between two full token-pricing passes; `None` keeps the computation's
     /// default.
@@ -606,6 +607,7 @@ impl FyndBuilder {
             partial_blocks: false,
             tycho_subscription_buffer_size: None,
             max_sync_lag: defaults::MAX_SYNC_LAG,
+            aggregate_rfqs: false,
             pricing_max_hops: defaults::PRICING_MAX_HOPS,
             pricing_max_tokens_per_pass: None,
             pricing_min_pass_interval: None,
@@ -707,6 +709,13 @@ impl FyndBuilder {
     /// `Stale` or `Ended` protocol is excluded regardless.
     pub fn max_sync_lag(mut self, lag: Duration) -> Self {
         self.max_sync_lag = lag;
+        self
+    }
+
+    /// Streams each Bebop and Hashflow venue as one component instead of one per token pair
+    /// (default: `false`). Metric, Native and Liquorice always stream per pair.
+    pub fn aggregate_rfqs(mut self, enabled: bool) -> Self {
+        self.aggregate_rfqs = enabled;
         self
     }
 
@@ -1026,7 +1035,8 @@ impl FyndBuilder {
         .traded_n_days_ago(self.traded_n_days_ago)
         .blocklisted_components(self.blocklisted_components)
         .partial_blocks(self.partial_blocks)
-        .max_sync_lag(self.max_sync_lag);
+        .max_sync_lag(self.max_sync_lag)
+        .aggregate_rfqs(self.aggregate_rfqs);
 
         let tycho_feed_config = match self.tycho_subscription_buffer_size {
             Some(size) => tycho_feed_config.subscription_buffer_size(size),

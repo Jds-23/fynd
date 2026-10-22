@@ -213,6 +213,7 @@ impl TychoFeed {
             self.config.min_tvl,
             &self.config.protocols,
             all_tokens.clone(),
+            self.config.aggregate_rfqs,
         )?;
 
         let mut protocol_stream = if has_tycho_protocols(&self.config.protocols) {
@@ -363,6 +364,7 @@ impl TychoFeed {
             self.config.min_tvl,
             &self.config.protocols,
             all_tokens.clone(),
+            self.config.aggregate_rfqs,
         ) {
             Ok(book_stream) => book_stream,
             Err(e) => {

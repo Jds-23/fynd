@@ -179,6 +179,11 @@ pub struct ServeArgs {
     #[arg(long)]
     pub partial_blocks: bool,
 
+    /// Stream each Bebop and Hashflow venue as one component instead of one per token pair.
+    /// Metric, Native and Liquorice always stream per pair.
+    #[arg(long, env)]
+    pub aggregate_rfqs: bool,
+
     /// Enable price guard validation against external price sources.
     /// Disabled by default.
     #[arg(long)]
