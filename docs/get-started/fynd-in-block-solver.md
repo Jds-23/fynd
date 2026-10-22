@@ -79,4 +79,4 @@ A share of the extra output from improved routes goes to the builder and the pro
 
 ## Contract addresses
 
-<table><thead><tr><th width="230">Chain</th><th>FyndJITRouter address</th></tr></thead><tbody><tr><td>Ethereum Mainnet</td><td>0xDAa2Fe509DE861D53e81940fDb8353B33126c930</td></tr></tbody></table>
+<table><thead><tr><th width="230">Chain</th><th>FyndJITRouter address</th></tr></thead><tbody><tr><td>Ethereum Mainnet</td><td>0x5BEFE2A5d993dcB63486ff04deDB1BE9DfB55e56</td></tr></tbody></table>
