@@ -90,6 +90,7 @@ impl DerivedComputation for SpotPriceComputation {
             let token_addresses = changed
                 .added
                 .get(component_id)
+                .map(|component_topology| &component_topology.tokens)
                 .or_else(|| {
                     market_guard
                         .get_component(component_id)

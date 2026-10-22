@@ -53,14 +53,14 @@ impl MarketEventHandler for RfqSwapReplacer {
             return Ok(());
         }
         let view = market.read().await;
-        for (id, tokens) in added_components {
+        for (id, topology) in added_components {
             self.index.remove(id);
             if view
                 .get_component(id)
                 .is_some_and(|component| is_rfq_protocol(&component.protocol_system))
             {
                 self.index
-                    .insert(id.clone(), tokens.clone());
+                    .insert(id.clone(), topology.tokens.clone());
             }
         }
         Ok(())

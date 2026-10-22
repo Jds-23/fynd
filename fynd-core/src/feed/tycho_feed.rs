@@ -8,6 +8,7 @@
 use std::{collections::HashSet, pin::Pin, time::Instant};
 
 use metrics::{gauge, histogram};
+use rustc_hash::FxHashMap;
 use tokio::sync::{broadcast, oneshot};
 use tokio_stream::{Stream, StreamExt};
 use tracing::{debug, info, instrument, span, trace, Instrument, Level};
@@ -19,7 +20,6 @@ use tycho_simulation::{
     protocol::models::{ProtocolComponent, Update},
     tycho_client::feed::component_tracker::ComponentFilter,
     tycho_common::traits::TxDeltaIndexer,
-    tycho_core::Bytes,
     utils::load_all_tokens,
 };
 
@@ -31,7 +31,7 @@ use crate::{
         protocol_registry::{has_tycho_protocols, open_price_level_stream, register_exchanges},
         when_configured, DataFeedError, TychoFeedConfig,
     },
-    types::ComponentId,
+    types::{ComponentId, ComponentTopology},
 };
 
 /// The Tycho indexer that keeps market data synchronized.
@@ -505,6 +505,11 @@ impl TychoFeed {
         let mut token_count = 0;
         let mut unsynced_protocol_count = 0;
         let mut latest_block_fields = None;
+        let mut added_topology: FxHashMap<ComponentId, ComponentTopology> = FxHashMap::default();
+        let added_ids: Vec<ComponentId> = added_components
+            .values()
+            .map(|component| component.id.to_string())
+            .collect();
         self.market_data
             .apply_block_update(new_block_number, |market_data| {
                 market_data.upsert_components(
@@ -518,6 +523,10 @@ impl TychoFeed {
                 market_data.update_states(updated_or_new_states);
                 market_data.update_sync_status(sync_states, self.config.max_sync_lag);
 
+                added_topology = added_ids
+                    .iter()
+                    .filter_map(|id| Some((id.clone(), market_data.topology_of(id)?)))
+                    .collect();
                 latest_component_count = market_data.component_count();
                 token_count = market_data.token_count();
                 unsynced_protocol_count = market_data.unsynced_protocols().len();
@@ -546,19 +555,7 @@ impl TychoFeed {
             !updated_components_ids.is_empty()
         {
             let market_update_event = MarketEvent::MarketUpdated {
-                added_components: added_components
-                    .into_iter()
-                    .map(|(id, component)| {
-                        (
-                            id,
-                            component
-                                .tokens
-                                .into_iter()
-                                .map(|token| token.address)
-                                .collect(),
-                        )
-                    })
-                    .collect(),
+                added_components: added_topology,
                 removed_components: removed_components.into_keys().collect(),
                 updated_components: updated_components_ids
                     .into_iter()
@@ -591,20 +588,11 @@ impl TychoFeed {
         );
 
         let update_start = Instant::now();
-        let component_tokens: Vec<(ComponentId, Vec<Bytes>)> = added
+        let added_ids: Vec<ComponentId> = added
             .iter()
-            .map(|component| {
-                (
-                    component.id.to_string(),
-                    component
-                        .tokens
-                        .iter()
-                        .map(|token| token.address.clone())
-                        .collect(),
-                )
-            })
+            .map(|component| component.id.to_string())
             .collect();
-        let (component_count, token_count) = {
+        let (added_topology, component_count, token_count) = {
             let mut market_data = self
                 .market_data
                 .write()
@@ -618,7 +606,11 @@ impl TychoFeed {
             market_data.upsert_components(added.into_iter().map(market_component));
             market_data.remove_components(removed.iter());
             market_data.update_states(states);
-            (market_data.component_count(), market_data.token_count())
+            let added_topology: FxHashMap<ComponentId, ComponentTopology> = added_ids
+                .iter()
+                .filter_map(|id| Some((id.clone(), market_data.topology_of(id)?)))
+                .collect();
+            (added_topology, market_data.component_count(), market_data.token_count())
         };
 
         histogram!("market_update_duration_seconds").record(update_start.elapsed().as_secs_f64());
@@ -627,7 +619,7 @@ impl TychoFeed {
 
         self.event_tx
             .send(MarketEvent::MarketUpdated {
-                added_components: component_tokens.into_iter().collect(),
+                added_components: added_topology,
                 removed_components: removed,
                 updated_components,
             })

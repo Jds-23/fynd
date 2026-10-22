@@ -19,7 +19,7 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, trace, warn};
 use tycho_simulation::tycho_common::models::Address;
 
-use crate::types::ComponentId;
+use crate::types::{ComponentId, ComponentTopology};
 
 /// Information about which components changed in a market update.
 ///
@@ -27,9 +27,9 @@ use crate::types::ComponentId;
 /// for components that actually changed.
 #[derive(Debug, Clone, Default)]
 pub struct ChangedComponents {
-    /// Newly added components with their token addresses. At startup this carries every
-    /// component in the market.
-    pub added: FxHashMap<ComponentId, Vec<Address>>,
+    /// Newly added components with their tokens and swap directions. At startup this carries
+    /// every component in the market.
+    pub added: FxHashMap<ComponentId, ComponentTopology>,
     /// Components that were removed.
     pub removed: Vec<ComponentId>,
     /// Components whose state was updated (but not added/removed).
@@ -54,7 +54,7 @@ impl ChangedComponents {
 ///
 /// Returns `None` when the batch carries no net changes.
 fn coalesce_market_events(events: &[MarketEvent]) -> Option<ChangedComponents> {
-    let mut added: FxHashMap<ComponentId, Vec<Address>> = FxHashMap::default();
+    let mut added: FxHashMap<ComponentId, ComponentTopology> = FxHashMap::default();
     let mut removed: FxHashSet<ComponentId> = FxHashSet::default();
     let mut updated: FxHashSet<ComponentId> = FxHashSet::default();
 
@@ -65,10 +65,10 @@ fn coalesce_market_events(events: &[MarketEvent]) -> Option<ChangedComponents> {
                 removed_components,
                 updated_components,
             } => {
-                for (id, tokens) in added_components {
+                for (id, topology) in added_components {
                     removed.remove(id);
                     updated.remove(id);
-                    added.insert(id.clone(), tokens.clone());
+                    added.insert(id.clone(), topology.clone());
                 }
                 for id in removed_components {
                     added.remove(id);

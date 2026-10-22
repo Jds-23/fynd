@@ -45,7 +45,7 @@ pub trait GraphManager<G>: Send + Sync
 where
     G: Send + Sync,
 {
-    fn initialize_graph(&mut self, components: &FxHashMap<ComponentId, Vec<Address>>);
+    fn initialize_graph(&mut self, components: &FxHashMap<ComponentId, ComponentTopology>);
     fn graph(&self) -> &G;
 }
 ```
