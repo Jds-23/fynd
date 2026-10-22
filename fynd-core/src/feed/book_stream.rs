@@ -19,8 +19,8 @@ use itertools::Itertools;
 use tracing::{debug, info, warn};
 use tycho_simulation::{
     book::{
-        quote_tokens::usd_stablecoins_for_chain, BookFeedConfig, BookFeedEvent, BookFeedStreams,
-        BookSnapshot, ReceivedAt,
+        all_pairs::QuoteRule, quote_tokens::usd_stablecoins_for_chain, BookFeedConfig,
+        BookFeedEvent, BookFeedStreams, BookSnapshot, ReceivedAt,
     },
     evm::tycho_models::Chain,
     pamm::protocols::metric::{self, feed::MetricFeedBuilder},
@@ -51,8 +51,9 @@ pub struct BookUpdate {
     pub added: Vec<ProtocolComponent>,
     /// Components the market has that the venue no longer serves.
     pub removed: Vec<ComponentId>,
-    /// The ids whose state the venue refreshed, the added ones excluded.
-    pub updated: Vec<ComponentId>,
+    /// Components the market has whose state the venue refreshed. Each comes with its component,
+    /// because an all-pairs venue keeps its id while the swap directions it lists change.
+    pub updated: Vec<ProtocolComponent>,
     /// The state of every book the venue currently serves, the added ones included.
     pub states: HashMap<ComponentId, Box<dyn ProtocolSim>>,
 }
@@ -81,7 +82,8 @@ impl BookStream {
     /// Subscribes to every `rfq:` entry in `protocols`, or `None` when it names none.
     ///
     /// The venues price their books' TVL in USD stablecoins, so `min_tvl_usd` is a USD amount —
-    /// unlike the native-token threshold the Tycho component filter takes.
+    /// unlike the native-token threshold the Tycho component filter takes. With `aggregate_rfqs`,
+    /// Bebop and Hashflow each stream as one component for all their pairs.
     ///
     /// # Errors
     ///
@@ -92,6 +94,7 @@ impl BookStream {
         min_tvl_usd: f64,
         protocols: &[String],
         tokens: HashMap<Bytes, Token>,
+        aggregate_rfqs: bool,
     ) -> Result<Option<Self>, DataFeedError> {
         let mut venues = Vec::new();
         for (entry, venue) in parse_rfq_entries(protocols)? {
@@ -159,6 +162,9 @@ impl BookStream {
                     if let Ok(source) = std::env::var("BEBOP_ORIGIN_SOURCE") {
                         builder = builder.origin_source(source);
                     }
+                    if aggregate_rfqs {
+                        builder = builder.all_pairs();
+                    }
                     if venue.uses_fallback_router() {
                         builder = builder.with_fallback_router();
                     }
@@ -174,6 +180,9 @@ impl BookStream {
                         get_env("HASHFLOW_USER")?,
                         get_env("HASHFLOW_KEY")?,
                     );
+                    if aggregate_rfqs {
+                        builder = builder.all_pairs(QuoteRule::OncePerMaker);
+                    }
                     if venue.uses_fallback_router() {
                         builder = builder.with_fallback_router();
                     }
@@ -324,7 +333,7 @@ impl BookStream {
         let mut current = HashSet::with_capacity(books.len());
         for (id, book) in books.iter() {
             if served.contains(id) {
-                updated.push(id.clone());
+                updated.push(book.component.clone());
             } else {
                 added.push(book.component.clone());
             }
@@ -456,7 +465,11 @@ mod tests {
         assert!(update.added.is_empty());
         assert!(update.removed.is_empty());
         // The venue's books arrive in a `HashMap`, so the refreshed ids carry its order.
-        let mut updated = update.updated.clone();
+        let mut updated: Vec<String> = update
+            .updated
+            .iter()
+            .map(|component| component.id.to_string())
+            .collect();
         updated.sort();
         assert_eq!(updated, ["0x01", "0x02"]);
     }

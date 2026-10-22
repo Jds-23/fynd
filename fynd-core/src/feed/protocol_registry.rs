@@ -965,6 +965,7 @@ mod tests {
                 .map(|entry| (*entry).to_string())
                 .collect::<Vec<_>>(),
             HashMap::new(),
+            false,
         )
     }
 
