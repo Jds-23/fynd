@@ -35,6 +35,7 @@ use tycho_simulation::{
         stream::ProtocolStreamBuilder,
         tycho_models::Chain,
     },
+    pamm::protocols::metric,
     price_level_stream::{config::default_served_pamms, stream::PriceLevelStreamBuilder},
     protocol::models::Update,
     tycho_client::feed::{component_tracker::ComponentFilter, synchronizer::ComponentWithState},
@@ -140,9 +141,10 @@ pub(crate) const METRIC_CHAINS: &[Chain] =
 
 /// The price level stream venue that is Metric.
 ///
-/// Fynd serves Metric through its book feed on every chain in [`METRIC_CHAINS`], Ethereum
-/// included, so the price level stream refuses it: serving Metric both ways would stream the same
-/// inventory twice.
+/// On Ethereum, Metric is served both by the price level stream (`pricelevelstream:metric`,
+/// executing through Titan's Metric router) and by the book feed (`fallback:rfq:metric`,
+/// executing through `MetricFallbackRouter`). Both price the same pools, so a list may name one
+/// of them but not both: together they would stream the same inventory twice.
 const METRIC_PRICE_LEVEL_VENUE: &str = "metric";
 
 /// Whether a `--protocols` entry names a Tycho protocol system.
@@ -574,17 +576,19 @@ pub(crate) fn open_price_level_stream(
         )));
     }
 
-    let served: Vec<_> = default_served_pamms()
-        .into_iter()
-        .filter(|config| config.protocol != METRIC_PRICE_LEVEL_VENUE)
-        .collect();
+    let served = default_served_pamms();
     let mut builder = PriceLevelStreamBuilder::new().with_tokens(tokens.clone());
     for venue in venues {
         if venue == METRIC_PRICE_LEVEL_VENUE {
-            return Err(DataFeedError::Config(format!(
-                "{PRICE_LEVEL_STREAM_PREFIX}{venue} is not served: Fynd serves Metric through its \
-                 book feed, so name fallback:rfq:metric instead"
-            )));
+            if let Some(book_entry) = protocols.iter().find(|protocol| {
+                RfqEntry::parse(protocol)
+                    .is_some_and(|entry| entry.protocol() == metric::PROTOCOL_SYSTEM)
+            }) {
+                return Err(DataFeedError::Config(format!(
+                    "{PRICE_LEVEL_STREAM_PREFIX}{venue} and {book_entry} serve the same Metric \
+                     pools; name only one of them"
+                )));
+            }
         }
         let Some(config) = served
             .iter()
@@ -1248,34 +1252,41 @@ mod tests {
         };
     }
 
-    /// The book feed serves Metric on the stream's own chain, so the stream refuses the venue
-    /// rather than stream the same inventory twice.
     #[test]
     fn test_open_price_level_stream_metric() {
-        assert!(METRIC_CHAINS.contains(&PRICE_LEVEL_STREAM_CHAIN));
-        for entries in [
-            vec!["pricelevelstream:metric"],
-            vec!["pricelevelstream:fermiswap", "pricelevelstream:metric"],
-        ] {
-            let Err(err) = price_level_stream(Chain::Ethereum, &entries) else {
-                panic!("expected pricelevelstream:metric to be rejected in {entries:?}");
-            };
-            assert!(
-                err.to_string()
-                    .contains("name fallback:rfq:metric instead"),
-                "got {err}"
-            );
-        }
+        let Ok(Some(_)) = price_level_stream(Chain::Ethereum, &["pricelevelstream:metric"]) else {
+            panic!("expected metric to be served by the price level stream");
+        };
     }
 
-    #[test]
-    fn test_open_price_level_stream_unknown_venue_lists_no_metric() {
-        let Err(err) = price_level_stream(Chain::Ethereum, &["pricelevelstream:nope"]) else {
-            panic!("expected an unserved venue to be rejected");
+    /// The book feed serves Metric on the stream's own chain, so naming both would stream the same
+    /// pools twice.
+    #[rstest::rstest]
+    #[case::via_fallback_router("fallback:rfq:metric")]
+    #[case::direct("rfq:metric")]
+    fn test_open_price_level_stream_metric_with_book_feed(#[case] book_entry: &str) {
+        assert!(METRIC_CHAINS.contains(&PRICE_LEVEL_STREAM_CHAIN));
+        let Err(err) = price_level_stream(
+            Chain::Ethereum,
+            &["uniswap_v3", "pricelevelstream:metric", book_entry],
+        ) else {
+            panic!("expected pricelevelstream:metric and {book_entry} to be rejected together");
         };
-        let message = err.to_string();
-        assert!(message.contains("fermiswap"), "got {message}");
-        assert!(!message.contains("metric"), "got {message}");
+        assert!(
+            err.to_string()
+                .contains("name only one of them"),
+            "got {err}"
+        );
+    }
+
+    /// Another book feed beside the stream's Metric does not overlap it.
+    #[test]
+    fn test_open_price_level_stream_metric_with_other_book_feed() {
+        let Ok(Some(_)) =
+            price_level_stream(Chain::Ethereum, &["pricelevelstream:metric", "fallback:rfq:bebop"])
+        else {
+            panic!("expected metric to be served beside Bebop's book feed");
+        };
     }
 
     #[rstest::rstest]

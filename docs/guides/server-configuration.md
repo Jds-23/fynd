@@ -59,7 +59,7 @@ fynd serve \
 * `rfq:` venues cannot serve quotes on their own. At least one on-chain protocol is required. Fynd does start and the feed does publish, but books carry no block, so with no on-chain protocol the market never gets a block label, derived data never builds, and every quote returns `not_ready`.
 * When encoding is enabled (`encoding_options` in the quote request), the RFQ venues `rfq:bebop`, `rfq:hashflow`, `rfq:native` and `rfq:liquorice` require an additional round-trip to the provider to fetch a signed quote. This can add significant tail latency to solve times. If you are using these venues, consider quoting first without encoding to evaluate the price, and only request encoding once you are confident the quote is worth executing. `rfq:metric` encodes locally and needs no such round-trip — its executor reads the on-chain oracle Metric updates every block.
 * Metric runs on Ethereum, Base, Robinhood, BSC, Arbitrum and Polygon only. Each entry also needs its executor on the chain: `fallback:rfq:metric` runs on all six, and `rfq:metric` on Base, Robinhood, Arbitrum and Polygon. Ethereum and BSC have only the fallback executor. Naming an entry where its executor is missing fails at startup rather than producing quotes that cannot be encoded.
-* Metric is served through its book feed on every chain, Ethereum included: use `fallback:rfq:metric` there. The pAMM price level stream refuses `pricelevelstream:metric`, so the same Metric inventory is never streamed twice.
+* On Ethereum, Metric can come from either source: `fallback:rfq:metric` (Metric's API, executing through `MetricFallbackRouter`) or `pricelevelstream:metric` (Titan's price level stream, executing through Titan's Metric router). Both price the same pools, so name only one of them; a list naming both fails at startup.
 * On Ethereum, a Metric pool fills only in blocks whose builder places Metric's oracle update before the trade (Titan and the other builders taking part in Metric's conditional updates). In any other block the `MetricFallbackRouter` fills the leg on the fallback pool Fynd names instead.
 
 **Environment variables:**
@@ -73,9 +73,9 @@ fynd serve \
 
 Serve a proprietary AMM from Titan's pAMM price level stream instead of simulating it in the EVM. Titan publishes a quote ladder per pair every block, so quotes come from interpolating those levels — much cheaper than a VM simulation.
 
-Name a venue with the `pricelevelstream:` prefix. The served venues are `fermiswap`, `kipseli`, `bebop`, `taurusfi`, `tempest`, `goliath`, `stelaxis`, and `elzorro`:
+Name a venue with the `pricelevelstream:` prefix. The served venues are `fermiswap`, `kipseli`, `metric`, `bebop`, `taurusfi`, `tempest`, `goliath`, `stelaxis`, and `elzorro`:
 
-The stream serves Ethereum only. Metric is not served here: it is reached through `fallback:rfq:metric` on Ethereum, and `rfq:metric` or `fallback:rfq:metric` elsewhere — see [Including Off-Chain Priced Venues](#including-off-chain-priced-venues).
+The stream serves Ethereum only. `pricelevelstream:metric` and Metric's book feed (`rfq:metric` or `fallback:rfq:metric`) price the same pools, so name only one of them — see [Including Off-Chain Priced Venues](#including-off-chain-priced-venues).
 
 ```bash
 fynd serve \
