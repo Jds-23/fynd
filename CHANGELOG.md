@@ -1,4 +1,12 @@
 
+## [0.114.3](https://github.com/propeller-heads/fynd/compare/0.114.2...0.114.3) (2026-10-22)
+
+### Features
+
+* **core:** let the calldata hook write into the swaps bytes ([9573e0e](https://github.com/propeller-heads/fynd/commit/9573e0e1f862e5346f08ef7badb2c241bf09076a))
+* **core:** add solution and calldata hooks to encoding ([5f5ce22](https://github.com/propeller-heads/fynd/commit/5f5ce220660d4046328d98b8e8d7b83505bfd949))
+
+
 ## [0.114.2](https://github.com/propeller-heads/fynd/compare/0.114.1...0.114.2) (2026-10-21)
 
 ### Features
