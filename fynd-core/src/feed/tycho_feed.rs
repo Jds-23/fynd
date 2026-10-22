@@ -1208,9 +1208,21 @@ mod tests {
 
     const VENUE: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    /// Sends a venue that lists `directions`, given as indexes into `tokens`, the way tycho
-    /// re-sends an aggregated RFQ venue.
-    async fn send_venue(feed: &TychoFeed, tokens: &[Token], directions: &[(usize, usize)]) {
+    /// The feed that delivers a venue to the market.
+    #[derive(Clone, Copy)]
+    enum VenueSource {
+        Tycho,
+        Book,
+    }
+
+    /// Sends a venue that lists `directions`, given as indexes into `tokens`. Tycho re-sends an
+    /// aggregated RFQ venue as a new pair; a book feed lists it as refreshed once it serves it.
+    async fn send_venue(
+        feed: &TychoFeed,
+        source: VenueSource,
+        tokens: &[Token],
+        directions: &[(usize, usize)],
+    ) {
         let directions: std::collections::BTreeSet<_> = directions
             .iter()
             .map(|&(token_in, token_out)| {
@@ -1225,16 +1237,44 @@ mod tests {
             VENUE.to_string(),
             Box::new(FeedMockProtocolSim::new(1.0)) as Box<dyn ProtocolSim>,
         )]);
-        let update = Update::new(12345, states, HashMap::from([(VENUE.to_string(), venue)]));
-        feed.handle_tycho_message(update)
-            .await
-            .expect("Failed to handle message");
+        match source {
+            VenueSource::Tycho => {
+                let update =
+                    Update::new(12345, states, HashMap::from([(VENUE.to_string(), venue)]));
+                feed.handle_tycho_message(update)
+                    .await
+                    .expect("Failed to handle message");
+            }
+            VenueSource::Book => {
+                let served = feed
+                    .market_data
+                    .read()
+                    .await
+                    .topology_of(VENUE)
+                    .is_some();
+                let (added, updated) =
+                    if served { (vec![], vec![venue]) } else { (vec![venue], vec![]) };
+                let update = BookUpdate {
+                    protocol_system: "rfq:test".to_string(),
+                    added,
+                    removed: vec![],
+                    updated,
+                    states,
+                };
+                feed.handle_book_update(update)
+                    .await
+                    .expect("Failed to handle book update");
+            }
+        }
     }
 
     /// A re-sent venue with the same swap directions is a state update. With other swap
     /// directions it is added again.
+    #[rstest::rstest]
+    #[case::tycho(VenueSource::Tycho)]
+    #[case::book(VenueSource::Book)]
     #[tokio::test]
-    async fn test_handle_message_resent_component() {
+    async fn test_handle_resent_component(#[case] source: VenueSource) {
         let feed = TychoFeed::new(create_test_config(), new_shared_market_data());
         let mut event_rx = feed.subscribe();
         let tokens = [
@@ -1242,9 +1282,9 @@ mod tests {
             create_test_token("0x2222222222222222222222222222222222222222", "TKN2"),
         ];
 
-        send_venue(&feed, &tokens, &[(0, 1)]).await;
-        send_venue(&feed, &tokens, &[(0, 1)]).await;
-        send_venue(&feed, &tokens, &[(0, 1), (1, 0)]).await;
+        send_venue(&feed, source, &tokens, &[(0, 1)]).await;
+        send_venue(&feed, source, &tokens, &[(0, 1)]).await;
+        send_venue(&feed, source, &tokens, &[(0, 1), (1, 0)]).await;
 
         let MarketEvent::MarketUpdated { added_components, .. } = event_rx.try_recv().unwrap();
         assert_eq!(

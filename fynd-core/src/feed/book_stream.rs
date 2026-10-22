@@ -465,7 +465,11 @@ mod tests {
         assert!(update.added.is_empty());
         assert!(update.removed.is_empty());
         // The venue's books arrive in a `HashMap`, so the refreshed ids carry its order.
-        let mut updated = update.updated.clone();
+        let mut updated: Vec<String> = update
+            .updated
+            .iter()
+            .map(|component| component.id.to_string())
+            .collect();
         updated.sort();
         assert_eq!(updated, ["0x01", "0x02"]);
     }
