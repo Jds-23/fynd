@@ -101,7 +101,8 @@ See `fynd-core/examples/custom_algorithm.rs` for a walkthrough.
 `tests/integration/` replays a recorded market (`tests/fixtures/`, Git LFS) through the full
 pipeline and asserts solution availability, quality vs baseline, derived-data metrics, and timing.
 Run with `cargo nextest run -p fynd-core --features test-utils --test integration`. The
-`test-utils` feature gates `Solver::from_recording` and the recording helpers; fixtures are
+`test-utils` feature gates `Solver::from_recording`, the recording helpers, and
+`OrderQuote::with_route_for_testing` (an encodable quote for tests in other crates); fixtures are
 recorded with `tools/record-market`. See `tests/integration/README.md`.
 
 ## Data Flow
