@@ -2797,518 +2797,554 @@ mod tests {
         );
     }
 
-    // ==================== Encoding Hook Tests ====================
+    mod encoding_hooks {
+        use super::*;
 
-    /// Rebuilds `solution` with the given receiver and amounts out.
-    fn rebuilt_solution(
-        solution: &Solution,
-        receiver: Bytes,
-        expected_amount_out: BigUint,
-        min_amount_out: BigUint,
-    ) -> Solution {
-        let rebuilt = Solution::new(
-            solution.sender().clone(),
-            receiver,
-            solution.token_in().clone(),
-            solution.token_out().clone(),
-            solution.amount_in().clone(),
-            expected_amount_out,
-            min_amount_out,
-            solution.swaps().to_vec(),
-        )
-        .with_user_transfer_type(solution.user_transfer_type().clone());
-        match solution.origin() {
-            Some(origin) => rebuilt.with_origin(origin.clone()),
-            None => rebuilt,
-        }
-    }
-
-    /// Replaces the solution's expected amount out.
-    #[derive(Debug)]
-    struct SetExpectedAmountOut(BigUint);
-
-    impl SolutionHook for SetExpectedAmountOut {
-        fn apply(&self, _quote: &OrderQuote, solution: Solution) -> Result<Solution, SolveError> {
-            Ok(rebuilt_solution(
-                &solution,
-                solution.receiver().clone(),
-                self.0.clone(),
-                solution.min_amount_out().clone(),
-            ))
-        }
-    }
-
-    /// Replaces the solution's minimum amount out.
-    #[derive(Debug)]
-    struct SetMinAmountOut(BigUint);
-
-    impl SolutionHook for SetMinAmountOut {
-        fn apply(&self, _quote: &OrderQuote, solution: Solution) -> Result<Solution, SolveError> {
-            Ok(rebuilt_solution(
-                &solution,
-                solution.receiver().clone(),
-                solution.expected_amount_out().clone(),
-                self.0.clone(),
-            ))
-        }
-    }
-
-    /// Replaces the solution's receiver.
-    #[derive(Debug)]
-    struct SetReceiver(Bytes);
-
-    impl SolutionHook for SetReceiver {
-        fn apply(&self, _quote: &OrderQuote, solution: Solution) -> Result<Solution, SolveError> {
-            Ok(rebuilt_solution(
-                &solution,
-                self.0.clone(),
-                solution.expected_amount_out().clone(),
-                solution.min_amount_out().clone(),
-            ))
-        }
-    }
-
-    /// Records the `min_amount_out` of the solution it receives and returns the solution.
-    #[derive(Debug, Default)]
-    struct RecordMinAmountOut {
-        received: std::sync::Mutex<Option<BigUint>>,
-    }
-
-    impl SolutionHook for RecordMinAmountOut {
-        fn apply(&self, _quote: &OrderQuote, solution: Solution) -> Result<Solution, SolveError> {
-            *self.received.lock().unwrap() = Some(solution.min_amount_out().clone());
-            Ok(solution)
-        }
-    }
-
-    /// Writes its bytes over the client fee signature placeholder and records the length of the
-    /// calldata it received.
-    #[derive(Debug)]
-    struct WriteClientFeeSignature {
-        signature: [u8; 65],
-        received_len: std::sync::Mutex<Option<usize>>,
-    }
-
-    impl CalldataHook for WriteClientFeeSignature {
-        fn apply(
-            &self,
-            _quote: &OrderQuote,
-            _solution: &Solution,
-            encoded: &EncodedSolution,
-            calldata: &mut [u8],
-        ) -> Result<(), SolveError> {
-            *self.received_len.lock().unwrap() = Some(calldata.len());
-            let offset = encoded.client_fee_signature_offset();
-            calldata[offset..offset + 65].copy_from_slice(&self.signature);
-            Ok(())
-        }
-    }
-
-    /// Fails the quote of one order and passes every other quote through.
-    #[derive(Debug)]
-    struct FailOrder {
-        order_id: &'static str,
-    }
-
-    impl FailOrder {
-        fn fail_if_order(&self, quote: &OrderQuote) -> Result<(), SolveError> {
-            if quote.order_id() == self.order_id {
-                return Err(SolveError::FailedEncoding("the hook rejected this quote".to_string()));
+        /// Rebuilds `solution` with the given receiver and amounts out.
+        fn rebuilt_solution(
+            solution: &Solution,
+            receiver: Bytes,
+            expected_amount_out: BigUint,
+            min_amount_out: BigUint,
+        ) -> Solution {
+            let rebuilt = Solution::new(
+                solution.sender().clone(),
+                receiver,
+                solution.token_in().clone(),
+                solution.token_out().clone(),
+                solution.amount_in().clone(),
+                expected_amount_out,
+                min_amount_out,
+                solution.swaps().to_vec(),
+            )
+            .with_user_transfer_type(solution.user_transfer_type().clone());
+            match solution.origin() {
+                Some(origin) => rebuilt.with_origin(origin.clone()),
+                None => rebuilt,
             }
-            Ok(())
         }
-    }
 
-    impl SolutionHook for FailOrder {
-        fn apply(&self, quote: &OrderQuote, solution: Solution) -> Result<Solution, SolveError> {
-            self.fail_if_order(quote)?;
-            Ok(solution)
+        /// Replaces the solution's expected amount out.
+        #[derive(Debug)]
+        struct SetExpectedAmountOut(BigUint);
+
+        impl SolutionHook for SetExpectedAmountOut {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                Ok(rebuilt_solution(
+                    &solution,
+                    solution.receiver().clone(),
+                    self.0.clone(),
+                    solution.min_amount_out().clone(),
+                ))
+            }
         }
-    }
 
-    impl CalldataHook for FailOrder {
-        fn apply(
-            &self,
-            quote: &OrderQuote,
-            _solution: &Solution,
-            _encoded: &EncodedSolution,
-            _calldata: &mut [u8],
-        ) -> Result<(), SolveError> {
-            self.fail_if_order(quote)
+        /// Replaces the solution's minimum amount out.
+        #[derive(Debug)]
+        struct SetMinAmountOut(BigUint);
+
+        impl SolutionHook for SetMinAmountOut {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                Ok(rebuilt_solution(
+                    &solution,
+                    solution.receiver().clone(),
+                    solution.expected_amount_out().clone(),
+                    self.0.clone(),
+                ))
+            }
         }
-    }
 
-    #[tokio::test]
-    async fn test_solution_hook_changes_expected_amount_out() {
-        let encoder = real_encoder();
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let hook = SetExpectedAmountOut(BigUint::from(1_500u64));
-        let opts = EncodingOptions::new(0.01)
-            .with_client_fee_params(make_client_fee(100))
-            .with_solution_hook(Arc::new(hook));
+        /// Replaces the solution's receiver.
+        #[derive(Debug)]
+        struct SetReceiver(Bytes);
 
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
+        impl SolutionHook for SetReceiver {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                Ok(rebuilt_solution(
+                    &solution,
+                    self.0.clone(),
+                    solution.expected_amount_out().clone(),
+                    solution.min_amount_out().clone(),
+                ))
+            }
+        }
 
-        assert_eq!(result[0].status(), QuoteStatus::Success);
-        let tx = result[0].transaction().unwrap();
-        let (_, _, _, expected_amount_out, min_amount_out, _, _, _) =
-            <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
-        assert_eq!(expected_amount_out, U256::from(1_500u64));
-        assert_eq!(*result[0].amount_out(), BigUint::from(1_500u64));
-        let min_amount_received = result[0]
-            .fee_breakdown()
-            .unwrap()
-            .min_amount_received();
-        assert_eq!(min_amount_out, biguint_to_u256(min_amount_received));
-        assert!(*min_amount_received < BigUint::from(990u64));
-    }
+        /// Records the `min_amount_out` of the solution it receives and returns the solution.
+        #[derive(Debug, Default)]
+        struct RecordMinAmountOut {
+            received: std::sync::Mutex<Option<BigUint>>,
+        }
 
-    #[tokio::test]
-    async fn test_solution_hook_with_client_fee() {
-        let encoder = real_encoder();
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
-        let hook = Arc::new(RecordMinAmountOut::default());
+        impl SolutionHook for RecordMinAmountOut {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                *self.received.lock().unwrap() = Some(solution.min_amount_out().clone());
+                Ok(solution)
+            }
+        }
 
-        let without_hook = encoder
-            .encode(vec![quote.clone()], opts.clone())
-            .await
-            .unwrap();
-        encoder
-            .encode(vec![quote], opts.with_solution_hook(hook.clone()))
-            .await
-            .unwrap();
+        /// Writes its bytes over the client fee signature placeholder and records the length of the
+        /// calldata it received.
+        #[derive(Debug)]
+        struct WriteClientFeeSignature {
+            signature: [u8; 65],
+            received_len: std::sync::Mutex<Option<usize>>,
+        }
 
-        let received = hook
-            .received
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("the solution hook ran");
-        assert_eq!(
-            &received,
-            without_hook[0]
+        impl CalldataHook for WriteClientFeeSignature {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                _solution: &Solution,
+                encoded: &EncodedSolution,
+                calldata: &mut [u8],
+            ) -> Result<(), SolveError> {
+                *self.received_len.lock().unwrap() = Some(calldata.len());
+                let offset = encoded.client_fee_signature_offset();
+                calldata[offset..offset + 65].copy_from_slice(&self.signature);
+                Ok(())
+            }
+        }
+
+        /// Fails the quote of one order and passes every other quote through.
+        #[derive(Debug)]
+        struct FailOrder {
+            order_id: &'static str,
+        }
+
+        impl FailOrder {
+            fn fail_if_order(&self, quote: &OrderQuote) -> Result<(), SolveError> {
+                if quote.order_id() == self.order_id {
+                    return Err(SolveError::FailedEncoding(
+                        "the hook rejected this quote".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        impl SolutionHook for FailOrder {
+            fn apply(
+                &self,
+                quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                self.fail_if_order(quote)?;
+                Ok(solution)
+            }
+        }
+
+        impl CalldataHook for FailOrder {
+            fn apply(
+                &self,
+                quote: &OrderQuote,
+                _solution: &Solution,
+                _encoded: &EncodedSolution,
+                _calldata: &mut [u8],
+            ) -> Result<(), SolveError> {
+                self.fail_if_order(quote)
+            }
+        }
+
+        #[tokio::test]
+        async fn test_solution_hook_changes_expected_amount_out() {
+            let encoder = real_encoder();
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let hook = SetExpectedAmountOut(BigUint::from(1_500u64));
+            let opts = EncodingOptions::new(0.01)
+                .with_client_fee_params(make_client_fee(100))
+                .with_solution_hook(Arc::new(hook));
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            assert_eq!(result[0].status(), QuoteStatus::Success);
+            let tx = result[0].transaction().unwrap();
+            let (_, _, _, expected_amount_out, min_amount_out, _, _, _) =
+                <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
+            assert_eq!(expected_amount_out, U256::from(1_500u64));
+            assert_eq!(*result[0].amount_out(), BigUint::from(1_500u64));
+            let min_amount_received = result[0]
                 .fee_breakdown()
                 .unwrap()
-                .min_amount_received()
-        );
-    }
+                .min_amount_received();
+            assert_eq!(min_amount_out, biguint_to_u256(min_amount_received));
+            assert!(*min_amount_received < BigUint::from(990u64));
+        }
 
-    #[rstest]
-    #[case::changed_min(Arc::new(SetMinAmountOut(BigUint::from(1u64))))]
-    #[case::expected_below_min(Arc::new(SetExpectedAmountOut(BigUint::from(1u64))))]
-    #[case::changed_receiver(Arc::new(SetReceiver(Bytes::from(make_address(0xCC).as_ref()))))]
-    #[case::changed_swaps(Arc::new(SetSwapUserData))]
-    #[case::replaced_protocol_state(Arc::new(ReplaceProtocolState))]
-    #[tokio::test]
-    async fn test_solution_hook_invalid_output(#[case] hook: Arc<dyn SolutionHook>) {
-        let encoder = real_encoder();
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_solution_hook(hook);
+        #[tokio::test]
+        async fn test_solution_hook_with_client_fee() {
+            let encoder = real_encoder();
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
+            let hook = Arc::new(RecordMinAmountOut::default());
 
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .expect("an invalid hooked solution is reported on its quote, not on the call");
+            let without_hook = encoder
+                .encode(vec![quote.clone()], opts.clone())
+                .await
+                .unwrap();
+            encoder
+                .encode(vec![quote], opts.with_solution_hook(hook.clone()))
+                .await
+                .unwrap();
 
-        assert_eq!(result[0].status(), QuoteStatus::EncodingFailed);
-        assert!(result[0].transaction().is_none());
-        assert_eq!(*result[0].amount_out(), BigUint::from(990u64));
-    }
+            let received = hook
+                .received
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the solution hook ran");
+            assert_eq!(
+                &received,
+                without_hook[0]
+                    .fee_breakdown()
+                    .unwrap()
+                    .min_amount_received()
+            );
+        }
 
-    #[tokio::test]
-    async fn test_solution_hook_with_disable_slippage_taking() {
-        let signer = disable_slippage_taking_signer();
-        let signer_address = signer.receiver();
-        let encoder = real_encoder().with_disable_slippage_taking_signer(signer);
-        let quote = make_order_quote(1_000_000_000)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let hook = SetExpectedAmountOut(BigUint::from(1_500_000_000u64));
-        let opts = EncodingOptions::new(0.01)
-            .with_disable_slippage_taking(true)
-            .with_solution_hook(Arc::new(hook));
+        #[rstest]
+        #[case::changed_min(Arc::new(SetMinAmountOut(BigUint::from(1u64))))]
+        #[case::expected_below_min(Arc::new(SetExpectedAmountOut(BigUint::from(1u64))))]
+        #[case::changed_receiver(Arc::new(SetReceiver(Bytes::from(make_address(0xCC).as_ref()))))]
+        #[case::changed_swaps(Arc::new(SetSwapUserData))]
+        #[case::replaced_protocol_state(Arc::new(ReplaceProtocolState))]
+        #[tokio::test]
+        async fn test_solution_hook_invalid_output(#[case] hook: Arc<dyn SolutionHook>) {
+            let encoder = real_encoder();
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_solution_hook(hook);
 
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .expect("an invalid hooked solution is reported on its quote, not on the call");
 
-        let tx = result[0].transaction().unwrap();
-        let (
-            amount_in,
-            token_in,
-            token_out,
-            expected_amount_out,
-            min_amount_out,
-            receiver,
-            client_fee,
-            swaps,
-        ) = <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
-        let (_, fee_receiver, _, deadline, signature) = client_fee;
-        assert_eq!(expected_amount_out, U256::from(1_500_000_000u64));
-        // The signature must cover the hooked amounts, or the router rejects the swap.
-        let signing_hash = router_signing_hash(
-            fee_receiver,
-            &SwapIntent {
+            assert_eq!(result[0].status(), QuoteStatus::EncodingFailed);
+            assert!(result[0].transaction().is_none());
+            assert_eq!(*result[0].amount_out(), BigUint::from(990u64));
+        }
+
+        #[tokio::test]
+        async fn test_solution_hook_with_disable_slippage_taking() {
+            let signer = disable_slippage_taking_signer();
+            let signer_address = signer.receiver();
+            let encoder = real_encoder().with_disable_slippage_taking_signer(signer);
+            let quote = make_order_quote(1_000_000_000)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let hook = SetExpectedAmountOut(BigUint::from(1_500_000_000u64));
+            let opts = EncodingOptions::new(0.01)
+                .with_disable_slippage_taking(true)
+                .with_solution_hook(Arc::new(hook));
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            let (
                 amount_in,
                 token_in,
                 token_out,
                 expected_amount_out,
                 min_amount_out,
                 receiver,
-                swaps: &swaps,
-            },
-            deadline.to::<u64>(),
-            SIGNER_CHAIN_ID,
-            SIGNER_ROUTER,
-        );
-        let recovered = Signature::try_from(signature.as_ref())
-            .unwrap()
-            .recover_address_from_prehash(&signing_hash)
-            .unwrap();
-        assert_eq!(recovered, signer_address);
-    }
-
-    #[tokio::test]
-    async fn test_calldata_hook_with_watermark() {
-        let encoder = real_encoder();
-        let signature = [0xAB; 65];
-        let hook = Arc::new(WriteClientFeeSignature {
-            signature,
-            received_len: std::sync::Mutex::new(None),
-        });
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01)
-            .with_client_fee_params(make_client_fee(100))
-            .with_calldata_watermark("fynd")
-            .with_calldata_hook(hook.clone());
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let tx = result[0].transaction().unwrap();
-        let offset = tx
-            .client_fee_signature_offset()
-            .unwrap();
-        assert_eq!(&tx.data()[offset..offset + 65], &signature[..]);
-        assert!(tx.data().ends_with(b"fynd"));
-        let received_len = hook
-            .received_len
-            .lock()
-            .unwrap()
-            .expect("the calldata hook ran");
-        assert_eq!(received_len, tx.data().len() - b"fynd".len());
-    }
-
-    #[rstest]
-    #[case::solution_hook(
-        EncodingOptions::new(0.01).with_solution_hook(Arc::new(FailOrder { order_id: "fails" }))
-    )]
-    #[case::calldata_hook(
-        EncodingOptions::new(0.01).with_calldata_hook(Arc::new(FailOrder { order_id: "fails" }))
-    )]
-    #[tokio::test]
-    async fn test_hook_error_with_two_quotes(#[case] opts: EncodingOptions) {
-        let encoder = real_encoder();
-        let quotes = vec![
-            quote_on_protocol("encodes", "uniswap_v2"),
-            quote_on_protocol("fails", "uniswap_v2"),
-        ];
-
-        let result = encoder
-            .encode(quotes, opts)
-            .await
-            .expect("a hook error is reported on its quote, not on the call");
-
-        assert_eq!(result[0].status(), QuoteStatus::Success);
-        assert!(result[0].transaction().is_some());
-        assert_eq!(result[1].status(), QuoteStatus::EncodingFailed);
-        assert!(result[1].transaction().is_none());
-    }
-
-    /// Takes longer than any deadline under test.
-    #[derive(Debug)]
-    struct SlowHook;
-
-    impl SolutionHook for SlowHook {
-        fn apply(&self, _quote: &OrderQuote, solution: Solution) -> Result<Solution, SolveError> {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            Ok(solution)
-        }
-    }
-
-    impl CalldataHook for SlowHook {
-        fn apply(
-            &self,
-            _quote: &OrderQuote,
-            _solution: &Solution,
-            _encoded: &EncodedSolution,
-            _calldata: &mut [u8],
-        ) -> Result<(), SolveError> {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            Ok(())
-        }
-    }
-
-    /// On a single-threaded runtime the deadline can fire only while the hook runs off it.
-    #[rstest]
-    #[case::solution_hook(EncodingOptions::new(0.01).with_solution_hook(Arc::new(SlowHook)))]
-    #[case::calldata_hook(EncodingOptions::new(0.01).with_calldata_hook(Arc::new(SlowHook)))]
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_encode_until_deadline_with_slow_hook(#[case] opts: EncodingOptions) {
-        let encoder = real_encoder();
-        let started = Instant::now();
-
-        let quotes = encoder
-            .encode_until(
-                vec![quote_on_protocol("slow", "uniswap_v2")],
-                opts,
-                Some(started + std::time::Duration::from_millis(10)),
-            )
-            .await
-            .expect("a quote that misses the deadline is reported on its order");
-
-        assert_eq!(quotes[0].status(), QuoteStatus::EncodingFailed);
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
-            "waited {:?}",
-            started.elapsed()
-        );
-    }
-
-    /// Sets `user_data` on the solution's first swap.
-    #[derive(Debug)]
-    struct SetSwapUserData;
-
-    impl SolutionHook for SetSwapUserData {
-        fn apply(&self, _quote: &OrderQuote, solution: Solution) -> Result<Solution, SolveError> {
-            let mut swaps = solution.swaps().to_vec();
-            swaps[0] = swaps[0]
-                .clone()
-                .with_user_data(Bytes::from(vec![0xEE]));
-            Ok(solution.with_swaps(swaps))
-        }
-    }
-
-    /// Replaces the protocol state of the solution's first swap with an equal, new one.
-    #[derive(Debug)]
-    struct ReplaceProtocolState;
-
-    impl SolutionHook for ReplaceProtocolState {
-        fn apply(&self, _quote: &OrderQuote, solution: Solution) -> Result<Solution, SolveError> {
-            let mut swaps = solution.swaps().to_vec();
-            swaps[0] = swaps[0]
-                .clone()
-                .with_protocol_state(Arc::new(MockProtocolSim::default()));
-            Ok(solution.with_swaps(swaps))
-        }
-    }
-
-    /// Flips the first byte of the swaps in the calldata, as a hook writing a signature into a
-    /// swap would.
-    #[derive(Debug)]
-    struct ChangeSwapsByte;
-
-    impl CalldataHook for ChangeSwapsByte {
-        fn apply(
-            &self,
-            _quote: &OrderQuote,
-            _solution: &Solution,
-            encoded: &EncodedSolution,
-            calldata: &mut [u8],
-        ) -> Result<(), SolveError> {
-            let swaps = encoded.swaps();
-            let start = calldata
-                .windows(swaps.len())
-                .rposition(|window| window == swaps)
-                .expect("the calldata carries the encoded swaps");
-            calldata[start] ^= 0xFF;
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn test_calldata_hook_changes_swaps() {
-        let encoder = real_encoder();
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
-
-        let without_hook = encoder
-            .encode(vec![quote.clone()], opts.clone())
-            .await
-            .unwrap();
-        let with_hook = encoder
-            .encode(vec![quote], opts.with_calldata_hook(Arc::new(ChangeSwapsByte)))
-            .await
-            .unwrap();
-
-        assert_eq!(with_hook[0].status(), QuoteStatus::Success);
-        let tx = with_hook[0].transaction().unwrap();
-        let (_, _, _, _, _, _, _, swaps) =
-            <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
-        let swaps_hash = |quote: &OrderQuote| {
-            *quote
-                .fee_breakdown()
+                client_fee,
+                swaps,
+            ) = <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
+            let (_, fee_receiver, _, deadline, signature) = client_fee;
+            assert_eq!(expected_amount_out, U256::from(1_500_000_000u64));
+            // The signature must cover the hooked amounts, or the router rejects the swap.
+            let signing_hash = router_signing_hash(
+                fee_receiver,
+                &SwapIntent {
+                    amount_in,
+                    token_in,
+                    token_out,
+                    expected_amount_out,
+                    min_amount_out,
+                    receiver,
+                    swaps: &swaps,
+                },
+                deadline.to::<u64>(),
+                SIGNER_CHAIN_ID,
+                SIGNER_ROUTER,
+            );
+            let recovered = Signature::try_from(signature.as_ref())
                 .unwrap()
-                .swaps_hash()
+                .recover_address_from_prehash(&signing_hash)
+                .unwrap();
+            assert_eq!(recovered, signer_address);
+        }
+
+        #[tokio::test]
+        async fn test_calldata_hook_with_watermark() {
+            let encoder = real_encoder();
+            let signature = [0xAB; 65];
+            let hook = Arc::new(WriteClientFeeSignature {
+                signature,
+                received_len: std::sync::Mutex::new(None),
+            });
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01)
+                .with_client_fee_params(make_client_fee(100))
+                .with_calldata_watermark("fynd")
+                .with_calldata_hook(hook.clone());
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            let offset = tx
+                .client_fee_signature_offset()
+                .unwrap();
+            assert_eq!(&tx.data()[offset..offset + 65], &signature[..]);
+            assert!(tx.data().ends_with(b"fynd"));
+            let received_len = hook
+                .received_len
+                .lock()
                 .unwrap()
-        };
-        assert_eq!(swaps_hash(&with_hook[0]), keccak256(&swaps).0);
-        assert_ne!(swaps_hash(&with_hook[0]), swaps_hash(&without_hook[0]));
-    }
+                .expect("the calldata hook ran");
+            assert_eq!(received_len, tx.data().len() - b"fynd".len());
+        }
 
-    #[tokio::test]
-    async fn test_calldata_hook_changes_swaps_with_disable_slippage_taking() {
-        let encoder =
-            real_encoder().with_disable_slippage_taking_signer(disable_slippage_taking_signer());
-        let quote = make_order_quote(1_000_000_000)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01)
-            .with_disable_slippage_taking(true)
-            .with_calldata_hook(Arc::new(ChangeSwapsByte));
+        #[rstest]
+        #[case::solution_hook(
+            EncodingOptions::new(0.01).with_solution_hook(Arc::new(FailOrder { order_id: "fails" }))
+        )]
+        #[case::calldata_hook(
+            EncodingOptions::new(0.01).with_calldata_hook(Arc::new(FailOrder { order_id: "fails" }))
+        )]
+        #[tokio::test]
+        async fn test_hook_error_with_two_quotes(#[case] opts: EncodingOptions) {
+            let encoder = real_encoder();
+            let quotes = vec![
+                quote_on_protocol("encodes", "uniswap_v2"),
+                quote_on_protocol("fails", "uniswap_v2"),
+            ];
 
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .expect("a rejected hook edit is reported on its quote, not on the call");
+            let result = encoder
+                .encode(quotes, opts)
+                .await
+                .expect("a hook error is reported on its quote, not on the call");
 
-        assert_eq!(result[0].status(), QuoteStatus::EncodingFailed);
-        assert!(result[0].transaction().is_none());
-    }
+            assert_eq!(result[0].status(), QuoteStatus::Success);
+            assert!(result[0].transaction().is_some());
+            assert_eq!(result[1].status(), QuoteStatus::EncodingFailed);
+            assert!(result[1].transaction().is_none());
+        }
 
-    #[rstest]
-    #[case::too_short(vec![0u8; 40], 32)]
-    #[case::wrong_length_word(
-        [U256::from(31u64).to_be_bytes::<32>(), [0u8; 32]].concat(),
-        32
-    )]
-    fn test_swaps_in_calldata_invalid(#[case] calldata: Vec<u8>, #[case] swaps_len: usize) {
-        assert!(swaps_in_calldata(&calldata, swaps_len).is_err());
-    }
+        /// Takes longer than any deadline under test.
+        #[derive(Debug)]
+        struct SlowHook;
 
-    #[test]
-    fn test_swaps_in_calldata() {
-        let swaps = [0xAB; 33];
-        let calldata = [
-            vec![0x11; 4],
-            U256::from(swaps.len())
-                .to_be_bytes::<32>()
-                .to_vec(),
-            swaps.to_vec(),
-            vec![0; 31],
-        ]
-        .concat();
+        impl SolutionHook for SlowHook {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                Ok(solution)
+            }
+        }
 
-        assert_eq!(swaps_in_calldata(&calldata, swaps.len()).unwrap(), &swaps[..]);
+        impl CalldataHook for SlowHook {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                _solution: &Solution,
+                _encoded: &EncodedSolution,
+                _calldata: &mut [u8],
+            ) -> Result<(), SolveError> {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                Ok(())
+            }
+        }
+
+        /// On a single-threaded runtime the deadline can fire only while the hook runs off it.
+        #[rstest]
+        #[case::solution_hook(EncodingOptions::new(0.01).with_solution_hook(Arc::new(SlowHook)))]
+        #[case::calldata_hook(EncodingOptions::new(0.01).with_calldata_hook(Arc::new(SlowHook)))]
+        #[tokio::test(flavor = "current_thread")]
+        async fn test_encode_until_deadline_with_slow_hook(#[case] opts: EncodingOptions) {
+            let encoder = real_encoder();
+            let started = Instant::now();
+
+            let quotes = encoder
+                .encode_until(
+                    vec![quote_on_protocol("slow", "uniswap_v2")],
+                    opts,
+                    Some(started + std::time::Duration::from_millis(10)),
+                )
+                .await
+                .expect("a quote that misses the deadline is reported on its order");
+
+            assert_eq!(quotes[0].status(), QuoteStatus::EncodingFailed);
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(500),
+                "waited {:?}",
+                started.elapsed()
+            );
+        }
+
+        /// Sets `user_data` on the solution's first swap.
+        #[derive(Debug)]
+        struct SetSwapUserData;
+
+        impl SolutionHook for SetSwapUserData {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                let mut swaps = solution.swaps().to_vec();
+                swaps[0] = swaps[0]
+                    .clone()
+                    .with_user_data(Bytes::from(vec![0xEE]));
+                Ok(solution.with_swaps(swaps))
+            }
+        }
+
+        /// Replaces the protocol state of the solution's first swap with an equal, new one.
+        #[derive(Debug)]
+        struct ReplaceProtocolState;
+
+        impl SolutionHook for ReplaceProtocolState {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                let mut swaps = solution.swaps().to_vec();
+                swaps[0] = swaps[0]
+                    .clone()
+                    .with_protocol_state(Arc::new(MockProtocolSim::default()));
+                Ok(solution.with_swaps(swaps))
+            }
+        }
+
+        /// Flips the first byte of the swaps in the calldata, as a hook writing a signature into a
+        /// swap would.
+        #[derive(Debug)]
+        struct ChangeSwapsByte;
+
+        impl CalldataHook for ChangeSwapsByte {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                _solution: &Solution,
+                encoded: &EncodedSolution,
+                calldata: &mut [u8],
+            ) -> Result<(), SolveError> {
+                let swaps = encoded.swaps();
+                let start = calldata
+                    .windows(swaps.len())
+                    .rposition(|window| window == swaps)
+                    .expect("the calldata carries the encoded swaps");
+                calldata[start] ^= 0xFF;
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn test_calldata_hook_changes_swaps() {
+            let encoder = real_encoder();
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
+
+            let without_hook = encoder
+                .encode(vec![quote.clone()], opts.clone())
+                .await
+                .unwrap();
+            let with_hook = encoder
+                .encode(vec![quote], opts.with_calldata_hook(Arc::new(ChangeSwapsByte)))
+                .await
+                .unwrap();
+
+            assert_eq!(with_hook[0].status(), QuoteStatus::Success);
+            let tx = with_hook[0].transaction().unwrap();
+            let (_, _, _, _, _, _, _, swaps) =
+                <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
+            let swaps_hash = |quote: &OrderQuote| {
+                *quote
+                    .fee_breakdown()
+                    .unwrap()
+                    .swaps_hash()
+                    .unwrap()
+            };
+            assert_eq!(swaps_hash(&with_hook[0]), keccak256(&swaps).0);
+            assert_ne!(swaps_hash(&with_hook[0]), swaps_hash(&without_hook[0]));
+        }
+
+        #[tokio::test]
+        async fn test_calldata_hook_changes_swaps_with_disable_slippage_taking() {
+            let encoder = real_encoder()
+                .with_disable_slippage_taking_signer(disable_slippage_taking_signer());
+            let quote = make_order_quote(1_000_000_000)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01)
+                .with_disable_slippage_taking(true)
+                .with_calldata_hook(Arc::new(ChangeSwapsByte));
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .expect("a rejected hook edit is reported on its quote, not on the call");
+
+            assert_eq!(result[0].status(), QuoteStatus::EncodingFailed);
+            assert!(result[0].transaction().is_none());
+        }
+
+        #[rstest]
+        #[case::too_short(vec![0u8; 40], 32)]
+        #[case::wrong_length_word(
+            [U256::from(31u64).to_be_bytes::<32>(), [0u8; 32]].concat(),
+            32
+        )]
+        fn test_swaps_in_calldata_invalid(#[case] calldata: Vec<u8>, #[case] swaps_len: usize) {
+            assert!(swaps_in_calldata(&calldata, swaps_len).is_err());
+        }
+
+        #[test]
+        fn test_swaps_in_calldata() {
+            let swaps = [0xAB; 33];
+            let calldata = [
+                vec![0x11; 4],
+                U256::from(swaps.len())
+                    .to_be_bytes::<32>()
+                    .to_vec(),
+                swaps.to_vec(),
+                vec![0; 31],
+            ]
+            .concat();
+
+            assert_eq!(swaps_in_calldata(&calldata, swaps.len()).unwrap(), &swaps[..]);
+        }
     }
 }
