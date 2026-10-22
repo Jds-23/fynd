@@ -134,11 +134,18 @@ impl BookStream {
             return Ok(None);
         }
 
-        let usd_quote_tokens = Arc::new(usd_stablecoins_for_chain(chain).ok_or_else(|| {
-            DataFeedError::Config(format!(
-                "book feeds price their books in USD stablecoins, and none are known for {chain}"
-            ))
-        })?);
+        // Metric reports each pool's USD TVL itself; the other venues price their books' TVL in
+        // the chain's USD stablecoins, so only they need a chain that has a curated set.
+        let usd_quote_tokens = || {
+            usd_stablecoins_for_chain(chain)
+                .map(Arc::new)
+                .ok_or_else(|| {
+                    DataFeedError::Config(format!(
+                        "book feeds price their books in USD stablecoins, and none are known for \
+                         {chain}"
+                    ))
+                })
+        };
         let book_config = BookFeedConfig { chain, tokens: Arc::new(tokens), min_tvl_usd };
 
         let mut books = Self { feeds: BookFeedStreams::new(), served: HashMap::new() };
@@ -147,7 +154,7 @@ impl BookStream {
                 bebop::PROTOCOL_SYSTEM => {
                     let mut builder = BebopFeedBuilder::new(
                         book_config.clone(),
-                        Arc::clone(&usd_quote_tokens),
+                        usd_quote_tokens()?,
                         get_env("BEBOP_KEY")?,
                     );
                     if let Some(address) = optional_address_env("BEBOP_ORIGIN_ADDRESS")? {
@@ -170,7 +177,7 @@ impl BookStream {
                 hashflow::PROTOCOL_SYSTEM => {
                     let mut builder = HashflowFeedBuilder::new(
                         book_config.clone(),
-                        Arc::clone(&usd_quote_tokens),
+                        usd_quote_tokens()?,
                         get_env("HASHFLOW_USER")?,
                         get_env("HASHFLOW_KEY")?,
                     );
@@ -200,7 +207,7 @@ impl BookStream {
                 native::PROTOCOL_SYSTEM => {
                     let mut builder = NativeFeedBuilder::new(
                         book_config.clone(),
-                        Arc::clone(&usd_quote_tokens),
+                        usd_quote_tokens()?,
                         get_env("NATIVE_API_KEY")?,
                     );
                     if venue.uses_fallback_router() {
@@ -214,7 +221,7 @@ impl BookStream {
                 liquorice::PROTOCOL_SYSTEM => {
                     let mut builder = LiquoriceFeedBuilder::new(
                         book_config.clone(),
-                        Arc::clone(&usd_quote_tokens),
+                        usd_quote_tokens()?,
                         get_env("LIQUORICE_USER")?,
                         get_env("LIQUORICE_KEY")?,
                     );
