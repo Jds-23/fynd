@@ -240,6 +240,36 @@ fn same_protocol_state(original: &Swap, hooked: &Swap) -> bool {
     }
 }
 
+/// Returns the swaps bytes of a router call.
+///
+/// The swaps are the router call's last argument, so the ABI encoding puts them at the end of
+/// the calldata: a 32-byte word holding their length, then the bytes themselves, zero-padded to a
+/// multiple of 32.
+///
+/// # Errors
+/// Errors when the length word does not read `swaps_len`, i.e. the calldata does not end with
+/// swaps of that length.
+fn swaps_in_calldata(calldata: &[u8], swaps_len: usize) -> Result<&[u8], SolveError> {
+    let start = calldata
+        .len()
+        .checked_sub(swaps_len.div_ceil(32) * 32)
+        .filter(|start| *start >= 32)
+        .ok_or_else(|| {
+            SolveError::FailedEncoding(format!(
+                "router calldata of {} bytes is too short to end with {swaps_len} bytes of swaps",
+                calldata.len()
+            ))
+        })?;
+    let length_word = U256::from_be_slice(&calldata[start - 32..start]);
+    if length_word != U256::from(swaps_len) {
+        return Err(SolveError::FailedEncoding(format!(
+            "router calldata does not end with the swaps: its last length word reads \
+             {length_word}, the swaps are {swaps_len} bytes"
+        )));
+    }
+    Ok(&calldata[start..start + swaps_len])
+}
+
 /// Counts an RFQ leg rejected because its signed quote fell short of the user's slippage, by
 /// protocol and route shape. The leg-level check is exact only for a single-hop route, so the
 /// shape shows how many rejections a route-level check could have let through.
@@ -561,7 +591,8 @@ impl Encoder {
     /// fee breakdown and amount out to the quote.
     ///
     /// The calldata hook runs before the watermark is appended, so it gets only the router call:
-    /// the same bytes whichever client the watermark names.
+    /// the same bytes whichever client the watermark names. The fee breakdown's swaps hash is taken
+    /// after the hook, because the hook may write into the swaps bytes.
     fn attach_transaction(
         &self,
         quote: &mut OrderQuote,
@@ -571,19 +602,40 @@ impl Encoder {
     ) -> Result<(), SolveError> {
         let encoded_solution =
             encoded_solution.map_err(|error| Self::failed_encoding_error(quote, error))?;
-        let (mut transaction, fee_breakdown) = self
+        let mut transaction = self
             .encode_tycho_router_call(
                 &encoded_solution,
                 &prepared.solution,
                 encoding_options,
-                prepared.fee_breakdown,
-                prepared.fee_rates,
+                &prepared.fee_rates,
             )
             .map_err(|error| Self::failed_encoding_error(quote, error))?;
         let calldata = transaction.data_mut();
         if let Some(hook) = encoding_options.calldata_hook() {
             hook.apply(quote, &prepared.solution, &encoded_solution, calldata)?;
         }
+        let swaps = swaps_in_calldata(calldata, encoded_solution.swaps().len())?;
+        // Temporary: remove once disable-slippage-taking moves out of fynd-core into a calldata
+        // hook (ENG-6417). Until then fynd-core signs it before the hook, over the old swaps.
+        if encoding_options.applies_disable_slippage_taking() && swaps != encoded_solution.swaps() {
+            return Err(SolveError::FailedEncoding(
+                "the calldata hook changed the swaps bytes, but fynd-core signs the \
+                 disable-slippage-taking client fee before the hook runs, so that signature \
+                 would no longer match; turn off disable_slippage_taking and sign the zero-fee \
+                 client fee in the hook"
+                    .to_string(),
+            ));
+        }
+        let fee_breakdown = if encoding_options
+            .client_fee_params()
+            .is_some()
+        {
+            prepared
+                .fee_breakdown
+                .with_swaps_hash(keccak256(swaps).0)
+        } else {
+            prepared.fee_breakdown
+        };
         let watermark = encoding_options
             .calldata_watermark()
             .or(self.calldata_watermark.as_deref());
@@ -800,9 +852,8 @@ impl Encoder {
         encoded_solution: &EncodedSolution,
         solution: &Solution,
         encoding_options: &EncodingOptions,
-        fee_breakdown: FeeBreakdown,
-        fee_rates: FeeRates,
-    ) -> Result<(Transaction, FeeBreakdown), EncodingError> {
+        fee_rates: &FeeRates,
+    ) -> Result<Transaction, EncodingError> {
         let amount_in = biguint_to_u256(solution.amount_in());
         let expected_amount_out = biguint_to_u256(solution.expected_amount_out());
         let min_amount_out = biguint_to_u256(solution.min_amount_out());
@@ -907,14 +958,6 @@ impl Encoder {
         };
 
         let fn_sig = encoded_solution.function_signature();
-        let fee_breakdown = if encoding_options
-            .client_fee_params()
-            .is_some()
-        {
-            fee_breakdown.with_swaps_hash(keccak256(swaps).0)
-        } else {
-            fee_breakdown
-        };
 
         let method_calldata = if fn_sig.contains("Permit2") {
             let permit = permit.ok_or(EncodingError::FatalError(
@@ -1005,7 +1048,7 @@ impl Encoder {
             let offset = encoded_solution.client_fee_signature_offset();
             transaction = transaction.with_client_fee_signature_offset(offset);
         }
-        Ok((transaction, fee_breakdown))
+        Ok(transaction)
     }
 
     /// Rejects a FyndJITRouter request when this deployment has no FyndJITRouter configured.
@@ -2895,34 +2938,6 @@ mod tests {
         }
     }
 
-    /// Sets `user_data` on the solution's first swap.
-    #[derive(Debug)]
-    struct SetSwapUserData;
-
-    impl SolutionHook for SetSwapUserData {
-        fn apply(&self, _quote: &OrderQuote, solution: Solution) -> Result<Solution, SolveError> {
-            let mut swaps = solution.swaps().to_vec();
-            swaps[0] = swaps[0]
-                .clone()
-                .with_user_data(Bytes::from(vec![0xEE]));
-            Ok(solution.with_swaps(swaps))
-        }
-    }
-
-    /// Replaces the protocol state of the solution's first swap with an equal, new one.
-    #[derive(Debug)]
-    struct ReplaceProtocolState;
-
-    impl SolutionHook for ReplaceProtocolState {
-        fn apply(&self, _quote: &OrderQuote, solution: Solution) -> Result<Solution, SolveError> {
-            let mut swaps = solution.swaps().to_vec();
-            swaps[0] = swaps[0]
-                .clone()
-                .with_protocol_state(Arc::new(MockProtocolSim::default()));
-            Ok(solution.with_swaps(swaps))
-        }
-    }
-
     #[tokio::test]
     async fn test_solution_hook_changes_expected_amount_out() {
         let encoder = real_encoder();
@@ -3168,5 +3183,132 @@ mod tests {
             "waited {:?}",
             started.elapsed()
         );
+    }
+
+    /// Sets `user_data` on the solution's first swap.
+    #[derive(Debug)]
+    struct SetSwapUserData;
+
+    impl SolutionHook for SetSwapUserData {
+        fn apply(&self, _quote: &OrderQuote, solution: Solution) -> Result<Solution, SolveError> {
+            let mut swaps = solution.swaps().to_vec();
+            swaps[0] = swaps[0]
+                .clone()
+                .with_user_data(Bytes::from(vec![0xEE]));
+            Ok(solution.with_swaps(swaps))
+        }
+    }
+
+    /// Replaces the protocol state of the solution's first swap with an equal, new one.
+    #[derive(Debug)]
+    struct ReplaceProtocolState;
+
+    impl SolutionHook for ReplaceProtocolState {
+        fn apply(&self, _quote: &OrderQuote, solution: Solution) -> Result<Solution, SolveError> {
+            let mut swaps = solution.swaps().to_vec();
+            swaps[0] = swaps[0]
+                .clone()
+                .with_protocol_state(Arc::new(MockProtocolSim::default()));
+            Ok(solution.with_swaps(swaps))
+        }
+    }
+
+    /// Flips the first byte of the swaps in the calldata, as a hook writing a signature into a
+    /// swap would.
+    #[derive(Debug)]
+    struct ChangeSwapsByte;
+
+    impl CalldataHook for ChangeSwapsByte {
+        fn apply(
+            &self,
+            _quote: &OrderQuote,
+            _solution: &Solution,
+            encoded: &EncodedSolution,
+            calldata: &mut [u8],
+        ) -> Result<(), SolveError> {
+            let swaps = encoded.swaps();
+            let start = calldata
+                .windows(swaps.len())
+                .rposition(|window| window == swaps)
+                .expect("the calldata carries the encoded swaps");
+            calldata[start] ^= 0xFF;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_calldata_hook_changes_swaps() {
+        let encoder = real_encoder();
+        let quote = make_order_quote(990)
+            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+        let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
+
+        let without_hook = encoder
+            .encode(vec![quote.clone()], opts.clone())
+            .await
+            .unwrap();
+        let with_hook = encoder
+            .encode(vec![quote], opts.with_calldata_hook(Arc::new(ChangeSwapsByte)))
+            .await
+            .unwrap();
+
+        assert_eq!(with_hook[0].status(), QuoteStatus::Success);
+        let tx = with_hook[0].transaction().unwrap();
+        let (_, _, _, _, _, _, _, swaps) =
+            <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
+        let swaps_hash = |quote: &OrderQuote| {
+            *quote
+                .fee_breakdown()
+                .unwrap()
+                .swaps_hash()
+                .unwrap()
+        };
+        assert_eq!(swaps_hash(&with_hook[0]), keccak256(&swaps).0);
+        assert_ne!(swaps_hash(&with_hook[0]), swaps_hash(&without_hook[0]));
+    }
+
+    #[tokio::test]
+    async fn test_calldata_hook_changes_swaps_with_disable_slippage_taking() {
+        let encoder =
+            real_encoder().with_disable_slippage_taking_signer(disable_slippage_taking_signer());
+        let quote = make_order_quote(1_000_000_000)
+            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+        let opts = EncodingOptions::new(0.01)
+            .with_disable_slippage_taking(true)
+            .with_calldata_hook(Arc::new(ChangeSwapsByte));
+
+        let result = encoder
+            .encode(vec![quote], opts)
+            .await
+            .expect("a rejected hook edit is reported on its quote, not on the call");
+
+        assert_eq!(result[0].status(), QuoteStatus::EncodingFailed);
+        assert!(result[0].transaction().is_none());
+    }
+
+    #[rstest]
+    #[case::too_short(vec![0u8; 40], 32)]
+    #[case::wrong_length_word(
+        [U256::from(31u64).to_be_bytes::<32>(), [0u8; 32]].concat(),
+        32
+    )]
+    fn test_swaps_in_calldata_invalid(#[case] calldata: Vec<u8>, #[case] swaps_len: usize) {
+        assert!(swaps_in_calldata(&calldata, swaps_len).is_err());
+    }
+
+    #[test]
+    fn test_swaps_in_calldata() {
+        let swaps = [0xAB; 33];
+        let calldata = [
+            vec![0x11; 4],
+            U256::from(swaps.len())
+                .to_be_bytes::<32>()
+                .to_vec(),
+            swaps.to_vec(),
+            vec![0; 31],
+        ]
+        .concat();
+
+        assert_eq!(swaps_in_calldata(&calldata, swaps.len()).unwrap(), &swaps[..]);
     }
 }

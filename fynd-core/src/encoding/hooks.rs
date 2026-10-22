@@ -49,13 +49,18 @@ pub trait SolutionHook: Debug + Send + Sync + RefUnwindSafe {
 /// it. The watermark is appended after the hook, so a hook that decodes or hashes `calldata` gets
 /// the same bytes for every client. Simulation runs on the edited calldata.
 ///
-/// The hook must not change the amounts, the receiver or the swaps bytes: the client fee
-/// signature, the disable-slippage-taking signature and the fee breakdown's swaps hash cover them.
+/// The hook may write into the swaps bytes, for example a signature inside one swap. The fee
+/// breakdown's swaps hash is computed after the hook, so a client signs its fee over the final
+/// swaps. The hook must not change the amounts or the receiver: the client fee signature covers
+/// them.
 ///
-/// Read the amounts from `solution`; `quote` still reports the amounts from before the solution
-/// hook.
+/// `calldata` is what the router executes. Its values can differ from `solution`, `encoded` and
+/// `quote`, so read them from `calldata`.
 pub trait CalldataHook: Debug + Send + Sync + RefUnwindSafe {
     /// Overwrites bytes of `calldata` in place.
+    ///
+    /// `calldata` is a slice, so its length cannot change: the `EncodedSolution` offsets, the
+    /// client fee signature offset and the position of the swaps stay valid.
     ///
     /// # Errors
     /// An error fails this quote only.
