@@ -68,6 +68,7 @@ pub use algorithm::{
 };
 // Required for implementing the Algorithm trait externally
 pub use derived::computation::ComputationRequirements;
+pub use encoding::hooks::{CalldataHook, SolutionHook};
 pub use feed::{events::MarketEvent, market_data::StateLabel};
 pub use post_process::{
     PostProcessRequest, PostProcessorAlreadyRegistered, PostProcessorRegistry, RoutePostProcessor,
