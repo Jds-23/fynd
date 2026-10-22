@@ -6,6 +6,7 @@ use alloy::{
 };
 use futures::{StreamExt, TryStreamExt};
 use num_bigint::BigUint;
+use serde_json::Value;
 use tycho_execution::encoding::{
     errors::EncodingError,
     evm::{
@@ -186,41 +187,57 @@ fn slippage_bps(slippage: f64) -> u32 {
         .clamp(0.0, 10_000.0) as u32
 }
 
-/// Returns the name of the first field other than `expected_amount_out` where `hooked` differs
-/// from `original`.
-fn changed_solution_field(original: &Solution, hooked: &Solution) -> Option<&'static str> {
-    let unchanged = [
-        ("sender", original.sender() == hooked.sender()),
-        ("receiver", original.receiver() == hooked.receiver()),
-        ("token_in", original.token_in() == hooked.token_in()),
-        ("token_out", original.token_out() == hooked.token_out()),
-        ("amount_in", original.amount_in() == hooked.amount_in()),
-        ("min_amount_out", original.min_amount_out() == hooked.min_amount_out()),
-        ("user_transfer_type", original.user_transfer_type() == hooked.user_transfer_type()),
-        ("origin", original.origin() == hooked.origin()),
-        ("swaps", same_swaps(original.swaps(), hooked.swaps())),
-    ];
-    unchanged
+/// Fields of the tycho `Solution` a solution hook may change.
+const HOOK_MUTABLE_FIELDS: &[&str] = &["expected_amount_out"];
+
+/// Returns the name of the first field outside `HOOK_MUTABLE_FIELDS` where `hooked` differs from
+/// `original`.
+///
+/// Compares the serialized solutions, so a field tycho adds later is checked without a change
+/// here: tycho's `Solution` and `Swap` have no `PartialEq`. `Swap.protocol_state` is not
+/// serialized, and RFQ encoders request their quote from it, so it is compared separately.
+fn changed_solution_field(
+    original_solution: &Solution,
+    hooked_solution: &Solution,
+) -> Result<Option<String>, SolveError> {
+    let serialize = |solution: &Solution| match serde_json::to_value(solution) {
+        Ok(Value::Object(fields)) => Ok(fields),
+        Ok(other) => Err(SolveError::FailedEncoding(format!(
+            "a tycho solution serialized to {other} instead of an object; cannot check the \
+             solution hook's changes"
+        ))),
+        Err(error) => Err(SolveError::FailedEncoding(format!(
+            "failed to serialize a tycho solution to check the solution hook's changes: {error}"
+        ))),
+    };
+    let original = serialize(original_solution)?;
+    let hooked = serialize(hooked_solution)?;
+    let changed_field = original
         .into_iter()
-        .find(|(_, is_unchanged)| !is_unchanged)
-        .map(|(field, _)| field)
+        .find(|(field, value)| {
+            !HOOK_MUTABLE_FIELDS.contains(&field.as_str()) && hooked.get(field) != Some(value)
+        })
+        .map(|(field, _)| field);
+    if changed_field.is_some() {
+        return Ok(changed_field);
+    }
+    // The serialized swaps matched, so both solutions have the same number of swaps.
+    let same_states = original_solution
+        .swaps()
+        .iter()
+        .zip(hooked_solution.swaps())
+        .all(|(original, hooked)| same_protocol_state(original, hooked));
+    Ok((!same_states).then(|| "swaps.protocol_state".to_string()))
 }
 
-/// tycho `Swap` has no `PartialEq`. These are the fields the router calldata and an RFQ quote
-/// request read; a changed `user_data` would also break an exclusive leg's signature.
-fn same_swaps(original: &[Swap], hooked: &[Swap]) -> bool {
-    original.len() == hooked.len() &&
-        original
-            .iter()
-            .zip(hooked)
-            .all(|(original, hooked)| {
-                original.component().id == hooked.component().id &&
-                    original.token_in().address == hooked.token_in().address &&
-                    original.token_out().address == hooked.token_out().address &&
-                    original.split() == hooked.split() &&
-                    original.user_data() == hooked.user_data() &&
-                    original.estimated_amount_in() == hooked.estimated_amount_in()
-            })
+/// Whether both swaps hold the same protocol state object. A hook gets a clone of the solution,
+/// which shares each swap's state, so any other state was put there by the hook.
+fn same_protocol_state(original: &Swap, hooked: &Swap) -> bool {
+    match (original.protocol_state(), hooked.protocol_state()) {
+        (Some(original), Some(hooked)) => Arc::ptr_eq(original, hooked),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// Counts an RFQ leg rejected because its signed quote fell short of the user's slippage, by
@@ -523,9 +540,10 @@ impl Encoder {
         solution: Solution,
     ) -> Result<Solution, SolveError> {
         let hooked = hook.apply(quote, solution.clone())?;
-        if let Some(field) = changed_solution_field(&solution, &hooked) {
+        if let Some(field) = changed_solution_field(&solution, &hooked)? {
             return Err(SolveError::FailedEncoding(format!(
-                "the solution hook changed {field}; it may change only expected_amount_out"
+                "the solution hook changed {field}; it may change only {}",
+                HOOK_MUTABLE_FIELDS.join(", ")
             )));
         }
         if hooked.expected_amount_out() < hooked.min_amount_out() {
@@ -2877,6 +2895,34 @@ mod tests {
         }
     }
 
+    /// Sets `user_data` on the solution's first swap.
+    #[derive(Debug)]
+    struct SetSwapUserData;
+
+    impl SolutionHook for SetSwapUserData {
+        fn apply(&self, _quote: &OrderQuote, solution: Solution) -> Result<Solution, SolveError> {
+            let mut swaps = solution.swaps().to_vec();
+            swaps[0] = swaps[0]
+                .clone()
+                .with_user_data(Bytes::from(vec![0xEE]));
+            Ok(solution.with_swaps(swaps))
+        }
+    }
+
+    /// Replaces the protocol state of the solution's first swap with an equal, new one.
+    #[derive(Debug)]
+    struct ReplaceProtocolState;
+
+    impl SolutionHook for ReplaceProtocolState {
+        fn apply(&self, _quote: &OrderQuote, solution: Solution) -> Result<Solution, SolveError> {
+            let mut swaps = solution.swaps().to_vec();
+            swaps[0] = swaps[0]
+                .clone()
+                .with_protocol_state(Arc::new(MockProtocolSim::default()));
+            Ok(solution.with_swaps(swaps))
+        }
+    }
+
     #[tokio::test]
     async fn test_solution_hook_changes_expected_amount_out() {
         let encoder = real_encoder();
@@ -2942,6 +2988,8 @@ mod tests {
     #[case::changed_min(Arc::new(SetMinAmountOut(BigUint::from(1u64))))]
     #[case::expected_below_min(Arc::new(SetExpectedAmountOut(BigUint::from(1u64))))]
     #[case::changed_receiver(Arc::new(SetReceiver(Bytes::from(make_address(0xCC).as_ref()))))]
+    #[case::changed_swaps(Arc::new(SetSwapUserData))]
+    #[case::replaced_protocol_state(Arc::new(ReplaceProtocolState))]
     #[tokio::test]
     async fn test_solution_hook_invalid_output(#[case] hook: Arc<dyn SolutionHook>) {
         let encoder = real_encoder();
