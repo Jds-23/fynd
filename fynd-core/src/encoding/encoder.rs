@@ -29,6 +29,7 @@ use crate::{
         },
         exclusive_swap::ExclusiveSwapSigner,
         hooks::SolutionHook,
+        router_call::{RouterCall, RouterLayout},
         router_fees::{FeeRates, RouterFees, SharedRouterFees},
     },
     fallback::user_data::fallback_user_data,
@@ -238,36 +239,6 @@ fn same_protocol_state(original: &Swap, hooked: &Swap) -> bool {
         (None, None) => true,
         _ => false,
     }
-}
-
-/// Returns the swaps bytes of a router call.
-///
-/// The swaps are the router call's last argument, so the ABI encoding puts them at the end of
-/// the calldata: a 32-byte word holding their length, then the bytes themselves, zero-padded to a
-/// multiple of 32.
-///
-/// # Errors
-/// Errors when the length word does not read `swaps_len`, i.e. the calldata does not end with
-/// swaps of that length.
-fn swaps_in_calldata(calldata: &[u8], swaps_len: usize) -> Result<&[u8], SolveError> {
-    let start = calldata
-        .len()
-        .checked_sub(swaps_len.div_ceil(32) * 32)
-        .filter(|start| *start >= 32)
-        .ok_or_else(|| {
-            SolveError::FailedEncoding(format!(
-                "router calldata of {} bytes is too short to end with {swaps_len} bytes of swaps",
-                calldata.len()
-            ))
-        })?;
-    let length_word = U256::from_be_slice(&calldata[start - 32..start]);
-    if length_word != U256::from(swaps_len) {
-        return Err(SolveError::FailedEncoding(format!(
-            "router calldata does not end with the swaps: its last length word reads \
-             {length_word}, the swaps are {swaps_len} bytes"
-        )));
-    }
-    Ok(&calldata[start..start + swaps_len])
 }
 
 /// Counts an RFQ leg rejected because its signed quote fell short of the user's slippage, by
@@ -614,7 +585,8 @@ impl Encoder {
         if let Some(hook) = encoding_options.calldata_hook() {
             hook.apply(quote, &prepared.solution, &encoded_solution, calldata)?;
         }
-        let swaps = swaps_in_calldata(calldata, encoded_solution.swaps().len())?;
+        let call = RouterCall::decode(encoded_solution.function_signature(), calldata)?;
+        let swaps = call.swaps().as_ref();
         // Temporary: remove once disable-slippage-taking moves out of fynd-core into a calldata
         // hook (ENG-6417). Until then fynd-core signs it before the hook, over the old swaps.
         if encoding_options.applies_disable_slippage_taking() && swaps != encoded_solution.swaps() {
@@ -959,11 +931,47 @@ impl Encoder {
 
         let fn_sig = encoded_solution.function_signature();
 
-        let method_calldata = if fn_sig.contains("Permit2") {
-            let permit = permit.ok_or(EncodingError::FatalError(
-                "permit2 object must be set to use permit2".to_string(),
-            ))?;
-            if fn_sig.contains("splitSwap") {
+        let layout = RouterLayout::of(fn_sig).ok_or_else(|| {
+            EncodingError::FatalError(format!(
+                "unsupported function signature for Tycho router: {fn_sig}"
+            ))
+        })?;
+        let method_calldata =
+            if matches!(layout, RouterLayout::SequentialPermit2 | RouterLayout::SplitPermit2) {
+                let permit = permit.ok_or(EncodingError::FatalError(
+                    "permit2 object must be set to use permit2".to_string(),
+                ))?;
+                if layout == RouterLayout::SplitPermit2 {
+                    (
+                        amount_in,
+                        token_in,
+                        token_out,
+                        expected_amount_out,
+                        min_amount_out,
+                        U256::from(encoded_solution.n_tokens()),
+                        receiver,
+                        client_fee_params,
+                        permit,
+                        permit2_sig,
+                        swaps,
+                    )
+                        .abi_encode()
+                } else {
+                    (
+                        amount_in,
+                        token_in,
+                        token_out,
+                        expected_amount_out,
+                        min_amount_out,
+                        receiver,
+                        client_fee_params,
+                        permit,
+                        permit2_sig,
+                        swaps,
+                    )
+                        .abi_encode()
+                }
+            } else if layout == RouterLayout::Split {
                 (
                     amount_in,
                     token_in,
@@ -973,8 +981,6 @@ impl Encoder {
                     U256::from(encoded_solution.n_tokens()),
                     receiver,
                     client_fee_params,
-                    permit,
-                    permit2_sig,
                     swaps,
                 )
                     .abi_encode()
@@ -987,42 +993,10 @@ impl Encoder {
                     min_amount_out,
                     receiver,
                     client_fee_params,
-                    permit,
-                    permit2_sig,
                     swaps,
                 )
                     .abi_encode()
-            }
-        } else if fn_sig.contains("splitSwap") {
-            (
-                amount_in,
-                token_in,
-                token_out,
-                expected_amount_out,
-                min_amount_out,
-                U256::from(encoded_solution.n_tokens()),
-                receiver,
-                client_fee_params,
-                swaps,
-            )
-                .abi_encode()
-        } else if fn_sig.contains("singleSwap") || fn_sig.contains("sequentialSwap") {
-            (
-                amount_in,
-                token_in,
-                token_out,
-                expected_amount_out,
-                min_amount_out,
-                receiver,
-                client_fee_params,
-                swaps,
-            )
-                .abi_encode()
-        } else {
-            return Err(EncodingError::FatalError(format!(
-                "unsupported function signature for Tycho router: {fn_sig}"
-            )));
-        };
+            };
 
         let contract_interaction =
             Self::encode_input(encoded_solution.function_signature(), method_calldata);
@@ -3331,31 +3305,119 @@ mod tests {
             assert_eq!(result[0].status(), QuoteStatus::EncodingFailed);
             assert!(result[0].transaction().is_none());
         }
+    }
 
-        #[rstest]
-        #[case::too_short(vec![0u8; 40], 32)]
-        #[case::wrong_length_word(
-            [U256::from(31u64).to_be_bytes::<32>(), [0u8; 32]].concat(),
-            32
-        )]
-        fn test_swaps_in_calldata_invalid(#[case] calldata: Vec<u8>, #[case] swaps_len: usize) {
-            assert!(swaps_in_calldata(&calldata, swaps_len).is_err());
+    mod router_call_decode {
+        use super::*;
+        use crate::{PermitDetails, PermitSingle as FyndPermitSingle};
+
+        /// Decodes the calldata it is handed, as a hook that signs over it would, and keeps the
+        /// result.
+        #[derive(Debug, Default)]
+        struct DecodeCall {
+            decoded: std::sync::Mutex<Option<(RouterLayout, RouterCall)>>,
         }
 
-        #[test]
-        fn test_swaps_in_calldata() {
-            let swaps = [0xAB; 33];
-            let calldata = [
-                vec![0x11; 4],
-                U256::from(swaps.len())
-                    .to_be_bytes::<32>()
-                    .to_vec(),
-                swaps.to_vec(),
-                vec![0; 31],
-            ]
-            .concat();
+        impl CalldataHook for DecodeCall {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                _solution: &Solution,
+                encoded: &EncodedSolution,
+                calldata: &mut [u8],
+            ) -> Result<(), SolveError> {
+                let function_signature = encoded.function_signature();
+                let layout = RouterLayout::of(function_signature).expect("a router function");
+                let call = RouterCall::decode(function_signature, calldata)?;
+                *self.decoded.lock().unwrap() = Some((layout, call));
+                Ok(())
+            }
+        }
 
-            assert_eq!(swaps_in_calldata(&calldata, swaps.len()).unwrap(), &swaps[..]);
+        fn split_route() -> crate::types::Route {
+            let (a, b) = (make_address(0x01), make_address(0x02));
+            let tokens = FxHashMap::from_iter([
+                (a.clone(), make_token(a.clone())),
+                (b.clone(), make_token(b.clone())),
+            ]);
+            crate::types::Route::new(
+                vec![
+                    make_route_swap_addrs(a.clone(), b.clone()).with_split(0.4),
+                    make_route_swap_addrs(a, b),
+                ],
+                tokens,
+            )
+            .expect("non-empty route")
+        }
+
+        fn with_permit2(options: EncodingOptions, encoder: &Encoder) -> EncodingOptions {
+            let details = PermitDetails::new(
+                Bytes::from(make_address(0x01).as_ref()),
+                BigUint::from(1000u64),
+                BigUint::from(u64::from(u32::MAX)),
+                BigUint::ZERO,
+            );
+            let spender = encoder
+                .router_address()
+                .expect("a router")
+                .clone();
+            options
+                .with_transfer_type(UserTransferType::TransferFromPermit2)
+                .with_permit(FyndPermitSingle::new(
+                    details,
+                    spender,
+                    BigUint::from(u64::from(u32::MAX)),
+                ))
+                .with_signature(Bytes::from(vec![0x11; 65]))
+        }
+
+        /// The decoder reads back what the encoder wrote, in every layout.
+        #[rstest]
+        #[case::sequential(false, false, RouterLayout::Sequential)]
+        #[case::sequential_permit2(false, true, RouterLayout::SequentialPermit2)]
+        #[case::split(true, false, RouterLayout::Split)]
+        #[case::split_permit2(true, true, RouterLayout::SplitPermit2)]
+        #[tokio::test]
+        async fn test_decode_encoded_call(
+            #[case] split: bool,
+            #[case] permit2: bool,
+            #[case] expected_layout: RouterLayout,
+        ) {
+            let encoder = real_encoder();
+            let route = if split {
+                split_route()
+            } else {
+                make_route_with_tokens(&[(make_address(0x01), make_address(0x02))])
+            };
+            let quote = make_order_quote(990).with_route(route);
+            let client_fee = make_client_fee(100);
+            let mut options = EncodingOptions::new(0.01).with_client_fee_params(client_fee.clone());
+            if permit2 {
+                options = with_permit2(options, &encoder);
+            }
+            let hook = Arc::new(DecodeCall::default());
+
+            let result = encoder
+                .encode(vec![quote.clone()], options.with_calldata_hook(hook.clone()))
+                .await
+                .unwrap();
+
+            assert_eq!(result[0].status(), QuoteStatus::Success, "{:?}", result[0]);
+            let (layout, call) = hook
+                .decoded
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the hook ran");
+            let fee_breakdown = result[0].fee_breakdown().unwrap();
+            assert_eq!(layout, expected_layout);
+            assert_eq!(call.amount_in(), quote.amount_in());
+            assert_eq!(call.expected_amount_out(), result[0].amount_out());
+            assert_eq!(call.min_amount_out(), fee_breakdown.min_amount_received());
+            assert_eq!(call.receiver(), quote.receiver());
+            assert_eq!(call.client_fee().receiver(), client_fee.receiver());
+            assert_eq!(*call.client_fee().deadline(), BigUint::from(client_fee.deadline()));
+            assert_eq!(Some(&keccak256(call.swaps()).0), fee_breakdown.swaps_hash());
         }
     }
 }
