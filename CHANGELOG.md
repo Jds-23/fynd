@@ -1,4 +1,21 @@
 
+## [0.114.5](https://github.com/propeller-heads/fynd/compare/0.114.4...0.114.5) (2026-10-22)
+
+### Features
+
+* **core:** add --aggregate-rfqs to stream an RFQ venue as one component ([20f340d](https://github.com/propeller-heads/fynd/commit/20f340d5afd8c4c9d188393243284657b237c4d3))
+* **core:** compute spot prices and depths per swap direction ([a2d8493](https://github.com/propeller-heads/fynd/commit/a2d849395ab66b9b498c93bab2efe2ae878a04e2))
+* **core:** build graph edges from component swap directions ([50f4335](https://github.com/propeller-heads/fynd/commit/50f4335b3f89d4ce345689089ee41e8e13c75d6c))
+* **core:** store each component's swap directions in the market ([e38c80b](https://github.com/propeller-heads/fynd/commit/e38c80b80b97c3d674b833dde4946b68bb1cd637))
+* **core:** leave RFQ venues out of token gas pricing ([1a09718](https://github.com/propeller-heads/fynd/commit/1a097185bb4f584f61dcc65168ebca06e67c8953))
+
+### Bug Fixes
+
+* **core:** upsert the books a venue refreshes ([0858d9d](https://github.com/propeller-heads/fynd/commit/0858d9dd95e2e95729091333229aa3b73357bf6e))
+* **core:** evict a re-sent pAMM that loses its backing ([776d860](https://github.com/propeller-heads/fynd/commit/776d86009e22df175266feed2eb521987e51437a))
+* **core:** report a re-sent component as updated, not added ([b201e75](https://github.com/propeller-heads/fynd/commit/b201e75284a2e3dfdc08e2d6542c2a8e6c5a441b))
+
+
 ## [0.114.4](https://github.com/propeller-heads/fynd/compare/0.114.3...0.114.4) (2026-10-22)
 
 ### Features
