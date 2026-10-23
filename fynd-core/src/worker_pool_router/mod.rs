@@ -50,6 +50,7 @@ use tycho_simulation::tycho_common::Bytes;
 
 use crate::{
     bps,
+    derived::SharedDerivedDataRef,
     encoding::encoder::Encoder,
     feed::{exclusivity::is_exclusive, protocol_registry::is_rfq_protocol},
     price_guard::guard::PriceGuard,
@@ -256,6 +257,8 @@ pub struct WorkerPoolRouter {
     price_guard: Option<PriceGuard>,
     /// Simulates encoded quotes when a request explicitly asks for it.
     simulator: Option<QuoteSimulator>,
+    /// Token gas prices that restate output-token amounts in the gas token for metrics.
+    derived_data: Option<SharedDerivedDataRef>,
 }
 
 /// Ranked, unencoded candidates for every order of a request — the output of
@@ -498,7 +501,7 @@ impl WorkerPoolRouter {
         config: WorkerPoolRouterConfig,
         encoder: Encoder,
     ) -> Self {
-        Self { solver_pools, config, encoder, price_guard: None, simulator: None }
+        Self { solver_pools, config, encoder, price_guard: None, simulator: None, derived_data: None }
     }
 
     /// Makes price guard validation available for this router.
@@ -513,6 +516,12 @@ impl WorkerPoolRouter {
     /// Makes encoded quote simulation available for this router.
     pub fn with_simulator(mut self, simulator: QuoteSimulator) -> Self {
         self.simulator = Some(simulator);
+        self
+    }
+
+    /// Makes the derived token gas prices available for this router's gas-token metrics.
+    pub fn with_derived_data(mut self, derived_data: SharedDerivedDataRef) -> Self {
+        self.derived_data = Some(derived_data);
         self
     }
 
