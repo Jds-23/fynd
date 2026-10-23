@@ -38,9 +38,10 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use instrumentation::record_quote_comparison;
 use metrics::{counter, gauge, histogram};
 use num_bigint::BigUint;
-use num_traits::{CheckedSub, ToPrimitive};
+use num_traits::ToPrimitive;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLockReadGuard;
 use tracing::{debug, warn};
 use tycho_execution::encoding::{
     evm::gas_estimator::estimate_gas_usage,
@@ -50,7 +51,7 @@ use tycho_simulation::tycho_common::Bytes;
 
 use crate::{
     bps,
-    derived::SharedDerivedDataRef,
+    derived::{DerivedData, SharedDerivedDataRef, TokenGasPrices},
     encoding::encoder::Encoder,
     feed::{exclusivity::is_exclusive, protocol_registry::is_rfq_protocol},
     price_guard::guard::PriceGuard,
@@ -481,9 +482,16 @@ fn record_encoding_failures(quotes: &[OrderQuote], cut_off_orders: &[usize]) {
 /// ranking: the price guard can pick a lower-ranked fallback, the exclusive overlay replaces the
 /// head of the list, and a failed encoding moves to the next candidate without an RFQ leg. These
 /// are the quotes the caller receives.
-pub fn finalize_quote(order_quotes: Vec<OrderQuote>, solve_time_ms: u64) -> Quote {
+///
+/// `token_prices` are the derived token gas prices that restate each win's volume in the gas
+/// token; without them the wins count as unpriced.
+pub fn finalize_quote(
+    order_quotes: Vec<OrderQuote>,
+    solve_time_ms: u64,
+    token_prices: Option<&TokenGasPrices>,
+) -> Quote {
     for quote in &order_quotes {
-        record_win(quote);
+        record_win(quote, token_prices);
         instrumentation::record_winning_protocols(quote);
     }
 
@@ -501,7 +509,14 @@ impl WorkerPoolRouter {
         config: WorkerPoolRouterConfig,
         encoder: Encoder,
     ) -> Self {
-        Self { solver_pools, config, encoder, price_guard: None, simulator: None, derived_data: None }
+        Self {
+            solver_pools,
+            config,
+            encoder,
+            price_guard: None,
+            simulator: None,
+            derived_data: None,
+        }
     }
 
     /// Makes price guard validation available for this router.
@@ -523,6 +538,14 @@ impl WorkerPoolRouter {
     pub fn with_derived_data(mut self, derived_data: SharedDerivedDataRef) -> Self {
         self.derived_data = Some(derived_data);
         self
+    }
+
+    /// Read access to the derived data, when the router was given it.
+    async fn read_derived_data(&self) -> Option<RwLockReadGuard<'_, DerivedData>> {
+        match &self.derived_data {
+            Some(derived_data) => Some(derived_data.read().await),
+            None => None,
+        }
     }
 
     /// Returns the number of registered solver pools.
@@ -622,6 +645,10 @@ impl WorkerPoolRouter {
         // `combine_with_surplus`, so the fallbacks are preserved. If the public worker pools find
         // nothing, that ranking is the `NoRouteFound` placeholder. The exclusive candidate then
         // uses a default fee.
+        let derived_data = self.read_derived_data().await;
+        let token_prices = derived_data
+            .as_deref()
+            .and_then(DerivedData::token_prices);
         let ranked_quotes: Vec<Vec<OrderQuote>> = order_responses
             .iter()
             .zip(&allocations)
@@ -637,12 +664,14 @@ impl WorkerPoolRouter {
                         request.options(),
                         public_ranked,
                         *USER_IMPROVEMENT_SHARE_BPS,
+                        token_prices,
                     )
                 } else {
                     self.rank_quotes(responses, request.options())
                 }
             })
             .collect();
+        drop(derived_data);
 
         // `join_all` preserves input order, so orders and responses line up one to one
         for (order, responses) in request
@@ -714,7 +743,11 @@ impl WorkerPoolRouter {
             }
             None => ranked.into_best(),
         };
-        Ok(finalize_quote(order_quotes, started.elapsed().as_millis() as u64))
+        let derived_data = self.read_derived_data().await;
+        let token_prices = derived_data
+            .as_deref()
+            .and_then(DerivedData::token_prices);
+        Ok(finalize_quote(order_quotes, started.elapsed().as_millis() as u64, token_prices))
     }
 
     /// The encoder this router uses for [`Self::quote`].
@@ -1171,6 +1204,7 @@ fn combine_with_surplus(
     options: &QuoteOptions,
     public_ranked: Vec<OrderQuote>,
     user_share_bps: u32,
+    token_prices: Option<&TokenGasPrices>,
 ) -> Vec<OrderQuote> {
     let Some(exclusive_candidate) = best_exclusive_candidate(responses, pool_scopes, options)
     else {
@@ -1200,28 +1234,32 @@ fn combine_with_surplus(
             "exclusive_user_savings_amount",
             exclusive_candidate,
             &user_savings,
+            token_prices,
         );
     }
 
     let mut result = Vec::with_capacity(public_ranked.len() + 1);
-    result.push(pin_commitment(exclusive_candidate, committed_amount_out));
+    result.push(pin_commitment(exclusive_candidate, committed_amount_out, token_prices));
     result.extend(public_ranked);
     result
 }
 
 /// Restates an output-token `amount` of `quote` in wei.
 ///
-/// The quote states its gas cost in both units, so that pair is the rate. `None` when either side
-/// is zero, which is how an unpriced output token shows up.
-fn to_gas_token_amount(quote: &OrderQuote, amount: &BigUint) -> Option<BigUint> {
-    let gas_cost_out = quote
-        .amount_out()
-        .checked_sub(quote.amount_out_net_gas())?;
-    let gas_cost_wei = quote.gas_estimate() * quote.gas_price()?;
-    if gas_cost_out == BigUint::ZERO || gas_cost_wei == BigUint::ZERO {
+/// The rate is the derived gas price of the quote's output token, so it does not depend on how the
+/// algorithm netted gas off the quote. `None` when there are no prices, the output token has none,
+/// or either side of its price is zero.
+fn to_gas_token_amount(
+    quote: &OrderQuote,
+    amount: &BigUint,
+    token_prices: Option<&TokenGasPrices>,
+) -> Option<BigUint> {
+    let output_token = quote.route()?.output_token()?;
+    let price = token_prices?.get(&output_token)?;
+    if price.numerator == BigUint::ZERO || price.denominator == BigUint::ZERO {
         return None;
     }
-    Some(amount * gas_cost_wei / gas_cost_out)
+    Some(amount * &price.denominator / &price.numerator)
 }
 
 /// Records the win and the settled volume of one quote the router returns, by pool, algorithm and
@@ -1229,16 +1267,17 @@ fn to_gas_token_amount(quote: &OrderQuote, amount: &BigUint) -> Option<BigUint> 
 ///
 /// Counting wins alone hides size: a solver can win few orders and still settle most of the flow,
 /// or the reverse. Output-token base units do not add up across tokens, so the amount is converted
-/// to the gas token first, the same way `record_gas_token_amount` does it. A quote the conversion
-/// cannot price counts under `worker_router_unpriced_won_quotes_total` rather than recording zero
-/// volume, which would read as a solver that won nothing.
+/// to the gas token first at the derived gas price of the output token, the same way
+/// `record_gas_token_amount` does it. A quote the conversion cannot price counts under
+/// `worker_router_unpriced_won_quotes_total` rather than recording zero volume, which would read
+/// as a solver that won nothing.
 ///
 /// The `post_processed_by` label joins the names of the post-processors that replaced the route
 /// with `+`, in config order. It is `none` when no post-processor replaced the route.
 ///
 /// A quote that found no route has no winner to credit. So has a quote the router built itself,
 /// which is why an empty worker pool is skipped rather than counted under a placeholder label.
-fn record_win(quote: &OrderQuote) {
+fn record_win(quote: &OrderQuote, token_prices: Option<&TokenGasPrices>) {
     if quote.status() != QuoteStatus::Success || quote.worker_pool().is_empty() {
         return;
     }
@@ -1256,7 +1295,8 @@ fn record_win(quote: &OrderQuote) {
     )
     .increment(1);
 
-    let volume = to_gas_token_amount(quote, quote.amount_out()).and_then(|amount| amount.to_f64());
+    let volume = to_gas_token_amount(quote, quote.amount_out(), token_prices)
+        .and_then(|amount| amount.to_f64());
     let Some(volume) = volume else {
         counter!(
             "worker_router_unpriced_won_quotes_total",
@@ -1278,11 +1318,16 @@ fn record_win(quote: &OrderQuote) {
 
 /// Records an output-token `amount` under `metric`, in whole gas tokens.
 ///
-/// Output-token base units are not summable across tokens, so a total over them means nothing. An
-/// amount with no rate increments `exclusive_unpriced_output_total`; a zero would read as "captured
-/// nothing".
-fn record_gas_token_amount(metric: &'static str, quote: &OrderQuote, amount: &BigUint) {
-    let Some(gas_token_amount) = to_gas_token_amount(quote, amount) else {
+/// Output-token base units are not summable across tokens, so a total over them means nothing. The
+/// rate is the derived gas price of the quote's output token. An amount with no rate increments
+/// `exclusive_unpriced_output_total`; a zero would read as "captured nothing".
+fn record_gas_token_amount(
+    metric: &'static str,
+    quote: &OrderQuote,
+    amount: &BigUint,
+    token_prices: Option<&TokenGasPrices>,
+) {
+    let Some(gas_token_amount) = to_gas_token_amount(quote, amount, token_prices) else {
         counter!("exclusive_unpriced_output_total").increment(1);
         return;
     };
@@ -1391,12 +1436,21 @@ fn default_fee_commitment(exclusive_candidate: &OrderQuote) -> Option<BigUint> {
 /// leg, sets `amount_out` and `amount_out_net_gas`, and attaches the `SurplusInfo`.
 ///
 /// The exclusive components capture all output above the commitment.
-fn pin_commitment(exclusive_candidate: &OrderQuote, committed_amount_out: BigUint) -> OrderQuote {
+fn pin_commitment(
+    exclusive_candidate: &OrderQuote,
+    committed_amount_out: BigUint,
+    token_prices: Option<&TokenGasPrices>,
+) -> OrderQuote {
     let exclusive_route_amount_out = exclusive_candidate.amount_out();
     let exclusive_gas_cost = exclusive_route_amount_out - exclusive_candidate.amount_out_net_gas();
     let surplus_amount = exclusive_route_amount_out - &committed_amount_out;
 
-    record_gas_token_amount("exclusive_fee_amount", exclusive_candidate, &surplus_amount);
+    record_gas_token_amount(
+        "exclusive_fee_amount",
+        exclusive_candidate,
+        &surplus_amount,
+        token_prices,
+    );
 
     let mut surplus_quote = exclusive_candidate.clone();
 
