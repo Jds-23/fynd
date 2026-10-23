@@ -102,7 +102,8 @@ See `fynd-core/examples/custom_algorithm.rs` for a walkthrough.
 pipeline and asserts solution availability, quality vs baseline, derived-data metrics, and timing.
 Run with `cargo nextest run -p fynd-core --features test-utils --test integration`. The
 `test-utils` feature gates `Solver::from_recording`, the recording helpers, and
-`OrderQuote::with_route_for_testing` (an encodable quote for tests in other crates); fixtures are
+`types::test_utils::OrderQuoteBuilder` (quotes for tests in other crates, encodable once given a
+route, sender and receiver); fixtures are
 recorded with `tools/record-market`. See `tests/integration/README.md`.
 
 ## Data Flow

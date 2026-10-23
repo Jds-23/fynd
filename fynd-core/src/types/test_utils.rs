@@ -6,6 +6,7 @@
 //! fields needs to set.
 
 use num_bigint::BigUint;
+use tycho_simulation::tycho_common::Bytes;
 
 use crate::types::{
     quote::{BlockInfo, OrderQuote, QuoteStatus, Route},
@@ -27,6 +28,8 @@ pub struct OrderQuoteBuilder {
     price_impact_bps: Option<i32>,
     route: Option<Route>,
     no_route_cause: Option<SolveError>,
+    sender: Bytes,
+    receiver: Bytes,
 }
 
 impl OrderQuoteBuilder {
@@ -42,6 +45,8 @@ impl OrderQuoteBuilder {
             price_impact_bps: None,
             route: None,
             no_route_cause: None,
+            sender: Bytes::default(),
+            receiver: Bytes::default(),
         }
     }
 
@@ -76,6 +81,18 @@ impl OrderQuoteBuilder {
         self
     }
 
+    /// Sets the address that sends the input. The encoder needs a 20-byte address.
+    pub fn sender(mut self, sender: Bytes) -> Self {
+        self.sender = sender;
+        self
+    }
+
+    /// Sets the address that receives the output. The encoder needs a 20-byte address.
+    pub fn receiver(mut self, receiver: Bytes) -> Self {
+        self.receiver = receiver;
+        self
+    }
+
     /// Sets why the order found no route, which is what drives its failure reason.
     pub fn no_route_cause(mut self, cause: SolveError) -> Self {
         self.no_route_cause = Some(cause);
@@ -94,8 +111,8 @@ impl OrderQuoteBuilder {
             BigUint::from(amount_out_net_gas),
             self.block,
             self.algorithm,
-            Default::default(),
-            Default::default(),
+            self.sender,
+            self.receiver,
             "1".to_string(),
         );
         if let Some(route) = self.route {

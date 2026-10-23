@@ -1333,13 +1333,6 @@ impl OrderQuote {
         self
     }
 
-    /// Sets the route for this solution, so a test outside this crate can build a quote the
-    /// encoder accepts. `Deserialize` cannot: it drops the route's token map.
-    #[cfg(feature = "test-utils")]
-    pub fn with_route_for_testing(self, route: Route) -> Self {
-        self.with_route(route)
-    }
-
     /// Sets the effective gas price.
     pub(crate) fn with_gas_price(mut self, gas_price: BigUint) -> Self {
         self.gas_price = Some(gas_price);
