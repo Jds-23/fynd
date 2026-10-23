@@ -34,7 +34,7 @@ async fn test_computation_reads_the_changed_components() {
     let mut changed = ChangedComponents::default();
     changed
         .added
-        .insert("pool".to_string(), Vec::new());
+        .insert("pool".to_string(), Default::default());
 
     let output = AddedComponents
         .compute(&MarketData::new_shared(), &DerivedData::new_shared(), &changed)

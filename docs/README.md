@@ -1,5 +1,5 @@
 ---
-description: The DEX aggregator that runs on your hardware, under the Fynd License.
+description: The DEX aggregator that runs on your hardware.
 icon: book-open
 layout:
   width: default
@@ -17,18 +17,21 @@ layout:
     visible: true
   tags:
     visible: true
+  actions:
+    visible: true
+  anchors:
+    visible: true
 ---
 
 # Overview
 
 ## What is Fynd?
 
-Fynd is a DEX aggregator that runs locally on your server. It is provided under the [Fynd License 1.0](reference/license.md). Use, modification, distribution, and settlement are subject to its terms. We built Fynd to be **reliable** and **trustless.**
+Fynd is a DEX aggregator that runs locally on your server.
 
 Fynd gives you quotes in 20ms, supports 1.000 RPS on commodity hardware (see [performance](reference/benchmark-results.md)), does not overquote, and is configurable to the pools, tokens, and objectives you care about (low reverts, best price, low latency, etc.).
 
 Fynd builds on [Tycho](https://www.propellerheads.xyz/tycho), PropellerHeads' DEX indexer (see the [protocols it supports](https://docs.propellerheads.xyz/tycho/for-solvers/supported-protocols)).
-
 
 ## Own Your Routing <a href="#own-your-dex-routing" id="own-your-dex-routing"></a>
 
@@ -79,4 +82,4 @@ Fynd works with any protocol Tycho supports. See the [list of supported protocol
 
 ## Try it out
 
-Head to the [quickstart](get-started/quickstart/README.md) to get Fynd running.
+Head to the [quickstart](get-started/quickstart/) to get Fynd running.

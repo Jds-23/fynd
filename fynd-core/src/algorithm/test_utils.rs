@@ -8,6 +8,7 @@ use num_rational::BigRational;
 use num_traits::{ToPrimitive, Zero};
 use rustc_hash::FxHashMap;
 use tycho_simulation::{
+    book::SWAP_DIRECTIONS_ATTRIBUTE,
     tycho_client::feed::{BlockHeader, SynchronizerState},
     tycho_core::{
         dto::ProtocolStateDelta,
@@ -28,7 +29,7 @@ use crate::{
     algorithm::most_liquid::DepthAndPrice,
     feed::market_data::{MarketData, MarketState},
     graph::{petgraph::PetgraphStableDiGraphManager, GraphManager, TopologyGraphManager},
-    types::{quote::OrderSide, Order},
+    types::{quote::OrderSide, ComponentTopology, Order},
 };
 
 /// Sets the last updated block of `market` by reporting a `Ready` block for `test_protocol`, a
@@ -532,6 +533,54 @@ pub fn component_with_protocol(
     )
 }
 
+/// Encodes `directions` the way a book feed writes its `swap_directions` attribute: 40 bytes each,
+/// the token sold first.
+pub fn encode_swap_directions<'a>(
+    directions: impl IntoIterator<Item = &'a (Address, Address)>,
+) -> Bytes {
+    let mut encoded = Vec::new();
+    for (token_in, token_out) in directions {
+        encoded.extend_from_slice(token_in);
+        encoded.extend_from_slice(token_out);
+    }
+    encoded.into()
+}
+
+/// Creates a test ProtocolComponent that lists its swap directions in the `swap_directions`
+/// attribute, as an aggregated RFQ venue does.
+pub fn component_with_directions(
+    id: &str,
+    tokens: &[Token],
+    directions: &[(&Token, &Token)],
+) -> ProtocolComponent {
+    let directions: std::collections::BTreeSet<(Address, Address)> = directions
+        .iter()
+        .map(|(token_in, token_out)| (token_in.address.clone(), token_out.address.clone()))
+        .collect();
+    let mut component = component_with_protocol(id, "rfq:test", tokens);
+    component
+        .static_attributes
+        .insert(SWAP_DIRECTIONS_ATTRIBUTE.to_string(), encode_swap_directions(&directions));
+    component
+}
+
+/// Creates a component topology with the given tokens and swap directions.
+pub fn topology_with_directions(
+    tokens: &[&Address],
+    directions: &[(&Address, &Address)],
+) -> ComponentTopology {
+    ComponentTopology {
+        tokens: tokens
+            .iter()
+            .map(|token| (*token).clone())
+            .collect(),
+        swap_directions: directions
+            .iter()
+            .map(|(token_in, token_out)| ((*token_in).clone(), (*token_out).clone()))
+            .collect(),
+    }
+}
+
 /// Creates an order for testing.
 pub fn order(token_in: &Token, token_out: &Token, amount: u128, side: OrderSide) -> Order {
     Order::new(
@@ -686,9 +735,9 @@ pub mod fixtures {
         let (a, b, c, d) = addrs();
         let mut m = TopologyGraphManager::<DepthAndPrice>::new();
         let mut t = FxHashMap::default();
-        t.insert("ab".into(), vec![a.clone(), b.clone()]);
-        t.insert("bc".into(), vec![b.clone(), c.clone()]);
-        t.insert("cd".into(), vec![c, d]);
+        t.insert("ab".into(), vec![a.clone(), b.clone()].into());
+        t.insert("bc".into(), vec![b.clone(), c.clone()].into());
+        t.insert("cd".into(), vec![c, d].into());
         m.initialize_graph(&t);
         m
     }
@@ -699,11 +748,11 @@ pub mod fixtures {
         let (a, b, c, _) = addrs();
         let mut m = TopologyGraphManager::<DepthAndPrice>::new();
         let mut t = FxHashMap::default();
-        t.insert("ab1".into(), vec![a.clone(), b.clone()]);
-        t.insert("ab2".into(), vec![a.clone(), b.clone()]);
-        t.insert("ab3".into(), vec![a, b.clone()]);
-        t.insert("bc1".into(), vec![b.clone(), c.clone()]);
-        t.insert("bc2".into(), vec![b, c]);
+        t.insert("ab1".into(), vec![a.clone(), b.clone()].into());
+        t.insert("ab2".into(), vec![a.clone(), b.clone()].into());
+        t.insert("ab3".into(), vec![a, b.clone()].into());
+        t.insert("bc1".into(), vec![b.clone(), c.clone()].into());
+        t.insert("bc2".into(), vec![b, c].into());
         m.initialize_graph(&t);
         m
     }
@@ -714,10 +763,10 @@ pub mod fixtures {
         let (a, b, c, d) = addrs();
         let mut m = TopologyGraphManager::<DepthAndPrice>::new();
         let mut t = FxHashMap::default();
-        t.insert("ab".into(), vec![a.clone(), b.clone()]);
-        t.insert("ac".into(), vec![a, c.clone()]);
-        t.insert("bd".into(), vec![b, d.clone()]);
-        t.insert("cd".into(), vec![c, d]);
+        t.insert("ab".into(), vec![a.clone(), b.clone()].into());
+        t.insert("ac".into(), vec![a, c.clone()].into());
+        t.insert("bd".into(), vec![b, d.clone()].into());
+        t.insert("cd".into(), vec![c, d].into());
         m.initialize_graph(&t);
         m
     }

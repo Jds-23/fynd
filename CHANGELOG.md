@@ -1,4 +1,43 @@
 
+## [0.115.0](https://github.com/propeller-heads/fynd/compare/0.114.5...0.115.0) (2026-10-23)
+
+### Features
+
+* **core:** decode router calls for calldata hooks ([2716b9e](https://github.com/propeller-heads/fynd/commit/2716b9e04adbf1b7c266abc5b2fb25694f58fc6b))
+
+
+## [0.114.5](https://github.com/propeller-heads/fynd/compare/0.114.4...0.114.5) (2026-10-22)
+
+### Features
+
+* **core:** add --aggregate-rfqs to stream an RFQ venue as one component ([20f340d](https://github.com/propeller-heads/fynd/commit/20f340d5afd8c4c9d188393243284657b237c4d3))
+* **core:** compute spot prices and depths per swap direction ([a2d8493](https://github.com/propeller-heads/fynd/commit/a2d849395ab66b9b498c93bab2efe2ae878a04e2))
+* **core:** build graph edges from component swap directions ([50f4335](https://github.com/propeller-heads/fynd/commit/50f4335b3f89d4ce345689089ee41e8e13c75d6c))
+* **core:** store each component's swap directions in the market ([e38c80b](https://github.com/propeller-heads/fynd/commit/e38c80b80b97c3d674b833dde4946b68bb1cd637))
+* **core:** leave RFQ venues out of token gas pricing ([1a09718](https://github.com/propeller-heads/fynd/commit/1a097185bb4f584f61dcc65168ebca06e67c8953))
+
+### Bug Fixes
+
+* **core:** upsert the books a venue refreshes ([0858d9d](https://github.com/propeller-heads/fynd/commit/0858d9dd95e2e95729091333229aa3b73357bf6e))
+* **core:** evict a re-sent pAMM that loses its backing ([776d860](https://github.com/propeller-heads/fynd/commit/776d86009e22df175266feed2eb521987e51437a))
+* **core:** report a re-sent component as updated, not added ([b201e75](https://github.com/propeller-heads/fynd/commit/b201e75284a2e3dfdc08e2d6542c2a8e6c5a441b))
+
+
+## [0.114.4](https://github.com/propeller-heads/fynd/compare/0.114.3...0.114.4) (2026-10-22)
+
+### Features
+
+* **core:** let tests in other crates attach a route to a quote ([1986935](https://github.com/propeller-heads/fynd/commit/19869355f8fbf9c93fab2e76452d88111137055f))
+
+
+## [0.114.3](https://github.com/propeller-heads/fynd/compare/0.114.2...0.114.3) (2026-10-22)
+
+### Features
+
+* **core:** let the calldata hook write into the swaps bytes ([9573e0e](https://github.com/propeller-heads/fynd/commit/9573e0e1f862e5346f08ef7badb2c241bf09076a))
+* **core:** add solution and calldata hooks to encoding ([5f5ce22](https://github.com/propeller-heads/fynd/commit/5f5ce220660d4046328d98b8e8d7b83505bfd949))
+
+
 ## [0.114.2](https://github.com/propeller-heads/fynd/compare/0.114.1...0.114.2) (2026-10-21)
 
 ### Features

@@ -6,6 +6,7 @@ use alloy::{
 };
 use futures::{StreamExt, TryStreamExt};
 use num_bigint::BigUint;
+use serde_json::Value;
 use tycho_execution::encoding::{
     errors::EncodingError,
     evm::{
@@ -27,6 +28,8 @@ use crate::{
             DisableSlippageTakingSigner, SwapIntent, ENV_DISABLE_SLIPPAGE_TAKING_KEY,
         },
         exclusive_swap::ExclusiveSwapSigner,
+        hooks::SolutionHook,
+        router_call::{RouterCall, RouterLayout},
         router_fees::{FeeRates, RouterFees, SharedRouterFees},
     },
     fallback::user_data::fallback_user_data,
@@ -47,8 +50,6 @@ const MAX_CONCURRENT_ENCODES: usize = 32;
 /// One quote's solution, ready to encode, with the fee figures its router call carries.
 #[derive(Debug)]
 struct PreparedSolution {
-    /// Position of the quote in the request, where the encoded transaction is written back.
-    quote_index: usize,
     solution: Solution,
     fee_breakdown: FeeBreakdown,
     fee_rates: FeeRates,
@@ -66,6 +67,7 @@ struct PreparedSolution {
 /// * `jit_router_address` - Address of the chain's `FyndJITRouter`, or `None` when the deployment
 ///   has none. It fronts the router with the same entrypoints, so a transaction sent to it carries
 ///   the same calldata.
+#[derive(Clone)]
 pub struct Encoder {
     tycho_encoder: Option<Arc<dyn TychoEncoder>>,
     chain: Chain,
@@ -73,9 +75,9 @@ pub struct Encoder {
     jit_router_address: Option<Bytes>,
     router_fees: SharedRouterFees,
     /// Signs exclusive legs. `None` disables signing (no controller key configured).
-    exclusive_swap_signer: Option<ExclusiveSwapSigner>,
+    exclusive_swap_signer: Option<Arc<ExclusiveSwapSigner>>,
     /// Signs disable-slippage-taking client fee params. `None` disables it (no key configured).
-    disable_slippage_taking_signer: Option<DisableSlippageTakingSigner>,
+    disable_slippage_taking_signer: Option<Arc<DisableSlippageTakingSigner>>,
     /// Bytes appended to every encoded transaction's calldata to tag its origin. Trailing
     /// calldata beyond the ABI-encoded arguments is ignored by the EVM, so the tag is free of
     /// on-chain effect. `None` (the default) appends nothing. A request that carries its own
@@ -186,6 +188,59 @@ fn slippage_bps(slippage: f64) -> u32 {
         .clamp(0.0, 10_000.0) as u32
 }
 
+/// Fields of the tycho `Solution` a solution hook may change.
+const HOOK_MUTABLE_FIELDS: &[&str] = &["expected_amount_out"];
+
+/// Returns the name of the first field outside `HOOK_MUTABLE_FIELDS` where `hooked` differs from
+/// `original`.
+///
+/// Compares the serialized solutions, so a field tycho adds later is checked without a change
+/// here: tycho's `Solution` and `Swap` have no `PartialEq`. `Swap.protocol_state` is not
+/// serialized, and RFQ encoders request their quote from it, so it is compared separately.
+fn changed_solution_field(
+    original_solution: &Solution,
+    hooked_solution: &Solution,
+) -> Result<Option<String>, SolveError> {
+    let serialize = |solution: &Solution| match serde_json::to_value(solution) {
+        Ok(Value::Object(fields)) => Ok(fields),
+        Ok(other) => Err(SolveError::FailedEncoding(format!(
+            "a tycho solution serialized to {other} instead of an object; cannot check the \
+             solution hook's changes"
+        ))),
+        Err(error) => Err(SolveError::FailedEncoding(format!(
+            "failed to serialize a tycho solution to check the solution hook's changes: {error}"
+        ))),
+    };
+    let original = serialize(original_solution)?;
+    let hooked = serialize(hooked_solution)?;
+    let changed_field = original
+        .into_iter()
+        .find(|(field, value)| {
+            !HOOK_MUTABLE_FIELDS.contains(&field.as_str()) && hooked.get(field) != Some(value)
+        })
+        .map(|(field, _)| field);
+    if changed_field.is_some() {
+        return Ok(changed_field);
+    }
+    // The serialized swaps matched, so both solutions have the same number of swaps.
+    let same_states = original_solution
+        .swaps()
+        .iter()
+        .zip(hooked_solution.swaps())
+        .all(|(original, hooked)| same_protocol_state(original, hooked));
+    Ok((!same_states).then(|| "swaps.protocol_state".to_string()))
+}
+
+/// Whether both swaps hold the same protocol state object. A hook gets a clone of the solution,
+/// which shares each swap's state, so any other state was put there by the hook.
+fn same_protocol_state(original: &Swap, hooked: &Swap) -> bool {
+    match (original.protocol_state(), hooked.protocol_state()) {
+        (Some(original), Some(hooked)) => Arc::ptr_eq(original, hooked),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// Counts an RFQ leg rejected because its signed quote fell short of the user's slippage, by
 /// protocol and route shape. The leg-level check is exact only for a single-hop route, so the
 /// shape shows how many rejections a route-level check could have let through.
@@ -253,13 +308,15 @@ impl Encoder {
         // Without a router address there is no locker to authorize, and `encode` already fails on
         // this chain, so an exclusive leg could not be encoded either way.
         let exclusive_swap_signer = match &router_address {
-            Some(router) => ExclusiveSwapSigner::from_env(chain.id(), router)?,
+            Some(router) => ExclusiveSwapSigner::from_env(chain.id(), router)?.map(Arc::new),
             None => None,
         };
         // The router is the EIP-712 verifying contract for `ClientFee`, so without one there is
         // nothing to sign for.
         let disable_slippage_taking_signer = match &router_address {
-            Some(router) => DisableSlippageTakingSigner::from_env(chain.id(), router)?,
+            Some(router) => {
+                DisableSlippageTakingSigner::from_env(chain.id(), router)?.map(Arc::new)
+            }
             None => None,
         };
         Ok(Self {
@@ -301,7 +358,7 @@ impl Encoder {
     /// Overrides the exclusive-swap signer, replacing whatever was read from the environment.
     #[must_use]
     pub fn with_exclusive_swap_signer(mut self, signer: ExclusiveSwapSigner) -> Self {
-        self.exclusive_swap_signer = Some(signer);
+        self.exclusive_swap_signer = Some(Arc::new(signer));
         self
     }
 
@@ -313,7 +370,7 @@ impl Encoder {
         mut self,
         signer: DisableSlippageTakingSigner,
     ) -> Self {
-        self.disable_slippage_taking_signer = Some(signer);
+        self.disable_slippage_taking_signer = Some(Arc::new(signer));
         self
     }
 
@@ -396,47 +453,22 @@ impl Encoder {
             tracing::warn!(slippage, "slippage exceeds 50%, possible misconfiguration");
         }
 
-        let router_fees = self.router_fees.snapshot();
-        let mut to_encode: Vec<PreparedSolution> = Vec::new();
-        let mut failures: Vec<(usize, SolveError)> = Vec::new();
-
-        for (quote_index, quote) in quotes.iter().enumerate() {
-            if quote.status() != QuoteStatus::Success {
-                continue;
-            }
-            match self.prepare_solution(quote_index, quote, &encoding_options, &router_fees) {
-                Ok(prepared) => to_encode.push(prepared),
-                Err(e) => failures.push((quote_index, e)),
-            }
-        }
-
-        let encoded_solutions = self
-            .encode_prepared_solutions(tycho_encoder, &to_encode, deadline)
+        let encoded_quotes = self
+            .encode_quotes(tycho_encoder, &quotes, encoding_options, deadline)
             .await?;
 
-        for (encoded_solution, prepared) in encoded_solutions
-            .into_iter()
-            .zip(to_encode)
-        {
-            let quote_index = prepared.quote_index;
-            if let Err(e) = self.attach_transaction(
-                &mut quotes[quote_index],
-                encoded_solution,
-                prepared,
-                &encoding_options,
-            ) {
-                record_signed_quote_shortfall(&quotes[quote_index], &e);
-                failures.push((quote_index, SolveError::FailedEncoding(e.to_string())));
+        for (quote_index, encoded_quote) in encoded_quotes {
+            match encoded_quote {
+                Ok(encoded_quote) => quotes[quote_index] = encoded_quote,
+                Err(error) => {
+                    tracing::warn!(
+                        order_id = %quotes[quote_index].order_id(),
+                        %error,
+                        "this candidate failed to encode"
+                    );
+                    quotes[quote_index].set_status(QuoteStatus::EncodingFailed);
+                }
             }
-        }
-
-        for (quote_index, error) in failures {
-            tracing::warn!(
-                order_id = %quotes[quote_index].order_id(),
-                %error,
-                "this candidate failed to encode"
-            );
-            quotes[quote_index].set_status(QuoteStatus::EncodingFailed);
         }
 
         Ok(quotes)
@@ -446,7 +478,6 @@ impl Encoder {
     /// and any signature an exclusive leg needs.
     fn prepare_solution(
         &self,
-        quote_index: usize,
         quote: &OrderQuote,
         encoding_options: &EncodingOptions,
         router_fees: &RouterFees,
@@ -495,85 +526,197 @@ impl Encoder {
                 solution
             }
         };
-        Ok(PreparedSolution { quote_index, solution, fee_breakdown, fee_rates })
+        let solution = match encoding_options.solution_hook() {
+            Some(hook) => Self::apply_solution_hook(hook, quote, solution)?,
+            None => solution,
+        };
+        Ok(PreparedSolution { solution, fee_breakdown, fee_rates })
     }
 
-    /// Builds the router call for one encoded solution and writes its transaction, gas estimate
-    /// and fee breakdown to the quote.
+    /// Runs `hook` and checks the `Solution` it returns: only `expected_amount_out` may change, and
+    /// it must stay at or above `min_amount_out`.
+    fn apply_solution_hook(
+        hook: &dyn SolutionHook,
+        quote: &OrderQuote,
+        solution: Solution,
+    ) -> Result<Solution, SolveError> {
+        let hooked = hook.apply(quote, solution.clone())?;
+        if let Some(field) = changed_solution_field(&solution, &hooked)? {
+            return Err(SolveError::FailedEncoding(format!(
+                "the solution hook changed {field}; it may change only {}",
+                HOOK_MUTABLE_FIELDS.join(", ")
+            )));
+        }
+        if hooked.expected_amount_out() < hooked.min_amount_out() {
+            return Err(SolveError::FailedEncoding(format!(
+                "the solution hook set expected_amount_out {} below min_amount_out {}; the router \
+                 rejects it",
+                hooked.expected_amount_out(),
+                hooked.min_amount_out()
+            )));
+        }
+        Ok(hooked)
+    }
+
+    /// Builds the router call for one encoded solution and writes its transaction, gas estimate,
+    /// fee breakdown and amount out to the quote.
+    ///
+    /// The calldata hook runs before the watermark is appended, so it gets only the router call:
+    /// the same bytes whichever client the watermark names. The fee breakdown's swaps hash is taken
+    /// after the hook, because the hook may write into the swaps bytes.
     fn attach_transaction(
         &self,
         quote: &mut OrderQuote,
         encoded_solution: Result<EncodedSolution, EncodingError>,
         prepared: PreparedSolution,
         encoding_options: &EncodingOptions,
-    ) -> Result<(), EncodingError> {
-        let encoded_solution = encoded_solution?;
-        let gas_estimate = encoded_solution.estimated_gas().clone();
-        let (transaction, fee_breakdown) = self.encode_tycho_router_call(
-            encoded_solution,
-            &prepared.solution,
-            encoding_options,
-            prepared.fee_breakdown,
-            prepared.fee_rates,
-        )?;
-        quote.set_gas_estimate(gas_estimate);
+    ) -> Result<(), SolveError> {
+        let encoded_solution =
+            encoded_solution.map_err(|error| Self::failed_encoding_error(quote, error))?;
+        let mut transaction = self
+            .encode_tycho_router_call(
+                &encoded_solution,
+                &prepared.solution,
+                encoding_options,
+                &prepared.fee_rates,
+            )
+            .map_err(|error| Self::failed_encoding_error(quote, error))?;
+        let calldata = transaction.data_mut();
+        if let Some(hook) = encoding_options.calldata_hook() {
+            hook.apply(quote, &prepared.solution, &encoded_solution, calldata)?;
+        }
+        let call = RouterCall::decode(encoded_solution.function_signature(), calldata)?;
+        let swaps = call.swaps().as_ref();
+        // Temporary: remove once disable-slippage-taking moves out of fynd-core into a calldata
+        // hook (ENG-6417). Until then fynd-core signs it before the hook, over the old swaps.
+        if encoding_options.applies_disable_slippage_taking() && swaps != encoded_solution.swaps() {
+            return Err(SolveError::FailedEncoding(
+                "the calldata hook changed the swaps bytes, but fynd-core signs the \
+                 disable-slippage-taking client fee before the hook runs, so that signature \
+                 would no longer match; turn off disable_slippage_taking and sign the zero-fee \
+                 client fee in the hook"
+                    .to_string(),
+            ));
+        }
+        let fee_breakdown = if encoding_options
+            .client_fee_params()
+            .is_some()
+        {
+            prepared
+                .fee_breakdown
+                .with_swaps_hash(keccak256(swaps).0)
+        } else {
+            prepared.fee_breakdown
+        };
+        let watermark = encoding_options
+            .calldata_watermark()
+            .or(self.calldata_watermark.as_deref());
+        if let Some(watermark) = watermark {
+            calldata.extend_from_slice(watermark);
+        }
+        // A solution hook may change `expected_amount_out`; the quote reports what the calldata
+        // carries, because a client signs its fee over the reported amounts.
+        quote.set_amount_out(
+            prepared
+                .solution
+                .expected_amount_out()
+                .clone(),
+        );
+        quote.set_gas_estimate(encoded_solution.estimated_gas().clone());
         quote.set_transaction(transaction);
         quote.set_fee_breakdown(fee_breakdown);
         Ok(())
     }
 
-    /// Encodes each prepared solution into router swap calldata, one result per solution in the
-    /// same order.
+    /// Converts `error` into `SolveError::FailedEncoding`, counting a signed-quote shortfall if it
+    /// is one.
+    fn failed_encoding_error(quote: &OrderQuote, error: EncodingError) -> SolveError {
+        record_signed_quote_shortfall(quote, &error);
+        SolveError::FailedEncoding(error.to_string())
+    }
+
+    /// Encodes one quote: builds its solution, encodes it and writes the router call to `quote`.
+    fn encode_quote(
+        &self,
+        tycho_encoder: &dyn TychoEncoder,
+        quote: &mut OrderQuote,
+        encoding_options: &EncodingOptions,
+        router_fees: &RouterFees,
+    ) -> Result<(), SolveError> {
+        let prepared = self.prepare_solution(quote, encoding_options, router_fees)?;
+        let encoded_solution = tycho_encoder
+            .encode_solutions(vec![prepared.solution.clone()])
+            .and_then(|mut encoded| {
+                encoded.pop().ok_or_else(|| {
+                    EncodingError::FatalError(
+                        "the encoder returned no encoded solution".to_string(),
+                    )
+                })
+            });
+        self.attach_transaction(quote, encoded_solution, prepared, encoding_options)
+    }
+
+    /// Encodes each successful quote, returning its position in `quotes` and either the encoded
+    /// quote or the error that fails it, in quote order.
     ///
-    /// Every solution gets its own blocking task, [`MAX_CONCURRENT_ENCODES`] of them at a time.
-    /// `encode_solutions` blocks: an RFQ swap fetches its signed quote over the network and waits
-    /// for it, so on the runtime a single task would park a worker for a whole round trip, and
-    /// every task sharing that worker -- the market feed included -- would wait with it. One task
-    /// per solution also keeps a failing solution from discarding the calldata of the others, and
-    /// the round trips still overlap.
-    async fn encode_prepared_solutions(
+    /// Every quote gets its own blocking task, [`MAX_CONCURRENT_ENCODES`] of them at a time, and
+    /// the deadline covers the whole task, both hooks included. `encode_solutions` blocks: an RFQ
+    /// swap fetches its signed quote over the network and waits for it, so on the runtime a single
+    /// task would park a worker for a whole round trip, and every task sharing that worker -- the
+    /// market feed included -- would wait with it. One task per quote also keeps a failing quote
+    /// from discarding the calldata of the others, and the round trips still overlap.
+    async fn encode_quotes(
         &self,
         tycho_encoder: &Arc<dyn TychoEncoder>,
-        to_encode: &[PreparedSolution],
+        quotes: &[OrderQuote],
+        encoding_options: EncodingOptions,
         deadline: Option<Instant>,
-    ) -> Result<Vec<Result<EncodedSolution, EncodingError>>, SolveError> {
-        // Owned clones, so no task borrows from `to_encode`: a future that holds such a borrow
-        // is not general enough over its lifetime for an async caller further up.
-        let solutions: Vec<Solution> = to_encode
+    ) -> Result<Vec<(usize, Result<OrderQuote, SolveError>)>, SolveError> {
+        let encoder = Arc::new(self.clone());
+        let encoding_options = Arc::new(encoding_options);
+        let router_fees = Arc::new(self.router_fees.snapshot());
+        // Owned clones, so no task borrows from `quotes`: a future that holds such a borrow is not
+        // general enough over its lifetime for an async caller further up.
+        let tasks: Vec<_> = quotes
             .iter()
-            .map(|prepared| prepared.solution.clone())
-            .collect();
-
-        let tycho_encoder = Arc::clone(tycho_encoder);
-        let tasks = solutions
-            .into_iter()
-            .map(move |solution| {
-                let encoder = Arc::clone(&tycho_encoder);
+            .enumerate()
+            .filter(|(_, quote)| quote.status() == QuoteStatus::Success)
+            .map(|(quote_index, quote)| {
+                let mut quote = quote.clone();
+                let (encoder, tycho_encoder) = (Arc::clone(&encoder), Arc::clone(tycho_encoder));
+                let (encoding_options, router_fees) =
+                    (Arc::clone(&encoding_options), Arc::clone(&router_fees));
                 async move {
                     let encode = tokio::task::spawn_blocking(move || {
                         encoder
-                            .encode_solutions(vec![solution])?
-                            .pop()
-                            .ok_or_else(|| {
-                                EncodingError::FatalError(
-                                    "the encoder returned no encoded solution".to_string(),
-                                )
-                            })
+                            .encode_quote(
+                                &*tycho_encoder,
+                                &mut quote,
+                                &encoding_options,
+                                &router_fees,
+                            )
+                            .map(|()| quote)
                     });
                     let Some(deadline) = deadline else {
-                        return encode.await;
+                        return encode
+                            .await
+                            .map(|encoded| (quote_index, encoded));
                     };
                     match tokio::time::timeout_at(deadline.into(), encode).await {
-                        Ok(joined) => joined,
-                        Err(_) => Ok(Err(EncodingError::RecoverableError(
-                            "the solution did not encode before the deadline".to_string(),
-                        ))),
+                        Ok(joined) => joined.map(|encoded| (quote_index, encoded)),
+                        Err(_) => Ok((
+                            quote_index,
+                            Err(SolveError::FailedEncoding(
+                                "the quote did not encode before the deadline".to_string(),
+                            )),
+                        )),
                     }
                 }
-            });
+            })
+            .collect();
 
-        // `buffered` keeps the results in solution order and spawns no more than the limit at a
-        // time; the rest wait for a permit rather than for a thread.
+        // `buffered` keeps the results in quote order and spawns no more than the limit at a time;
+        // the rest wait for a permit rather than for a thread.
         futures::stream::iter(tasks)
             .buffered(MAX_CONCURRENT_ENCODES)
             .map(|joined| {
@@ -678,12 +821,11 @@ impl Encoder {
     /// reverts.
     fn encode_tycho_router_call(
         &self,
-        encoded_solution: EncodedSolution,
+        encoded_solution: &EncodedSolution,
         solution: &Solution,
         encoding_options: &EncodingOptions,
-        fee_breakdown: FeeBreakdown,
-        fee_rates: FeeRates,
-    ) -> Result<(Transaction, FeeBreakdown), EncodingError> {
+        fee_rates: &FeeRates,
+    ) -> Result<Transaction, EncodingError> {
         let amount_in = biguint_to_u256(solution.amount_in());
         let expected_amount_out = biguint_to_u256(solution.expected_amount_out());
         let min_amount_out = biguint_to_u256(solution.min_amount_out());
@@ -788,20 +930,48 @@ impl Encoder {
         };
 
         let fn_sig = encoded_solution.function_signature();
-        let fee_breakdown = if encoding_options
-            .client_fee_params()
-            .is_some()
-        {
-            fee_breakdown.with_swaps_hash(keccak256(swaps).0)
-        } else {
-            fee_breakdown
-        };
 
-        let method_calldata = if fn_sig.contains("Permit2") {
-            let permit = permit.ok_or(EncodingError::FatalError(
-                "permit2 object must be set to use permit2".to_string(),
-            ))?;
-            if fn_sig.contains("splitSwap") {
+        let layout = RouterLayout::of(fn_sig).ok_or_else(|| {
+            EncodingError::FatalError(format!(
+                "unsupported function signature for Tycho router: {fn_sig}"
+            ))
+        })?;
+        let method_calldata =
+            if matches!(layout, RouterLayout::SequentialPermit2 | RouterLayout::SplitPermit2) {
+                let permit = permit.ok_or(EncodingError::FatalError(
+                    "permit2 object must be set to use permit2".to_string(),
+                ))?;
+                if layout == RouterLayout::SplitPermit2 {
+                    (
+                        amount_in,
+                        token_in,
+                        token_out,
+                        expected_amount_out,
+                        min_amount_out,
+                        U256::from(encoded_solution.n_tokens()),
+                        receiver,
+                        client_fee_params,
+                        permit,
+                        permit2_sig,
+                        swaps,
+                    )
+                        .abi_encode()
+                } else {
+                    (
+                        amount_in,
+                        token_in,
+                        token_out,
+                        expected_amount_out,
+                        min_amount_out,
+                        receiver,
+                        client_fee_params,
+                        permit,
+                        permit2_sig,
+                        swaps,
+                    )
+                        .abi_encode()
+                }
+            } else if layout == RouterLayout::Split {
                 (
                     amount_in,
                     token_in,
@@ -811,8 +981,6 @@ impl Encoder {
                     U256::from(encoded_solution.n_tokens()),
                     receiver,
                     client_fee_params,
-                    permit,
-                    permit2_sig,
                     swaps,
                 )
                     .abi_encode()
@@ -825,51 +993,13 @@ impl Encoder {
                     min_amount_out,
                     receiver,
                     client_fee_params,
-                    permit,
-                    permit2_sig,
                     swaps,
                 )
                     .abi_encode()
-            }
-        } else if fn_sig.contains("splitSwap") {
-            (
-                amount_in,
-                token_in,
-                token_out,
-                expected_amount_out,
-                min_amount_out,
-                U256::from(encoded_solution.n_tokens()),
-                receiver,
-                client_fee_params,
-                swaps,
-            )
-                .abi_encode()
-        } else if fn_sig.contains("singleSwap") || fn_sig.contains("sequentialSwap") {
-            (
-                amount_in,
-                token_in,
-                token_out,
-                expected_amount_out,
-                min_amount_out,
-                receiver,
-                client_fee_params,
-                swaps,
-            )
-                .abi_encode()
-        } else {
-            return Err(EncodingError::FatalError(format!(
-                "unsupported function signature for Tycho router: {fn_sig}"
-            )));
-        };
+            };
 
-        let mut contract_interaction =
+        let contract_interaction =
             Self::encode_input(encoded_solution.function_signature(), method_calldata);
-        let watermark = encoding_options
-            .calldata_watermark()
-            .or(self.calldata_watermark.as_deref());
-        if let Some(watermark) = watermark {
-            contract_interaction.extend_from_slice(watermark);
-        }
 
         let value =
             if token_in == router_eth { solution.amount_in().clone() } else { BigUint::ZERO };
@@ -892,7 +1022,7 @@ impl Encoder {
             let offset = encoded_solution.client_fee_signature_offset();
             transaction = transaction.with_client_fee_signature_offset(offset);
         }
-        Ok((transaction, fee_breakdown))
+        Ok(transaction)
     }
 
     /// Rejects a FyndJITRouter request when this deployment has no FyndJITRouter configured.
@@ -1107,7 +1237,9 @@ mod tests {
     use crate::{
         algorithm::test_utils::{component, component_with_protocol, MockProtocolSim},
         encoding::{
-            disable_slippage_taking::router_signing_hash, router_fees::RouterFees,
+            disable_slippage_taking::router_signing_hash,
+            hooks::{CalldataHook, SolutionHook},
+            router_fees::RouterFees,
             DEFAULT_DEADLINE_WINDOW_SECS,
         },
         BlockInfo, OrderQuote, QuoteStatus,
@@ -1791,7 +1923,7 @@ mod tests {
 
         let opts = EncodingOptions::new(1.0);
         let err = encoder
-            .prepare_solution(0, &quote, &opts, &encoder.router_fees().snapshot())
+            .prepare_solution(&quote, &opts, &encoder.router_fees().snapshot())
             .expect_err("100% slippage leaves nothing for the router's floor");
         assert!(
             err.to_string()
@@ -1814,7 +1946,6 @@ mod tests {
 
         let prepared = encoder
             .prepare_solution(
-                0,
                 &quote,
                 &EncodingOptions::new(0.01),
                 &encoder.router_fees().snapshot(),
@@ -1944,8 +2075,6 @@ mod tests {
         assert_eq!(fallback_fees.max_slippage(), venue_fees.max_slippage());
     }
 
-    // ==================== Signature Offset Tests ====================
-
     /// The pAMM address tycho's `FallbackSwapEncoder` reads off the component, and the Uniswap V3
     /// pool `select_fallback` stamped on the leg.
     const PAMM_ADDRESS: &str = "0x1111111111111111111111111111111111111111";
@@ -2035,66 +2164,6 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn test_encode_with_client_fee_returns_signature_offset() {
-        let encoder = real_encoder();
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let tx = result[0].transaction().unwrap();
-        tx.client_fee_signature_offset()
-            .expect("client_fee_signature_offset must be present with client fee");
-    }
-
-    #[tokio::test]
-    async fn test_encode_without_client_fee_has_no_signature_offset() {
-        let encoder = real_encoder();
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01);
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let tx = result[0].transaction().unwrap();
-        assert!(tx
-            .client_fee_signature_offset()
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn test_signature_offset_allows_patching() {
-        let encoder = real_encoder();
-        let real_sig = vec![0xFF; 65];
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let tx = result[0].transaction().unwrap();
-        let offset = tx
-            .client_fee_signature_offset()
-            .unwrap();
-
-        let mut calldata = tx.data().to_vec();
-        calldata[offset..offset + 65].copy_from_slice(&real_sig);
-        assert_eq!(&calldata[offset..offset + 65], &real_sig[..]);
-    }
-
-    // ==================== Disable-Slippage-Taking Tests ====================
-
     const DISABLE_SLIPPAGE_TAKING_KEY: &str =
         "0x3333333333333333333333333333333333333333333333333333333333333333";
     const SIGNER_CHAIN_ID: u64 = 1;
@@ -2111,384 +2180,457 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn test_encode_disable_slippage_taking() {
-        let signer = disable_slippage_taking_signer();
-        let signer_address = signer.receiver();
-        let encoder = real_encoder().with_disable_slippage_taking_signer(signer);
-        let quote = make_order_quote(1_000_000_000)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_disable_slippage_taking(true);
+    /// FeeCalculator precision used in these tests: 100% = 100,000,000 fee units.
+    const FEE_SCALE: u64 = 100_000_000;
 
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
+    mod signature_offset {
+        use super::*;
 
-        let tx = result[0].transaction().unwrap();
-        // The signature is final at encode time, so there is nothing for the caller to patch.
-        assert!(tx
-            .client_fee_signature_offset()
-            .is_none());
-        let (
-            amount_in,
-            token_in,
-            token_out,
-            expected_amount_out,
-            min_amount_out,
-            receiver,
-            client_fee,
-            swaps,
-        ) = <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
-        let (fee_units, fee_receiver, max_contribution, deadline, signature) = client_fee;
+        #[tokio::test]
+        async fn test_encode_with_client_fee_returns_signature_offset() {
+            let encoder = real_encoder();
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
 
-        assert_eq!(fee_units, 0, "the params must carry no fee");
-        assert_eq!(fee_receiver, signer_address);
-        assert_eq!(max_contribution, U256::ZERO);
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
 
-        // The embedded signature must recover to the signer over a hash rebuilt from the decoded
-        // calldata, proving the encoder signed the values it actually encoded.
-        let signing_hash = router_signing_hash(
-            fee_receiver,
-            &SwapIntent {
+            let tx = result[0].transaction().unwrap();
+            tx.client_fee_signature_offset()
+                .expect("client_fee_signature_offset must be present with client fee");
+        }
+
+        #[tokio::test]
+        async fn test_encode_without_client_fee_has_no_signature_offset() {
+            let encoder = real_encoder();
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01);
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            assert!(tx
+                .client_fee_signature_offset()
+                .is_none());
+        }
+
+        #[tokio::test]
+        async fn test_signature_offset_allows_patching() {
+            let encoder = real_encoder();
+            let real_sig = vec![0xFF; 65];
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            let offset = tx
+                .client_fee_signature_offset()
+                .unwrap();
+
+            let mut calldata = tx.data().to_vec();
+            calldata[offset..offset + 65].copy_from_slice(&real_sig);
+            assert_eq!(&calldata[offset..offset + 65], &real_sig[..]);
+        }
+    }
+
+    mod disable_slippage_taking {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_encode_disable_slippage_taking() {
+            let signer = disable_slippage_taking_signer();
+            let signer_address = signer.receiver();
+            let encoder = real_encoder().with_disable_slippage_taking_signer(signer);
+            let quote = make_order_quote(1_000_000_000)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_disable_slippage_taking(true);
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            // The signature is final at encode time, so there is nothing for the caller to patch.
+            assert!(tx
+                .client_fee_signature_offset()
+                .is_none());
+            let (
                 amount_in,
                 token_in,
                 token_out,
                 expected_amount_out,
                 min_amount_out,
                 receiver,
-                swaps: &swaps,
-            },
-            deadline.to::<u64>(),
-            SIGNER_CHAIN_ID,
-            SIGNER_ROUTER,
-        );
-        let recovered = Signature::try_from(signature.as_ref())
-            .unwrap()
-            .recover_address_from_prehash(&signing_hash)
-            .unwrap();
-        assert_eq!(recovered, signer_address);
-    }
+                client_fee,
+                swaps,
+            ) = <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
+            let (fee_units, fee_receiver, max_contribution, deadline, signature) = client_fee;
 
-    #[tokio::test]
-    async fn test_encode_disable_slippage_taking_without_signer() {
-        let encoder = real_encoder();
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_disable_slippage_taking(true);
+            assert_eq!(fee_units, 0, "the params must carry no fee");
+            assert_eq!(fee_receiver, signer_address);
+            assert_eq!(max_contribution, U256::ZERO);
 
-        let err = encoder
-            .prepare_solution(0, &quote, &opts, &encoder.router_fees().snapshot())
-            .expect_err("encoding must fail without a signing key");
-        assert!(
-            err.to_string()
-                .contains(ENV_DISABLE_SLIPPAGE_TAKING_KEY),
-            "error must name the missing env var, got {err:?}"
-        );
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .expect("a failing order is reported on the order, not on the call");
-        assert_eq!(result[0].status(), QuoteStatus::EncodingFailed);
-        assert!(result[0].transaction().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_encode_client_fee_params_precedence() {
-        let signer = disable_slippage_taking_signer();
-        let signer_receiver = signer.receiver();
-        let encoder = real_encoder().with_disable_slippage_taking_signer(signer);
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let client_fee = make_client_fee(100);
-        let client_receiver = bytes_to_address(client_fee.receiver()).unwrap();
-        let opts = EncodingOptions::new(0.01)
-            .with_client_fee_params(client_fee)
-            .with_disable_slippage_taking(true);
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let tx = result[0].transaction().unwrap();
-        assert!(tx
-            .client_fee_signature_offset()
-            .is_some());
-        let (_, _, _, _, _, _, client_fee, _) =
-            <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
-        let (fee_units, fee_receiver, _, _, _) = client_fee;
-
-        assert_ne!(fee_units, 0, "explicit client fee bps must be encoded");
-        assert_eq!(fee_receiver, client_receiver);
-        assert_ne!(fee_receiver, signer_receiver);
-    }
-
-    #[tokio::test]
-    async fn test_encode_disable_slippage_taking_fee_rates() {
-        let signer = disable_slippage_taking_signer();
-        let signer_client = Bytes::from(signer.receiver().as_slice());
-        let encoder = real_encoder().with_disable_slippage_taking_signer(signer);
-        // Default 1% router fee on output; the signer's address pays no router fees at all.
-        let custom = FxHashMap::from_iter([(signer_client, (0u32, 0u32))]);
-        encoder
-            .router_fees()
-            .set(RouterFees::new(FEE_SCALE, 1_000_000, 20_000_000, custom));
-        let quote = make_order_quote(1_000_000_000)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.0).with_disable_slippage_taking(true);
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let breakdown = result[0].fee_breakdown().unwrap();
-        assert_eq!(*breakdown.router_fee(), BigUint::ZERO);
-        assert_eq!(*breakdown.client_fee(), BigUint::ZERO);
-    }
-
-    // ==================== Calldata Watermark Tests ====================
-
-    #[tokio::test]
-    async fn test_encode_appends_calldata_watermark() {
-        let encoder = real_encoder().with_calldata_watermark("fynd");
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-
-        let result = encoder
-            .encode(vec![quote], EncodingOptions::new(0.01))
-            .await
-            .unwrap();
-
-        let tx = result[0].transaction().unwrap();
-        assert!(
-            tx.data().ends_with(b"fynd"),
-            "calldata must end with the watermark bytes, got suffix {:?}",
-            &tx.data()[tx.data().len().saturating_sub(4)..]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_encode_without_watermark_leaves_calldata_unchanged() {
-        let make_quote = || {
-            make_order_quote(990)
-                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]))
-        };
-
-        let plain = real_encoder()
-            .encode(vec![make_quote()], EncodingOptions::new(0.01))
-            .await
-            .unwrap();
-        let watermarked = real_encoder()
-            .with_calldata_watermark("fynd")
-            .encode(vec![make_quote()], EncodingOptions::new(0.01))
-            .await
-            .unwrap();
-
-        let plain_data = plain[0].transaction().unwrap().data();
-        let watermarked_data = watermarked[0]
-            .transaction()
-            .unwrap()
-            .data();
-        // The watermark is a pure suffix: stripping it yields the unwatermarked calldata.
-        assert_eq!(*plain_data, watermarked_data[..watermarked_data.len() - 4]);
-    }
-
-    #[tokio::test]
-    async fn test_request_watermark_replaces_encoder_watermark() {
-        let encoder = real_encoder().with_calldata_watermark("fynd");
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_calldata_watermark("propeller/acme");
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let data = result[0].transaction().unwrap().data();
-        assert!(data.ends_with(b"propeller/acme"), "request watermark must be the suffix");
-        let before_suffix = &data[..data.len() - b"propeller/acme".len()];
-        assert!(!before_suffix.ends_with(b"fynd"), "encoder watermark must not be stamped too");
-    }
-
-    #[tokio::test]
-    async fn test_request_watermark_applies_without_encoder_watermark() {
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_calldata_watermark("propeller/acme");
-
-        let result = real_encoder()
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let data = result[0].transaction().unwrap().data();
-        assert!(data.ends_with(b"propeller/acme"));
-    }
-
-    #[tokio::test]
-    async fn test_watermarked_calldata_still_decodes() {
-        let encoder = real_encoder().with_calldata_watermark("fynd");
-        let quote = make_order_quote(1_000_000_000)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let amount_in = quote.amount_in().clone();
-        let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
-
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
-
-        let tx = result[0].transaction().unwrap();
-        // Solidity's ABI decoder ignores trailing calldata, so decoding the args without the
-        // 4-byte watermark suffix must still work.
-        let (encoded_amount_in, _, _, _, _, _, _, _) =
-            <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..tx.data().len() - 4])
+            // The embedded signature must recover to the signer over a hash rebuilt from the
+            // decoded calldata, proving the encoder signed the values it actually encoded.
+            let signing_hash = router_signing_hash(
+                fee_receiver,
+                &SwapIntent {
+                    amount_in,
+                    token_in,
+                    token_out,
+                    expected_amount_out,
+                    min_amount_out,
+                    receiver,
+                    swaps: &swaps,
+                },
+                deadline.to::<u64>(),
+                SIGNER_CHAIN_ID,
+                SIGNER_ROUTER,
+            );
+            let recovered = Signature::try_from(signature.as_ref())
+                .unwrap()
+                .recover_address_from_prehash(&signing_hash)
                 .unwrap();
-        assert_eq!(encoded_amount_in, biguint_to_u256(&amount_in));
-    }
+            assert_eq!(recovered, signer_address);
+        }
 
-    #[tokio::test]
-    async fn test_signature_offset_unaffected_by_watermark() {
-        let encoder = real_encoder().with_calldata_watermark("fynd");
-        let real_sig = vec![0xFF; 65];
-        let quote = make_order_quote(990)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
+        #[tokio::test]
+        async fn test_encode_disable_slippage_taking_without_signer() {
+            let encoder = real_encoder();
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_disable_slippage_taking(true);
 
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
+            let err = encoder
+                .prepare_solution(&quote, &opts, &encoder.router_fees().snapshot())
+                .expect_err("encoding must fail without a signing key");
+            assert!(
+                err.to_string()
+                    .contains(ENV_DISABLE_SLIPPAGE_TAKING_KEY),
+                "error must name the missing env var, got {err:?}"
+            );
 
-        let tx = result[0].transaction().unwrap();
-        let offset = tx
-            .client_fee_signature_offset()
-            .unwrap();
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .expect("a failing order is reported on the order, not on the call");
+            assert_eq!(result[0].status(), QuoteStatus::EncodingFailed);
+            assert!(result[0].transaction().is_none());
+        }
 
-        let mut calldata = tx.data().to_vec();
-        calldata[offset..offset + 65].copy_from_slice(&real_sig);
-        assert_eq!(&calldata[offset..offset + 65], &real_sig[..]);
-        assert!(calldata.ends_with(b"fynd"));
-    }
+        #[tokio::test]
+        async fn test_encode_client_fee_params_precedence() {
+            let signer = disable_slippage_taking_signer();
+            let signer_receiver = signer.receiver();
+            let encoder = real_encoder().with_disable_slippage_taking_signer(signer);
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let client_fee = make_client_fee(100);
+            let client_receiver = bytes_to_address(client_fee.receiver()).unwrap();
+            let opts = EncodingOptions::new(0.01)
+                .with_client_fee_params(client_fee)
+                .with_disable_slippage_taking(true);
 
-    // ==================== Fee Breakdown Tests ====================
-
-    /// FeeCalculator precision used in these tests: 100% = 100,000,000 fee units.
-    const FEE_SCALE: u64 = 100_000_000;
-
-    #[test]
-    fn test_calculate_fee_breakdown() {
-        // 10 bps router fee on output, 20% router share of the client fee, 1% client fee.
-        let rates = FeeRates::new(100_000, 20_000_000, FEE_SCALE);
-
-        let breakdown =
-            Encoder::calculate_fee_breakdown(&BigUint::from(1_000_000u64), 100, 0.0, rates)
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
                 .unwrap();
 
-        // total client fee = 1% of 1_000_000 = 10_000; router takes 20% of it = 2_000.
-        // router fee on output = 0.1% of 1_000_000 = 1_000.
-        assert_eq!(*breakdown.client_fee(), BigUint::from(8_000u64));
-        assert_eq!(*breakdown.router_fee(), BigUint::from(3_000u64));
-        assert_eq!(*breakdown.min_amount_received(), BigUint::from(989_000u64));
+            let tx = result[0].transaction().unwrap();
+            assert!(tx
+                .client_fee_signature_offset()
+                .is_some());
+            let (_, _, _, _, _, _, client_fee, _) =
+                <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
+            let (fee_units, fee_receiver, _, _, _) = client_fee;
+
+            assert_ne!(fee_units, 0, "explicit client fee bps must be encoded");
+            assert_eq!(fee_receiver, client_receiver);
+            assert_ne!(fee_receiver, signer_receiver);
+        }
+
+        #[tokio::test]
+        async fn test_encode_disable_slippage_taking_fee_rates() {
+            let signer = disable_slippage_taking_signer();
+            let signer_client = Bytes::from(signer.receiver().as_slice());
+            let encoder = real_encoder().with_disable_slippage_taking_signer(signer);
+            // Default 1% router fee on output; the signer's address pays no router fees at all.
+            let custom = FxHashMap::from_iter([(signer_client, (0u32, 0u32))]);
+            encoder
+                .router_fees()
+                .set(RouterFees::new(FEE_SCALE, 1_000_000, 20_000_000, custom));
+            let quote = make_order_quote(1_000_000_000)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.0).with_disable_slippage_taking(true);
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let breakdown = result[0].fee_breakdown().unwrap();
+            assert_eq!(*breakdown.router_fee(), BigUint::ZERO);
+            assert_eq!(*breakdown.client_fee(), BigUint::ZERO);
+        }
     }
 
-    #[test]
-    fn test_calculate_fee_breakdown_zero_fees() {
-        let rates = FeeRates::new(0, 0, FEE_SCALE);
+    mod calldata_watermark {
+        use super::*;
 
-        let breakdown =
-            Encoder::calculate_fee_breakdown(&BigUint::from(1_000_000u64), 0, 0.0, rates).unwrap();
+        #[tokio::test]
+        async fn test_encode_appends_calldata_watermark() {
+            let encoder = real_encoder().with_calldata_watermark("fynd");
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
 
-        assert_eq!(*breakdown.client_fee(), BigUint::ZERO);
-        assert_eq!(*breakdown.router_fee(), BigUint::ZERO);
-        assert_eq!(*breakdown.min_amount_received(), BigUint::from(1_000_000u64));
+            let result = encoder
+                .encode(vec![quote], EncodingOptions::new(0.01))
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            assert!(
+                tx.data().ends_with(b"fynd"),
+                "calldata must end with the watermark bytes, got suffix {:?}",
+                &tx.data()[tx.data().len().saturating_sub(4)..]
+            );
+        }
+
+        #[tokio::test]
+        async fn test_encode_without_watermark_leaves_calldata_unchanged() {
+            let make_quote = || {
+                make_order_quote(990)
+                    .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]))
+            };
+
+            let plain = real_encoder()
+                .encode(vec![make_quote()], EncodingOptions::new(0.01))
+                .await
+                .unwrap();
+            let watermarked = real_encoder()
+                .with_calldata_watermark("fynd")
+                .encode(vec![make_quote()], EncodingOptions::new(0.01))
+                .await
+                .unwrap();
+
+            let plain_data = plain[0].transaction().unwrap().data();
+            let watermarked_data = watermarked[0]
+                .transaction()
+                .unwrap()
+                .data();
+            // The watermark is a pure suffix: stripping it yields the unwatermarked calldata.
+            assert_eq!(*plain_data, watermarked_data[..watermarked_data.len() - 4]);
+        }
+
+        #[tokio::test]
+        async fn test_request_watermark_replaces_encoder_watermark() {
+            let encoder = real_encoder().with_calldata_watermark("fynd");
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_calldata_watermark("propeller/acme");
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let data = result[0].transaction().unwrap().data();
+            assert!(data.ends_with(b"propeller/acme"), "request watermark must be the suffix");
+            let before_suffix = &data[..data.len() - b"propeller/acme".len()];
+            assert!(!before_suffix.ends_with(b"fynd"), "encoder watermark must not be stamped too");
+        }
+
+        #[tokio::test]
+        async fn test_request_watermark_applies_without_encoder_watermark() {
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_calldata_watermark("propeller/acme");
+
+            let result = real_encoder()
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let data = result[0].transaction().unwrap().data();
+            assert!(data.ends_with(b"propeller/acme"));
+        }
+
+        #[tokio::test]
+        async fn test_watermarked_calldata_still_decodes() {
+            let encoder = real_encoder().with_calldata_watermark("fynd");
+            let quote = make_order_quote(1_000_000_000)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let amount_in = quote.amount_in().clone();
+            let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            // Solidity's ABI decoder ignores trailing calldata, so decoding the args without the
+            // 4-byte watermark suffix must still work.
+            let (encoded_amount_in, _, _, _, _, _, _, _) =
+                <SingleSwapCalldata as SolValue>::abi_decode_params(
+                    &tx.data()[4..tx.data().len() - 4],
+                )
+                .unwrap();
+            assert_eq!(encoded_amount_in, biguint_to_u256(&amount_in));
+        }
+
+        #[tokio::test]
+        async fn test_signature_offset_unaffected_by_watermark() {
+            let encoder = real_encoder().with_calldata_watermark("fynd");
+            let real_sig = vec![0xFF; 65];
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            let offset = tx
+                .client_fee_signature_offset()
+                .unwrap();
+
+            let mut calldata = tx.data().to_vec();
+            calldata[offset..offset + 65].copy_from_slice(&real_sig);
+            assert_eq!(&calldata[offset..offset + 65], &real_sig[..]);
+            assert!(calldata.ends_with(b"fynd"));
+        }
     }
 
-    #[test]
-    fn test_calculate_fee_breakdown_fee_too_high() {
-        // 100% client fee plus any router fee on output exceeds the maximum.
-        let rates = FeeRates::new(1, 0, FEE_SCALE);
+    mod fee_breakdown {
+        use super::*;
 
-        let result =
-            Encoder::calculate_fee_breakdown(&BigUint::from(1_000_000u64), 10_000, 0.0, rates);
+        #[test]
+        fn test_calculate_fee_breakdown() {
+            // 10 bps router fee on output, 20% router share of the client fee, 1% client fee.
+            let rates = FeeRates::new(100_000, 20_000_000, FEE_SCALE);
 
-        assert!(result.is_err());
-    }
+            let breakdown =
+                Encoder::calculate_fee_breakdown(&BigUint::from(1_000_000u64), 100, 0.0, rates)
+                    .unwrap();
 
-    #[tokio::test]
-    async fn test_encode_uses_custom_fees_for_client_fee_receiver() {
-        let encoder = real_encoder();
-        // Default 1% router fee on output; receiver 0xBB pays no router fees at all.
-        let custom =
-            FxHashMap::from_iter([(Bytes::from(make_address(0xBB).as_ref()), (0u32, 0u32))]);
-        encoder
-            .router_fees()
-            .set(RouterFees::new(FEE_SCALE, 1_000_000, 20_000_000, custom));
-        let quote = make_order_quote(1_000_000_000)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
-        let opts = EncodingOptions::new(0.0).with_client_fee_params(make_client_fee(100));
+            // total client fee = 1% of 1_000_000 = 10_000; router takes 20% of it = 2_000.
+            // router fee on output = 0.1% of 1_000_000 = 1_000.
+            assert_eq!(*breakdown.client_fee(), BigUint::from(8_000u64));
+            assert_eq!(*breakdown.router_fee(), BigUint::from(3_000u64));
+            assert_eq!(*breakdown.min_amount_received(), BigUint::from(989_000u64));
+        }
 
-        let result = encoder
-            .encode(vec![quote], opts)
-            .await
-            .unwrap();
+        #[test]
+        fn test_calculate_fee_breakdown_zero_fees() {
+            let rates = FeeRates::new(0, 0, FEE_SCALE);
 
-        let breakdown = result[0].fee_breakdown().unwrap();
-        assert_eq!(*breakdown.router_fee(), BigUint::ZERO);
-        // Client keeps the full 1% fee since the router's share is overridden to zero.
-        assert_eq!(*breakdown.client_fee(), BigUint::from(10_000_000u64));
-    }
+            let breakdown =
+                Encoder::calculate_fee_breakdown(&BigUint::from(1_000_000u64), 0, 0.0, rates)
+                    .unwrap();
 
-    #[tokio::test]
-    async fn test_encode_falls_back_to_sender() {
-        let encoder = real_encoder();
-        // The order sender (0xAA) has a custom zero router fee on output; client-fee share
-        // inherits the 20% default.
-        let custom = FxHashMap::from_iter([(
-            Bytes::from(make_address(0xAA).as_ref()),
-            (0u32, 20_000_000u32),
-        )]);
-        encoder
-            .router_fees()
-            .set(RouterFees::new(FEE_SCALE, 1_000_000, 20_000_000, custom));
-        let quote = make_order_quote(1_000_000_000)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            assert_eq!(*breakdown.client_fee(), BigUint::ZERO);
+            assert_eq!(*breakdown.router_fee(), BigUint::ZERO);
+            assert_eq!(*breakdown.min_amount_received(), BigUint::from(1_000_000u64));
+        }
 
-        let result = encoder
-            .encode(vec![quote], EncodingOptions::new(0.0))
-            .await
-            .unwrap();
+        #[test]
+        fn test_calculate_fee_breakdown_fee_too_high() {
+            // 100% client fee plus any router fee on output exceeds the maximum.
+            let rates = FeeRates::new(1, 0, FEE_SCALE);
 
-        let breakdown = result[0].fee_breakdown().unwrap();
-        assert_eq!(*breakdown.router_fee(), BigUint::ZERO);
-    }
+            let result =
+                Encoder::calculate_fee_breakdown(&BigUint::from(1_000_000u64), 10_000, 0.0, rates);
 
-    #[tokio::test]
-    async fn test_encode_unknown_client() {
-        let encoder = real_encoder();
-        encoder
-            .router_fees()
-            .set(RouterFees::new(
-                FEE_SCALE,
-                1_000_000,
-                20_000_000,
-                rustc_hash::FxHashMap::default(),
-            ));
-        let quote = make_order_quote(1_000_000_000)
-            .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            assert!(result.is_err());
+        }
 
-        let result = encoder
-            .encode(vec![quote], EncodingOptions::new(0.0))
-            .await
-            .unwrap();
+        #[tokio::test]
+        async fn test_encode_uses_custom_fees_for_client_fee_receiver() {
+            let encoder = real_encoder();
+            // Default 1% router fee on output; receiver 0xBB pays no router fees at all.
+            let custom =
+                FxHashMap::from_iter([(Bytes::from(make_address(0xBB).as_ref()), (0u32, 0u32))]);
+            encoder
+                .router_fees()
+                .set(RouterFees::new(FEE_SCALE, 1_000_000, 20_000_000, custom));
+            let quote = make_order_quote(1_000_000_000)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.0).with_client_fee_params(make_client_fee(100));
 
-        let breakdown = result[0].fee_breakdown().unwrap();
-        // 1% of 1_000_000_000.
-        assert_eq!(*breakdown.router_fee(), BigUint::from(10_000_000u64));
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let breakdown = result[0].fee_breakdown().unwrap();
+            assert_eq!(*breakdown.router_fee(), BigUint::ZERO);
+            // Client keeps the full 1% fee since the router's share is overridden to zero.
+            assert_eq!(*breakdown.client_fee(), BigUint::from(10_000_000u64));
+        }
+
+        #[tokio::test]
+        async fn test_encode_falls_back_to_sender() {
+            let encoder = real_encoder();
+            // The order sender (0xAA) has a custom zero router fee on output; client-fee share
+            // inherits the 20% default.
+            let custom = FxHashMap::from_iter([(
+                Bytes::from(make_address(0xAA).as_ref()),
+                (0u32, 20_000_000u32),
+            )]);
+            encoder
+                .router_fees()
+                .set(RouterFees::new(FEE_SCALE, 1_000_000, 20_000_000, custom));
+            let quote = make_order_quote(1_000_000_000)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+
+            let result = encoder
+                .encode(vec![quote], EncodingOptions::new(0.0))
+                .await
+                .unwrap();
+
+            let breakdown = result[0].fee_breakdown().unwrap();
+            assert_eq!(*breakdown.router_fee(), BigUint::ZERO);
+        }
+
+        #[tokio::test]
+        async fn test_encode_unknown_client() {
+            let encoder = real_encoder();
+            encoder
+                .router_fees()
+                .set(RouterFees::new(
+                    FEE_SCALE,
+                    1_000_000,
+                    20_000_000,
+                    rustc_hash::FxHashMap::default(),
+                ));
+            let quote = make_order_quote(1_000_000_000)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+
+            let result = encoder
+                .encode(vec![quote], EncodingOptions::new(0.0))
+                .await
+                .unwrap();
+
+            let breakdown = result[0].fee_breakdown().unwrap();
+            // 1% of 1_000_000_000.
+            assert_eq!(*breakdown.router_fee(), BigUint::from(10_000_000u64));
+        }
     }
 
     #[rstest]
@@ -2546,25 +2688,24 @@ mod tests {
     fn test_encode_fails_on_signed_quote_shortfall() {
         let tycho_encoder = Arc::new(ShortfallTychoEncoder::default());
         let encoder = encoder_with(Chain::Ethereum, tycho_encoder.clone());
-        let quote = make_order_quote(990).with_route(make_route_with_tokens(&[
+        let mut quote = make_order_quote(990).with_route(make_route_with_tokens(&[
             (make_address(0x01), make_address(0x02)),
             (make_address(0x02), make_address(0x03)),
         ]));
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a current-thread runtime builds");
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
 
-        // A current-thread runtime polls the encoder on this thread, where the local recorder is
-        // installed.
-        let quotes = metrics::with_local_recorder(&recorder, || {
-            runtime.block_on(encoder.encode(vec![quote], EncodingOptions::new(0.005)))
+        // `encode` runs this on a blocking thread, which the local recorder does not reach.
+        metrics::with_local_recorder(&recorder, || {
+            encoder.encode_quote(
+                &*tycho_encoder,
+                &mut quote,
+                &EncodingOptions::new(0.005),
+                &encoder.router_fees().snapshot(),
+            )
         })
-        .expect("a failing quote is reported on the quote, not on the call");
+        .expect_err("the signed quote falls short of the slippage");
 
-        assert_eq!(quotes[0].status(), QuoteStatus::EncodingFailed);
         assert_eq!(
             *tycho_encoder
                 .limits
@@ -2639,5 +2780,644 @@ mod tests {
                 ("route_shape=split".to_string(), counter(1)),
             ]
         );
+    }
+
+    mod encoding_hooks {
+        use super::*;
+
+        /// Rebuilds `solution` with the given receiver and amounts out.
+        fn rebuilt_solution(
+            solution: &Solution,
+            receiver: Bytes,
+            expected_amount_out: BigUint,
+            min_amount_out: BigUint,
+        ) -> Solution {
+            let rebuilt = Solution::new(
+                solution.sender().clone(),
+                receiver,
+                solution.token_in().clone(),
+                solution.token_out().clone(),
+                solution.amount_in().clone(),
+                expected_amount_out,
+                min_amount_out,
+                solution.swaps().to_vec(),
+            )
+            .with_user_transfer_type(solution.user_transfer_type().clone());
+            match solution.origin() {
+                Some(origin) => rebuilt.with_origin(origin.clone()),
+                None => rebuilt,
+            }
+        }
+
+        /// Replaces the solution's expected amount out.
+        #[derive(Debug)]
+        struct SetExpectedAmountOut(BigUint);
+
+        impl SolutionHook for SetExpectedAmountOut {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                Ok(rebuilt_solution(
+                    &solution,
+                    solution.receiver().clone(),
+                    self.0.clone(),
+                    solution.min_amount_out().clone(),
+                ))
+            }
+        }
+
+        /// Replaces the solution's minimum amount out.
+        #[derive(Debug)]
+        struct SetMinAmountOut(BigUint);
+
+        impl SolutionHook for SetMinAmountOut {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                Ok(rebuilt_solution(
+                    &solution,
+                    solution.receiver().clone(),
+                    solution.expected_amount_out().clone(),
+                    self.0.clone(),
+                ))
+            }
+        }
+
+        /// Replaces the solution's receiver.
+        #[derive(Debug)]
+        struct SetReceiver(Bytes);
+
+        impl SolutionHook for SetReceiver {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                Ok(rebuilt_solution(
+                    &solution,
+                    self.0.clone(),
+                    solution.expected_amount_out().clone(),
+                    solution.min_amount_out().clone(),
+                ))
+            }
+        }
+
+        /// Records the `min_amount_out` of the solution it receives and returns the solution.
+        #[derive(Debug, Default)]
+        struct RecordMinAmountOut {
+            received: std::sync::Mutex<Option<BigUint>>,
+        }
+
+        impl SolutionHook for RecordMinAmountOut {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                *self.received.lock().unwrap() = Some(solution.min_amount_out().clone());
+                Ok(solution)
+            }
+        }
+
+        /// Writes its bytes over the client fee signature placeholder and records the length of the
+        /// calldata it received.
+        #[derive(Debug)]
+        struct WriteClientFeeSignature {
+            signature: [u8; 65],
+            received_len: std::sync::Mutex<Option<usize>>,
+        }
+
+        impl CalldataHook for WriteClientFeeSignature {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                _solution: &Solution,
+                encoded: &EncodedSolution,
+                calldata: &mut [u8],
+            ) -> Result<(), SolveError> {
+                *self.received_len.lock().unwrap() = Some(calldata.len());
+                let offset = encoded.client_fee_signature_offset();
+                calldata[offset..offset + 65].copy_from_slice(&self.signature);
+                Ok(())
+            }
+        }
+
+        /// Fails the quote of one order and passes every other quote through.
+        #[derive(Debug)]
+        struct FailOrder {
+            order_id: &'static str,
+        }
+
+        impl FailOrder {
+            fn fail_if_order(&self, quote: &OrderQuote) -> Result<(), SolveError> {
+                if quote.order_id() == self.order_id {
+                    return Err(SolveError::FailedEncoding(
+                        "the hook rejected this quote".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        impl SolutionHook for FailOrder {
+            fn apply(
+                &self,
+                quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                self.fail_if_order(quote)?;
+                Ok(solution)
+            }
+        }
+
+        impl CalldataHook for FailOrder {
+            fn apply(
+                &self,
+                quote: &OrderQuote,
+                _solution: &Solution,
+                _encoded: &EncodedSolution,
+                _calldata: &mut [u8],
+            ) -> Result<(), SolveError> {
+                self.fail_if_order(quote)
+            }
+        }
+
+        #[tokio::test]
+        async fn test_solution_hook_changes_expected_amount_out() {
+            let encoder = real_encoder();
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let hook = SetExpectedAmountOut(BigUint::from(1_500u64));
+            let opts = EncodingOptions::new(0.01)
+                .with_client_fee_params(make_client_fee(100))
+                .with_solution_hook(Arc::new(hook));
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            assert_eq!(result[0].status(), QuoteStatus::Success);
+            let tx = result[0].transaction().unwrap();
+            let (_, _, _, expected_amount_out, min_amount_out, _, _, _) =
+                <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
+            assert_eq!(expected_amount_out, U256::from(1_500u64));
+            assert_eq!(*result[0].amount_out(), BigUint::from(1_500u64));
+            let min_amount_received = result[0]
+                .fee_breakdown()
+                .unwrap()
+                .min_amount_received();
+            assert_eq!(min_amount_out, biguint_to_u256(min_amount_received));
+            assert!(*min_amount_received < BigUint::from(990u64));
+        }
+
+        #[tokio::test]
+        async fn test_solution_hook_with_client_fee() {
+            let encoder = real_encoder();
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
+            let hook = Arc::new(RecordMinAmountOut::default());
+
+            let without_hook = encoder
+                .encode(vec![quote.clone()], opts.clone())
+                .await
+                .unwrap();
+            encoder
+                .encode(vec![quote], opts.with_solution_hook(hook.clone()))
+                .await
+                .unwrap();
+
+            let received = hook
+                .received
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the solution hook ran");
+            assert_eq!(
+                &received,
+                without_hook[0]
+                    .fee_breakdown()
+                    .unwrap()
+                    .min_amount_received()
+            );
+        }
+
+        #[rstest]
+        #[case::changed_min(Arc::new(SetMinAmountOut(BigUint::from(1u64))))]
+        #[case::expected_below_min(Arc::new(SetExpectedAmountOut(BigUint::from(1u64))))]
+        #[case::changed_receiver(Arc::new(SetReceiver(Bytes::from(make_address(0xCC).as_ref()))))]
+        #[case::changed_swaps(Arc::new(SetSwapUserData))]
+        #[case::replaced_protocol_state(Arc::new(ReplaceProtocolState))]
+        #[tokio::test]
+        async fn test_solution_hook_invalid_output(#[case] hook: Arc<dyn SolutionHook>) {
+            let encoder = real_encoder();
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_solution_hook(hook);
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .expect("an invalid hooked solution is reported on its quote, not on the call");
+
+            assert_eq!(result[0].status(), QuoteStatus::EncodingFailed);
+            assert!(result[0].transaction().is_none());
+            assert_eq!(*result[0].amount_out(), BigUint::from(990u64));
+        }
+
+        #[tokio::test]
+        async fn test_solution_hook_with_disable_slippage_taking() {
+            let signer = disable_slippage_taking_signer();
+            let signer_address = signer.receiver();
+            let encoder = real_encoder().with_disable_slippage_taking_signer(signer);
+            let quote = make_order_quote(1_000_000_000)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let hook = SetExpectedAmountOut(BigUint::from(1_500_000_000u64));
+            let opts = EncodingOptions::new(0.01)
+                .with_disable_slippage_taking(true)
+                .with_solution_hook(Arc::new(hook));
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            let (
+                amount_in,
+                token_in,
+                token_out,
+                expected_amount_out,
+                min_amount_out,
+                receiver,
+                client_fee,
+                swaps,
+            ) = <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
+            let (_, fee_receiver, _, deadline, signature) = client_fee;
+            assert_eq!(expected_amount_out, U256::from(1_500_000_000u64));
+            // The signature must cover the hooked amounts, or the router rejects the swap.
+            let signing_hash = router_signing_hash(
+                fee_receiver,
+                &SwapIntent {
+                    amount_in,
+                    token_in,
+                    token_out,
+                    expected_amount_out,
+                    min_amount_out,
+                    receiver,
+                    swaps: &swaps,
+                },
+                deadline.to::<u64>(),
+                SIGNER_CHAIN_ID,
+                SIGNER_ROUTER,
+            );
+            let recovered = Signature::try_from(signature.as_ref())
+                .unwrap()
+                .recover_address_from_prehash(&signing_hash)
+                .unwrap();
+            assert_eq!(recovered, signer_address);
+        }
+
+        #[tokio::test]
+        async fn test_calldata_hook_with_watermark() {
+            let encoder = real_encoder();
+            let signature = [0xAB; 65];
+            let hook = Arc::new(WriteClientFeeSignature {
+                signature,
+                received_len: std::sync::Mutex::new(None),
+            });
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01)
+                .with_client_fee_params(make_client_fee(100))
+                .with_calldata_watermark("fynd")
+                .with_calldata_hook(hook.clone());
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            let offset = tx
+                .client_fee_signature_offset()
+                .unwrap();
+            assert_eq!(&tx.data()[offset..offset + 65], &signature[..]);
+            assert!(tx.data().ends_with(b"fynd"));
+            let received_len = hook
+                .received_len
+                .lock()
+                .unwrap()
+                .expect("the calldata hook ran");
+            assert_eq!(received_len, tx.data().len() - b"fynd".len());
+        }
+
+        #[rstest]
+        #[case::solution_hook(
+            EncodingOptions::new(0.01).with_solution_hook(Arc::new(FailOrder { order_id: "fails" }))
+        )]
+        #[case::calldata_hook(
+            EncodingOptions::new(0.01).with_calldata_hook(Arc::new(FailOrder { order_id: "fails" }))
+        )]
+        #[tokio::test]
+        async fn test_hook_error_with_two_quotes(#[case] opts: EncodingOptions) {
+            let encoder = real_encoder();
+            let quotes = vec![
+                quote_on_protocol("encodes", "uniswap_v2"),
+                quote_on_protocol("fails", "uniswap_v2"),
+            ];
+
+            let result = encoder
+                .encode(quotes, opts)
+                .await
+                .expect("a hook error is reported on its quote, not on the call");
+
+            assert_eq!(result[0].status(), QuoteStatus::Success);
+            assert!(result[0].transaction().is_some());
+            assert_eq!(result[1].status(), QuoteStatus::EncodingFailed);
+            assert!(result[1].transaction().is_none());
+        }
+
+        /// Takes longer than any deadline under test.
+        #[derive(Debug)]
+        struct SlowHook;
+
+        impl SolutionHook for SlowHook {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                Ok(solution)
+            }
+        }
+
+        impl CalldataHook for SlowHook {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                _solution: &Solution,
+                _encoded: &EncodedSolution,
+                _calldata: &mut [u8],
+            ) -> Result<(), SolveError> {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                Ok(())
+            }
+        }
+
+        /// On a single-threaded runtime the deadline can fire only while the hook runs off it.
+        #[rstest]
+        #[case::solution_hook(EncodingOptions::new(0.01).with_solution_hook(Arc::new(SlowHook)))]
+        #[case::calldata_hook(EncodingOptions::new(0.01).with_calldata_hook(Arc::new(SlowHook)))]
+        #[tokio::test(flavor = "current_thread")]
+        async fn test_encode_until_deadline_with_slow_hook(#[case] opts: EncodingOptions) {
+            let encoder = real_encoder();
+            let started = Instant::now();
+
+            let quotes = encoder
+                .encode_until(
+                    vec![quote_on_protocol("slow", "uniswap_v2")],
+                    opts,
+                    Some(started + std::time::Duration::from_millis(10)),
+                )
+                .await
+                .expect("a quote that misses the deadline is reported on its order");
+
+            assert_eq!(quotes[0].status(), QuoteStatus::EncodingFailed);
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(500),
+                "waited {:?}",
+                started.elapsed()
+            );
+        }
+
+        /// Sets `user_data` on the solution's first swap.
+        #[derive(Debug)]
+        struct SetSwapUserData;
+
+        impl SolutionHook for SetSwapUserData {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                let mut swaps = solution.swaps().to_vec();
+                swaps[0] = swaps[0]
+                    .clone()
+                    .with_user_data(Bytes::from(vec![0xEE]));
+                Ok(solution.with_swaps(swaps))
+            }
+        }
+
+        /// Replaces the protocol state of the solution's first swap with an equal, new one.
+        #[derive(Debug)]
+        struct ReplaceProtocolState;
+
+        impl SolutionHook for ReplaceProtocolState {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                let mut swaps = solution.swaps().to_vec();
+                swaps[0] = swaps[0]
+                    .clone()
+                    .with_protocol_state(Arc::new(MockProtocolSim::default()));
+                Ok(solution.with_swaps(swaps))
+            }
+        }
+
+        /// Flips the first byte of the swaps in the calldata, as a hook writing a signature into a
+        /// swap would.
+        #[derive(Debug)]
+        struct ChangeSwapsByte;
+
+        impl CalldataHook for ChangeSwapsByte {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                _solution: &Solution,
+                encoded: &EncodedSolution,
+                calldata: &mut [u8],
+            ) -> Result<(), SolveError> {
+                let swaps = encoded.swaps();
+                let start = calldata
+                    .windows(swaps.len())
+                    .rposition(|window| window == swaps)
+                    .expect("the calldata carries the encoded swaps");
+                calldata[start] ^= 0xFF;
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn test_calldata_hook_changes_swaps() {
+            let encoder = real_encoder();
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01).with_client_fee_params(make_client_fee(100));
+
+            let without_hook = encoder
+                .encode(vec![quote.clone()], opts.clone())
+                .await
+                .unwrap();
+            let with_hook = encoder
+                .encode(vec![quote], opts.with_calldata_hook(Arc::new(ChangeSwapsByte)))
+                .await
+                .unwrap();
+
+            assert_eq!(with_hook[0].status(), QuoteStatus::Success);
+            let tx = with_hook[0].transaction().unwrap();
+            let (_, _, _, _, _, _, _, swaps) =
+                <SingleSwapCalldata as SolValue>::abi_decode_params(&tx.data()[4..]).unwrap();
+            let swaps_hash = |quote: &OrderQuote| {
+                *quote
+                    .fee_breakdown()
+                    .unwrap()
+                    .swaps_hash()
+                    .unwrap()
+            };
+            assert_eq!(swaps_hash(&with_hook[0]), keccak256(&swaps).0);
+            assert_ne!(swaps_hash(&with_hook[0]), swaps_hash(&without_hook[0]));
+        }
+
+        #[tokio::test]
+        async fn test_calldata_hook_changes_swaps_with_disable_slippage_taking() {
+            let encoder = real_encoder()
+                .with_disable_slippage_taking_signer(disable_slippage_taking_signer());
+            let quote = make_order_quote(1_000_000_000)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let opts = EncodingOptions::new(0.01)
+                .with_disable_slippage_taking(true)
+                .with_calldata_hook(Arc::new(ChangeSwapsByte));
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .expect("a rejected hook edit is reported on its quote, not on the call");
+
+            assert_eq!(result[0].status(), QuoteStatus::EncodingFailed);
+            assert!(result[0].transaction().is_none());
+        }
+    }
+
+    mod router_call_decode {
+        use super::*;
+        use crate::{PermitDetails, PermitSingle as FyndPermitSingle};
+
+        /// Decodes the calldata it is handed, as a hook that signs over it would, and keeps the
+        /// result.
+        #[derive(Debug, Default)]
+        struct DecodeCall {
+            decoded: std::sync::Mutex<Option<(RouterLayout, RouterCall)>>,
+        }
+
+        impl CalldataHook for DecodeCall {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                _solution: &Solution,
+                encoded: &EncodedSolution,
+                calldata: &mut [u8],
+            ) -> Result<(), SolveError> {
+                let function_signature = encoded.function_signature();
+                let layout = RouterLayout::of(function_signature).expect("a router function");
+                let call = RouterCall::decode(function_signature, calldata)?;
+                *self.decoded.lock().unwrap() = Some((layout, call));
+                Ok(())
+            }
+        }
+
+        fn split_route() -> crate::types::Route {
+            let (a, b) = (make_address(0x01), make_address(0x02));
+            let tokens = FxHashMap::from_iter([
+                (a.clone(), make_token(a.clone())),
+                (b.clone(), make_token(b.clone())),
+            ]);
+            crate::types::Route::new(
+                vec![
+                    make_route_swap_addrs(a.clone(), b.clone()).with_split(0.4),
+                    make_route_swap_addrs(a, b),
+                ],
+                tokens,
+            )
+            .expect("non-empty route")
+        }
+
+        fn with_permit2(options: EncodingOptions, encoder: &Encoder) -> EncodingOptions {
+            let details = PermitDetails::new(
+                Bytes::from(make_address(0x01).as_ref()),
+                BigUint::from(1000u64),
+                BigUint::from(u64::from(u32::MAX)),
+                BigUint::ZERO,
+            );
+            let spender = encoder
+                .router_address()
+                .expect("a router")
+                .clone();
+            options
+                .with_transfer_type(UserTransferType::TransferFromPermit2)
+                .with_permit(FyndPermitSingle::new(
+                    details,
+                    spender,
+                    BigUint::from(u64::from(u32::MAX)),
+                ))
+                .with_signature(Bytes::from(vec![0x11; 65]))
+        }
+
+        /// The decoder reads back what the encoder wrote, in every layout.
+        #[rstest]
+        #[case::sequential(false, false, RouterLayout::Sequential)]
+        #[case::sequential_permit2(false, true, RouterLayout::SequentialPermit2)]
+        #[case::split(true, false, RouterLayout::Split)]
+        #[case::split_permit2(true, true, RouterLayout::SplitPermit2)]
+        #[tokio::test]
+        async fn test_decode_encoded_call(
+            #[case] split: bool,
+            #[case] permit2: bool,
+            #[case] expected_layout: RouterLayout,
+        ) {
+            let encoder = real_encoder();
+            let route = if split {
+                split_route()
+            } else {
+                make_route_with_tokens(&[(make_address(0x01), make_address(0x02))])
+            };
+            let quote = make_order_quote(990).with_route(route);
+            let client_fee = make_client_fee(100);
+            let mut options = EncodingOptions::new(0.01).with_client_fee_params(client_fee.clone());
+            if permit2 {
+                options = with_permit2(options, &encoder);
+            }
+            let hook = Arc::new(DecodeCall::default());
+
+            let result = encoder
+                .encode(vec![quote.clone()], options.with_calldata_hook(hook.clone()))
+                .await
+                .unwrap();
+
+            assert_eq!(result[0].status(), QuoteStatus::Success, "{:?}", result[0]);
+            let (layout, call) = hook
+                .decoded
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the hook ran");
+            let fee_breakdown = result[0].fee_breakdown().unwrap();
+            assert_eq!(layout, expected_layout);
+            assert_eq!(call.amount_in(), quote.amount_in());
+            assert_eq!(call.expected_amount_out(), result[0].amount_out());
+            assert_eq!(call.min_amount_out(), fee_breakdown.min_amount_received());
+            assert_eq!(call.receiver(), quote.receiver());
+            assert_eq!(call.client_fee().receiver(), client_fee.receiver());
+            assert_eq!(*call.client_fee().deadline(), BigUint::from(client_fee.deadline()));
+            assert_eq!(Some(&keccak256(call.swaps()).0), fee_breakdown.swaps_hash());
+        }
     }
 }

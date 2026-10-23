@@ -34,8 +34,14 @@ use uuid::Uuid;
 
 use super::{internal::SolveError, primitives::ComponentId};
 use crate::{
-    algorithm::NoPathReason, encoding::router_fees::LEGACY_BPS_DENOMINATOR,
-    feed::market_data::StateLabel, price_guard::config::PriceGuardConfig, AlgorithmError,
+    algorithm::NoPathReason,
+    encoding::{
+        hooks::{CalldataHook, SolutionHook},
+        router_fees::LEGACY_BPS_DENOMINATOR,
+    },
+    feed::market_data::StateLabel,
+    price_guard::config::PriceGuardConfig,
+    AlgorithmError,
 };
 
 // ============================================================================
@@ -615,6 +621,14 @@ pub struct EncodingOptions {
     /// wire format.
     #[serde(skip)]
     jit_router: bool,
+    /// Adjusts each quote's `Solution` before encoding. Not serialized, so it is not in the
+    /// request JSON, and a replayed request runs without it, so its amounts and calldata differ.
+    #[serde(skip)]
+    solution_hook: Option<Arc<dyn SolutionHook>>,
+    /// Edits each quote's router calldata after encoding. Not serialized, so it is not in the
+    /// request JSON, and a replayed request runs without it, so its calldata differs.
+    #[serde(skip)]
+    calldata_hook: Option<Arc<dyn CalldataHook>>,
 }
 
 impl EncodingOptions {
@@ -631,6 +645,8 @@ impl EncodingOptions {
             simulate: false,
             calldata_watermark: None,
             jit_router: false,
+            solution_hook: None,
+            calldata_hook: None,
         }
     }
 
@@ -705,6 +721,28 @@ impl EncodingOptions {
     /// Returns whether the transaction is sent to the chain's `FyndJITRouter`.
     pub fn jit_router(&self) -> bool {
         self.jit_router
+    }
+
+    /// Runs `hook` on each quote's `Solution` before it is encoded.
+    pub fn with_solution_hook(mut self, hook: Arc<dyn SolutionHook>) -> Self {
+        self.solution_hook = Some(hook);
+        self
+    }
+
+    /// Returns the solution hook, if set.
+    pub fn solution_hook(&self) -> Option<&dyn SolutionHook> {
+        self.solution_hook.as_deref()
+    }
+
+    /// Runs `hook` on each quote's router calldata after encoding and before simulation.
+    pub fn with_calldata_hook(mut self, hook: Arc<dyn CalldataHook>) -> Self {
+        self.calldata_hook = Some(hook);
+        self
+    }
+
+    /// Returns the calldata hook, if set.
+    pub fn calldata_hook(&self) -> Option<&dyn CalldataHook> {
+        self.calldata_hook.as_deref()
     }
 
     /// Returns the permit2 authorization, if set.
@@ -2490,6 +2528,11 @@ impl Transaction {
     /// Returns the ABI-encoded calldata.
     pub fn data(&self) -> &[u8] {
         &self.data
+    }
+
+    /// Returns the calldata for in-place edits.
+    pub(crate) fn data_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.data
     }
 
     /// Byte offset of the client fee signature within `data`.

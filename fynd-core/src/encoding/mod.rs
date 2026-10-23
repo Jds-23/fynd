@@ -17,6 +17,8 @@ pub(crate) mod disable_slippage_taking;
 pub mod encoder;
 pub mod exclusive_swap;
 pub mod fee_fetcher;
+pub mod hooks;
+pub mod router_call;
 pub mod router_fees;
 
 /// Validity window for a server-signed payload, in seconds.
