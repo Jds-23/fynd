@@ -29,8 +29,8 @@ use crate::{OrderQuote, SolveError};
 /// It receives the `Solution` with the fee-adjusted `min_amount_out` already set. The router call
 /// reads `expected_amount_out` from the returned `Solution`.
 ///
-/// The hook may change only `expected_amount_out`, and not below `min_amount_out`. Any other
-/// change fails the quote.
+/// The hook may change only `expected_amount_out`, and not below `min_amount_out`, and the
+/// subsidy terms (`Solution::with_subsidy`). Any other change fails the quote.
 ///
 /// The quote reports the hooked `expected_amount_out` as `amount_out` and moves
 /// `amount_out_net_gas` by the same difference. The fee breakdown and the per-swap amounts of the
