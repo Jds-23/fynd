@@ -1,4 +1,11 @@
 
+## [0.115.0](https://github.com/propeller-heads/fynd/compare/0.114.5...0.115.0) (2026-10-23)
+
+### Features
+
+* **core:** decode router calls for calldata hooks ([2716b9e](https://github.com/propeller-heads/fynd/commit/2716b9e04adbf1b7c266abc5b2fb25694f58fc6b))
+
+
 ## [0.114.5](https://github.com/propeller-heads/fynd/compare/0.114.4...0.114.5) (2026-10-22)
 
 ### Features
