@@ -27,7 +27,7 @@ mod instrumentation;
 mod log_capture;
 
 use std::{
-    sync::{Arc, LazyLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
