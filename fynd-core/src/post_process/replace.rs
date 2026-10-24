@@ -261,10 +261,33 @@ pub(super) struct ReplacementTarget {
 }
 
 /// A route with one replacement applied and simulated, which the search keeps if it beats the
-/// current route. It carries the swaps of the route and their net amount out.
+/// current route. It carries the amount out, the net amount out and, when the finder sets one, the
+/// amount the route commits to pay.
 pub(super) struct CandidateRoute {
     swaps: Vec<Swap>,
+    amount_out: BigUint,
     net_amount_out: BigInt,
+    committed_amount_out: Option<BigUint>,
+}
+
+impl CandidateRoute {
+    pub(super) fn swaps(&self) -> &[Swap] {
+        &self.swaps
+    }
+
+    pub(super) fn amount_out(&self) -> &BigUint {
+        &self.amount_out
+    }
+
+    pub(super) fn net_amount_out(&self) -> &BigInt {
+        &self.net_amount_out
+    }
+
+    /// The candidate committed to pay `committed_amount_out`.
+    pub(super) fn with_commitment(mut self, committed_amount_out: BigUint) -> Self {
+        self.committed_amount_out = Some(committed_amount_out);
+        self
+    }
 }
 
 /// Decides which swaps may replace a target, and finds the best replacement through one swap.
@@ -302,11 +325,26 @@ pub(super) struct RouteEvaluator<'a> {
     input_token: Address,
     output_token: Address,
     total_in: BigUint,
+    original_amount_out: BigUint,
 }
 
 impl RouteEvaluator<'_> {
     pub(super) fn input_token(&self) -> &Address {
         &self.input_token
+    }
+
+    pub(super) fn output_token(&self) -> &Address {
+        &self.output_token
+    }
+
+    /// The amount out of the original route.
+    pub(super) fn original_amount_out(&self) -> &BigUint {
+        &self.original_amount_out
+    }
+
+    /// The net amount out of the original route.
+    pub(super) fn original_net_amount_out(&self) -> &BigInt {
+        self.original.net_amount_out()
     }
 
     pub(super) fn deadline_passed(&self) -> bool {
@@ -362,7 +400,12 @@ impl RouteEvaluator<'_> {
                 .with_split(*swap.split()),
             );
         }
-        Some(CandidateRoute { swaps: route_swaps, net_amount_out })
+        Some(CandidateRoute {
+            swaps: route_swaps,
+            amount_out: simulated.amount_out,
+            net_amount_out,
+            committed_amount_out: None,
+        })
     }
 
     /// Simulates the swaps in `ordered` in topological order, using the snapshot's tokens and each
@@ -408,6 +451,7 @@ impl<'a, F: ReplacementFinder> ReplacementSearcher<'a, F> {
             return None;
         }
         let pricing = GasPricing::of(original, &output_token)?;
+        let original_amount_out = route.amount_out(&output_token);
         let evaluator = RouteEvaluator {
             original,
             deadline: request.deadline(),
@@ -416,6 +460,7 @@ impl<'a, F: ReplacementFinder> ReplacementSearcher<'a, F> {
             input_token,
             output_token,
             total_in: request.order().amount().clone(),
+            original_amount_out,
         };
         Some(Self { evaluator, swaps: snapshot.swaps, finder })
     }
@@ -423,7 +468,8 @@ impl<'a, F: ReplacementFinder> ReplacementSearcher<'a, F> {
     /// Applies the best replacement until none raises the net amount out, the search has run one
     /// round per original swap, or the deadline passes. A candidate must beat the net amount out
     /// of the current route; the first round simulates the original route again. `None` when the
-    /// route did not change, or when the final net amount out is not above the original one.
+    /// route did not change, or when the final net amount out is not above the original one. The
+    /// result carries the commitment of the last candidate.
     pub(super) fn run(self) -> Option<RouteResult> {
         let original = self.evaluator.original;
         let mut swaps = original.route().swaps().to_vec();
@@ -431,6 +477,7 @@ impl<'a, F: ReplacementFinder> ReplacementSearcher<'a, F> {
         let mut net_amount_out = self
             .evaluator
             .simulate_baseline(&swaps)?;
+        let mut committed_amount_out = None;
         let mut changed = false;
         for _ in 0..rounds {
             if self.evaluator.deadline_passed() {
@@ -440,6 +487,7 @@ impl<'a, F: ReplacementFinder> ReplacementSearcher<'a, F> {
                 break;
             };
             net_amount_out = candidate.net_amount_out;
+            committed_amount_out = candidate.committed_amount_out;
             swaps = candidate.swaps;
             changed = true;
         }
@@ -451,7 +499,16 @@ impl<'a, F: ReplacementFinder> ReplacementSearcher<'a, F> {
                 warn!(%error, "cannot build the replacement route; keeping the original route");
             })
             .ok()?;
-        Some(RouteResult::new(route, net_amount_out, original.gas_price().clone()))
+        let result = RouteResult::new(route, net_amount_out, original.gas_price().clone());
+        Some(match committed_amount_out {
+            Some(committed) => result.with_commitment(
+                committed,
+                self.evaluator
+                    .original_amount_out
+                    .clone(),
+            ),
+            None => result,
+        })
     }
 
     /// The candidate with the highest net amount out that the finder returns, if it beats
