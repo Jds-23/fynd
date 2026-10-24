@@ -35,6 +35,7 @@ use tycho_simulation::{
         stream::ProtocolStreamBuilder,
         tycho_models::Chain,
     },
+    pamm::protocols::metric,
     price_level_stream::{config::default_served_pamms, stream::PriceLevelStreamBuilder},
     protocol::models::Update,
     tycho_client::feed::{component_tracker::ComponentFilter, synchronizer::ComponentWithState},
@@ -133,10 +134,18 @@ const PRICE_LEVEL_STREAM_CHAIN: Chain = Chain::Ethereum;
 ///
 /// An `rfq:metric` or `fallback:rfq:metric` entry on any other chain is rejected at registration.
 /// Each entry must also have its own executor in tycho-execution's `executor_addresses.json`, or
-/// its legs would price from the book feed and then fail to encode: BSC has only the fallback
-/// executor and Arbitrum only the direct one.
+/// its legs would price from the book feed and then fail to encode: Ethereum and BSC have only the
+/// fallback executor.
 pub(crate) const METRIC_CHAINS: &[Chain] =
-    &[Chain::Base, Chain::Robinhood, Chain::Bsc, Chain::Arbitrum];
+    &[Chain::Ethereum, Chain::Base, Chain::Robinhood, Chain::Bsc, Chain::Arbitrum, Chain::Polygon];
+
+/// The price level stream venue that is Metric.
+///
+/// On Ethereum, Metric is served both by the price level stream (`pricelevelstream:metric`,
+/// executing through Titan's Metric router) and by the book feed (`fallback:rfq:metric`,
+/// executing through `MetricFallbackRouter`). Both price the same pools, so a list may name one
+/// of them but not both: together they would stream the same inventory twice.
+const METRIC_PRICE_LEVEL_VENUE: &str = "metric";
 
 /// Whether a `--protocols` entry names a Tycho protocol system.
 ///
@@ -570,6 +579,17 @@ pub(crate) fn open_price_level_stream(
     let served = default_served_pamms();
     let mut builder = PriceLevelStreamBuilder::new().with_tokens(tokens.clone());
     for venue in venues {
+        if venue == METRIC_PRICE_LEVEL_VENUE {
+            if let Some(book_entry) = protocols.iter().find(|protocol| {
+                RfqEntry::parse(protocol)
+                    .is_some_and(|entry| entry.protocol() == metric::PROTOCOL_SYSTEM)
+            }) {
+                return Err(DataFeedError::Config(format!(
+                    "{PRICE_LEVEL_STREAM_PREFIX}{venue} and {book_entry} serve the same Metric \
+                     pools; name only one of them"
+                )));
+            }
+        }
         let Some(config) = served
             .iter()
             .find(|config| config.protocol == venue)
@@ -1234,11 +1254,40 @@ mod tests {
     }
 
     #[test]
-    fn test_metric_sources_serve_disjoint_chains() {
+    fn test_open_price_level_stream_metric() {
+        let Ok(Some(_)) = price_level_stream(Chain::Ethereum, &["pricelevelstream:metric"]) else {
+            panic!("expected metric to be served by the price level stream");
+        };
+    }
+
+    /// The book feed serves Metric on the stream's own chain, so naming both would stream the same
+    /// pools twice.
+    #[rstest::rstest]
+    #[case::via_fallback_router("fallback:rfq:metric")]
+    #[case::direct("rfq:metric")]
+    fn test_open_price_level_stream_metric_with_book_feed(#[case] book_entry: &str) {
+        assert!(METRIC_CHAINS.contains(&PRICE_LEVEL_STREAM_CHAIN));
+        let Err(err) = price_level_stream(
+            Chain::Ethereum,
+            &["uniswap_v3", "pricelevelstream:metric", book_entry],
+        ) else {
+            panic!("expected pricelevelstream:metric and {book_entry} to be rejected together");
+        };
         assert!(
-            !METRIC_CHAINS.contains(&PRICE_LEVEL_STREAM_CHAIN),
-            "a chain served both ways would stream the same Metric inventory twice"
+            err.to_string()
+                .contains("name only one of them"),
+            "got {err}"
         );
+    }
+
+    /// Another book feed beside the stream's Metric does not overlap it.
+    #[test]
+    fn test_open_price_level_stream_metric_with_other_book_feed() {
+        let Ok(Some(_)) =
+            price_level_stream(Chain::Ethereum, &["pricelevelstream:metric", "fallback:rfq:bebop"])
+        else {
+            panic!("expected metric to be served beside Bebop's book feed");
+        };
     }
 
     #[rstest::rstest]
@@ -1308,7 +1357,7 @@ mod tests {
     #[case::native_via_fallback_router(Chain::Ethereum, "fallback:rfq:native")]
     #[case::liquorice_off_ethereum(Chain::Base, "rfq:liquorice")]
     #[case::liquorice_via_fallback_router(Chain::Ethereum, "fallback:rfq:liquorice")]
-    #[case::metric_via_fallback_router_on_arbitrum(Chain::Arbitrum, "fallback:rfq:metric")]
+    #[case::metric_direct_on_ethereum(Chain::Ethereum, "rfq:metric")]
     fn test_open_book_without_executor(#[case] chain: Chain, #[case] entry: &str) {
         let Err(err) = open_book_stream(chain, &[entry]) else {
             panic!("expected {entry} to be rejected on {chain}");
@@ -1336,21 +1385,26 @@ mod tests {
 
     #[test]
     fn test_open_book_metric_off_supported_chains() {
-        let Err(err) = open_book_stream(Chain::Ethereum, &["rfq:metric"]) else {
+        let Err(err) = open_book_stream(Chain::Unichain, &["rfq:metric"]) else {
             panic!("expected rfq:metric to be rejected where Fynd does not serve Metric");
         };
         assert!(
             err.to_string()
-                .contains("only served on base, robinhood, bsc, arbitrum"),
+                .contains("only served on ethereum, base, robinhood, bsc, arbitrum, polygon"),
             "got {err}"
         );
     }
 
     #[rstest::rstest]
+    #[case::ethereum_via_fallback_router(Chain::Ethereum, "fallback:rfq:metric")]
     #[case::base(Chain::Base, "rfq:metric")]
     #[case::robinhood_via_fallback_router(Chain::Robinhood, "fallback:rfq:metric")]
     #[case::bsc_via_fallback_router(Chain::Bsc, "fallback:rfq:metric")]
     #[case::arbitrum(Chain::Arbitrum, "rfq:metric")]
+    #[case::arbitrum_via_fallback_router(Chain::Arbitrum, "fallback:rfq:metric")]
+    #[case::polygon(Chain::Polygon, "rfq:metric")]
+    // Polygon has no curated USD stablecoin set, which Metric's feed does not need.
+    #[case::polygon_via_fallback_router(Chain::Polygon, "fallback:rfq:metric")]
     fn test_open_book_metric_requires_api_key(#[case] chain: Chain, #[case] entry: &str) {
         env::remove_var("METRIC_API_KEY");
         let Err(err) = open_book_stream(chain, &[entry]) else {

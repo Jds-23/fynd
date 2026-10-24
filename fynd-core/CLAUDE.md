@@ -191,12 +191,11 @@ silently serves nothing: `BEBOP_KEY` for `rfq:bebop`, `HASHFLOW_USER`/`HASHFLOW_
 (whose `METRIC_API_URL` stays optional, defaulting to Metric's public endpoint), `NATIVE_API_KEY`
 for `rfq:native`, and `LIQUORICE_USER`/`LIQUORICE_KEY` for `rfq:liquorice`. `rfq:metric` is
 also gated on `METRIC_CHAINS`, the chains tycho-execution deploys its executor to — elsewhere the
-entry is rejected instead of pricing legs that cannot be encoded. That gate is what splits Metric
-between the two non-Tycho sources: the price level stream serves it on Ethereum
-(`pricelevelstream:metric`, executing through the `TychoFallbackRouter`) and `rfq:metric` serves it
-on the chains `METRIC_CHAINS` names (executing through `MetricExecutor`). `METRIC_CHAINS` and
-`PRICE_LEVEL_STREAM_CHAIN` are disjoint, so the price level stream and the book feeds never
-stream the same Metric inventory twice.
+entry is rejected instead of pricing legs that cannot be encoded. On Ethereum, Metric can come
+from either the book feed (`fallback:rfq:metric`, executing through `MetricFallbackRouter`) or the
+price level stream (`pricelevelstream:metric`, executing through Titan's Metric router). Both
+price the same pools, so `open_price_level_stream` rejects `pricelevelstream:metric` when the list
+also names Metric's book feed, and the same inventory is never streamed twice.
 
 A `fallback:rfq:` entry (`fallback:rfq:metric`, `fallback:rfq:bebop`, `fallback:rfq:hashflow`) is
 rejected at registration unless tycho-execution's default `executor_addresses.json` lists that exact
