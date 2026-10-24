@@ -380,13 +380,17 @@ pub(super) struct ReplacementSearcher<'a, F> {
 
 impl<'a, F: ReplacementFinder> ReplacementSearcher<'a, F> {
     /// Prepares a search of `original` on `snapshot`. `None` when the route cannot be searched:
-    /// the route has no swaps, it starts and ends on one token, or it uses no gas.
+    /// there are no replacement swaps, the route has no swaps, it starts and ends on one token, or
+    /// it uses no gas.
     pub(super) fn new(
         snapshot: ReplacementSnapshot,
         request: &PostProcessRequest<'_>,
         original: &'a RouteResult,
         finder: F,
     ) -> Option<Self> {
+        if snapshot.swaps.is_empty() {
+            return None;
+        }
         let route = original.route();
         let (input_token, output_token) = (route.input_token()?, route.output_token()?);
         if input_token == output_token {
