@@ -80,6 +80,37 @@ impl ComponentIndex {
     }
 }
 
+/// Whether `swap` can replace `target`: its pool trades both tokens of the target, and the route
+/// does not already use that pool.
+pub(super) fn can_replace(swap: &Swap, target: &ReplacementTarget, route_swaps: &[Swap]) -> bool {
+    let tokens = &swap.protocol_component().tokens;
+    tokens.contains(&target.token_in) &&
+        tokens.contains(&target.token_out) &&
+        !route_swaps
+            .iter()
+            .any(|route_swap| route_swap.component_id() == swap.component_id())
+}
+
+/// The route with `target` replaced by `swap` alone, if its net amount out is above
+/// `min_net_amount_out`. The swap takes the token pair and the split of the target.
+pub(super) fn replace_with_swap(
+    swap: &Swap,
+    target: &ReplacementTarget,
+    route_swaps: &[Swap],
+    evaluator: &RouteEvaluator<'_>,
+    min_net_amount_out: &BigInt,
+) -> Option<CandidateRoute> {
+    let mut replacement = swap.clone();
+    replacement.retarget(target.token_in.clone(), target.token_out.clone(), target.split);
+    let (simulated, net_amount_out) = evaluator.evaluate(route_swaps, target, &replacement)?;
+    (net_amount_out > *min_net_amount_out).then(|| CandidateRoute {
+        target: target.clone(),
+        swap: replacement,
+        simulated,
+        net_amount_out,
+    })
+}
+
 /// Indexes the components of the base market state that pass `is_member`.
 pub(super) async fn build_index(
     market: &MarketData,
@@ -134,8 +165,8 @@ pub(super) async fn update_index(
 /// The swaps the search may use as replacements for one route, and the route's tokens. Copied
 /// from the market so the search holds no lock.
 pub(super) struct ReplacementSnapshot {
-    /// One swap with zero amounts for each component the search may use, in id order. Its
-    /// token pair is a placeholder: `ReplacementSearcher` sets the pair and the split before it
+    /// One swap with zero amounts for each component the search may use, in id order. Its token
+    /// pair is a placeholder: the replacement finder sets the pair and the split before it
     /// simulates.
     swaps: Vec<Swap>,
     /// The tokens of the route.
@@ -231,7 +262,7 @@ pub(super) struct ReplacementTarget {
     pub(super) token_in: Address,
     pub(super) token_out: Address,
     /// The split of the replacement swap; `0.0` takes what remains of `token_in`.
-    split: f64,
+    pub(super) split: f64,
 }
 
 /// A route with one replacement applied and simulated, which the search keeps if it beats the
@@ -243,9 +274,34 @@ pub(super) struct CandidateRoute {
     net_amount_out: BigInt,
 }
 
+/// Decides which swaps may replace a target, and finds the best replacement through one swap.
+/// [`ReplacementSearcher`] runs it.
+pub(super) trait ReplacementFinder {
+    /// Whether `swap` may replace `target` of `route_swaps`.
+    fn accepts(
+        &self,
+        swap: &Swap,
+        target: &ReplacementTarget,
+        route_swaps: &[Swap],
+        evaluator: &RouteEvaluator<'_>,
+    ) -> bool;
+
+    /// Returns the replacement of `target` through `swap` that has the highest net amount out, if
+    /// that amount is above `min_net_amount_out`. Evaluates each replacement with `evaluator`. A
+    /// rule that restricts the routes it returns, or commits them to an amount, does so here.
+    fn find(
+        &self,
+        swap: &Swap,
+        target: &ReplacementTarget,
+        route_swaps: &[Swap],
+        evaluator: &RouteEvaluator<'_>,
+        min_net_amount_out: &BigInt,
+    ) -> Option<CandidateRoute>;
+}
+
 /// Simulates replacements on the route under search: holds the original route, its gas pricing,
 /// the tokens and the deadline.
-struct RouteEvaluator<'a> {
+pub(super) struct RouteEvaluator<'a> {
     original: &'a RouteResult,
     deadline: Instant,
     pricing: GasPricing,
@@ -256,11 +312,11 @@ struct RouteEvaluator<'a> {
 }
 
 impl RouteEvaluator<'_> {
-    fn input_token(&self) -> &Address {
+    pub(super) fn input_token(&self) -> &Address {
         &self.input_token
     }
 
-    fn deadline_passed(&self) -> bool {
+    pub(super) fn deadline_passed(&self) -> bool {
         Instant::now() >= self.deadline
     }
 
@@ -275,9 +331,9 @@ impl RouteEvaluator<'_> {
         Some(self.pricing.net_amount_out(&simulated))
     }
 
-    /// Simulates the route with `swap` in place of the target route_swaps.
+    /// Simulates the route with `replacement` in place of the target route_swaps.
     /// `None` when a swap simulation fails.
-    fn evaluate(
+    pub(super) fn evaluate(
         &self,
         route_swaps: &[Swap],
         target: &ReplacementTarget,
@@ -290,7 +346,7 @@ impl RouteEvaluator<'_> {
                 trace!(
                     component = swap.component_id(),
                     %error,
-                    "dropped RFQ candidate: route simulation failed"
+                    "dropped candidate: route simulation failed"
                 );
             })
             .ok()?;
@@ -316,18 +372,20 @@ impl RouteEvaluator<'_> {
 }
 
 /// Searches one route for replacements that raise the net amount out.
-pub(super) struct ReplacementSearcher<'a> {
+pub(super) struct ReplacementSearcher<'a, F> {
     evaluator: RouteEvaluator<'a>,
     swaps: Vec<Swap>,
+    finder: F,
 }
 
-impl<'a> ReplacementSearcher<'a> {
+impl<'a, F: ReplacementFinder> ReplacementSearcher<'a, F> {
     /// Prepares a search of `original` on `snapshot`. `None` when the route cannot be searched:
-    /// it has no swaps, it starts and ends on one token, or it uses no gas.
+    /// the route has no swaps, it starts and ends on one token, or it uses no gas.
     pub(super) fn new(
         snapshot: ReplacementSnapshot,
         request: &PostProcessRequest<'_>,
         original: &'a RouteResult,
+        finder: F,
     ) -> Option<Self> {
         let route = original.route();
         let (input_token, output_token) = (route.input_token()?, route.output_token()?);
@@ -344,14 +402,14 @@ impl<'a> ReplacementSearcher<'a> {
             output_token,
             total_in: request.order().amount().clone(),
         };
-        Some(Self { evaluator, swaps: snapshot.swaps })
+        Some(Self { evaluator, swaps: snapshot.swaps, finder })
     }
 
     /// Applies the best replacement until none raises the net amount out, the search has run one
     /// round per original swap, or the deadline passes. A candidate must beat the net amount out
     /// of the current route; the first round simulates the original route again. `None` when the
     /// route did not change, or when the final net amount out is not above the original one.
-    pub(super) fn run(mut self) -> Option<RouteResult> {
+    pub(super) fn run(self) -> Option<RouteResult> {
         let original = self.evaluator.original;
         let mut swaps = original.route().swaps().to_vec();
         let rounds = swaps.len();
@@ -381,45 +439,30 @@ impl<'a> ReplacementSearcher<'a> {
         Some(RouteResult::new(route, net_amount_out, original.gas_price().clone()))
     }
 
-    /// The candidate with the highest net amount out, if it beats `current_net`. Stops at the
-    /// deadline with the best so far.
-    fn best_route(&mut self, route_swaps: &[Swap], current_net: &BigInt) -> Option<CandidateRoute> {
+    /// The candidate with the highest net amount out that the finder returns, if it beats
+    /// `current_net`. Stops at the deadline with the best so far.
+    fn best_route(&self, route_swaps: &[Swap], current_net: &BigInt) -> Option<CandidateRoute> {
         let mut best: Option<CandidateRoute> = None;
         let mut best_net = current_net.clone();
         for target in build_targets(route_swaps) {
-            for position in 0..self.swaps.len() {
-                if !super::rfq::fits(
-                    &self.swaps[position],
-                    &target,
-                    route_swaps,
-                    self.evaluator.input_token(),
-                ) {
+            for swap in &self.swaps {
+                if !self
+                    .finder
+                    .accepts(swap, &target, route_swaps, &self.evaluator)
+                {
                     continue;
                 }
                 if self.evaluator.deadline_passed() {
                     return best;
                 }
-                self.swaps[position].retarget(
-                    target.token_in.clone(),
-                    target.token_out.clone(),
-                    target.split,
-                );
-                let swap = &self.swaps[position];
-                let Some((simulated, net_amount_out)) =
-                    self.evaluator
-                        .evaluate(route_swaps, &target, swap)
+                let Some(candidate) =
+                    self.finder
+                        .find(swap, &target, route_swaps, &self.evaluator, &best_net)
                 else {
                     continue;
                 };
-                if net_amount_out > best_net {
-                    best_net = net_amount_out.clone();
-                    best = Some(CandidateRoute {
-                        target: target.clone(),
-                        swap: swap.clone(),
-                        simulated,
-                        net_amount_out,
-                    });
-                }
+                best_net = candidate.net_amount_out.clone();
+                best = Some(candidate);
             }
         }
         best
@@ -453,11 +496,7 @@ impl<'a> ReplacementSearcher<'a> {
 /// Returns `swaps` with the positions in `replaced` removed and `replacement` inserted at the first
 /// removed position. The result keeps a topological order: `replacement` consumes only tokens that
 /// the swaps before it make.
-pub(super) fn splice<'a>(
-    swaps: &'a [Swap],
-    replaced: &[usize],
-    replacement: &'a Swap,
-) -> Vec<&'a Swap> {
+fn splice<'a>(swaps: &'a [Swap], replaced: &[usize], replacement: &'a Swap) -> Vec<&'a Swap> {
     let mut ordered = Vec::with_capacity(swaps.len());
     for (position, route_swap) in swaps.iter().enumerate() {
         if replaced.first() == Some(&position) {
@@ -471,7 +510,7 @@ pub(super) fn splice<'a>(
 }
 
 /// Returns replacement targets for individual swaps, followed by targets for segments.
-pub(super) fn build_targets(swaps: &[Swap]) -> Vec<ReplacementTarget> {
+fn build_targets(swaps: &[Swap]) -> Vec<ReplacementTarget> {
     let mut targets = Vec::new();
     for (position, swap) in swaps.iter().enumerate() {
         targets.push(ReplacementTarget {

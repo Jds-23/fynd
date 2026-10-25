@@ -1,8 +1,8 @@
 //! Replaces parts of a route with one RFQ swap when that raises the net amount out.
 
 use async_trait::async_trait;
+use num_bigint::BigInt;
 use tracing::debug;
-use tycho_simulation::tycho_common::models::Address;
 
 use crate::{
     algorithm::paths::read_market,
@@ -13,8 +13,9 @@ use crate::{
     },
     post_process::{
         replace::{
-            build_index, update_index, ComponentIndex, ReplacementSearcher, ReplacementSnapshot,
-            ReplacementTarget,
+            build_index, can_replace, replace_with_swap, update_index, CandidateRoute,
+            ComponentIndex, ReplacementFinder, ReplacementSearcher, ReplacementSnapshot,
+            ReplacementTarget, RouteEvaluator,
         },
         PostProcessRequest, RoutePostProcessor,
     },
@@ -77,7 +78,8 @@ impl RoutePostProcessor for RfqSwapReplacer {
                 return None;
             }
         };
-        ReplacementSearcher::new(snapshot, request, route).and_then(ReplacementSearcher::run)
+        ReplacementSearcher::new(snapshot, request, route, RfqReplacementFinder)
+            .and_then(ReplacementSearcher::run)
     }
 }
 
@@ -92,22 +94,34 @@ fn fills_partially(protocol_system: &str) -> bool {
     PARTIAL_FILL_PROTOCOLS.contains(&strip_fallback_prefix(protocol_system))
 }
 
-/// Whether the RFQ swap `swap` holds both tokens of `target` and `route_swaps` do not use its
-/// component. A swap whose protocol cannot fill partially accepts only a target that starts at
-/// `sell_token`.
-pub(super) fn fits(
-    swap: &Swap,
-    target: &ReplacementTarget,
-    route_swaps: &[Swap],
-    sell_token: &Address,
-) -> bool {
-    let tokens = &swap.protocol_component().tokens;
-    (fills_partially(swap.protocol()) || target.token_in == *sell_token) &&
-        tokens.contains(&target.token_in) &&
-        tokens.contains(&target.token_out) &&
-        !route_swaps
-            .iter()
-            .any(|route_swap| route_swap.component_id() == swap.component_id())
+/// Replaces a target with one swap through an RFQ component.
+struct RfqReplacementFinder;
+
+impl ReplacementFinder for RfqReplacementFinder {
+    /// A swap whose protocol cannot fill partially accepts only a target that starts at the input
+    /// token of the order.
+    fn accepts(
+        &self,
+        swap: &Swap,
+        target: &ReplacementTarget,
+        route_swaps: &[Swap],
+        evaluator: &RouteEvaluator<'_>,
+    ) -> bool {
+        (fills_partially(swap.protocol()) || target.token_in == *evaluator.input_token()) &&
+            can_replace(swap, target, route_swaps)
+    }
+
+    /// Replaces the target with `swap` alone.
+    fn find(
+        &self,
+        swap: &Swap,
+        target: &ReplacementTarget,
+        route_swaps: &[Swap],
+        evaluator: &RouteEvaluator<'_>,
+        min_net_amount_out: &BigInt,
+    ) -> Option<CandidateRoute> {
+        replace_with_swap(swap, target, route_swaps, evaluator, min_net_amount_out)
+    }
 }
 
 #[cfg(test)]
