@@ -102,13 +102,8 @@ pub(super) fn replace_with_swap(
 ) -> Option<CandidateRoute> {
     let mut replacement = swap.clone();
     replacement.retarget(target.token_in.clone(), target.token_out.clone(), target.split);
-    let (simulated, net_amount_out) = evaluator.evaluate(route_swaps, target, &replacement)?;
-    (net_amount_out > *min_net_amount_out).then(|| CandidateRoute {
-        target: target.clone(),
-        swap: replacement,
-        simulated,
-        net_amount_out,
-    })
+    let candidate = evaluator.evaluate(route_swaps, target, &replacement)?;
+    (candidate.net_amount_out > *min_net_amount_out).then_some(candidate)
 }
 
 /// Indexes the components of the base market state that pass `is_member`.
@@ -266,11 +261,9 @@ pub(super) struct ReplacementTarget {
 }
 
 /// A route with one replacement applied and simulated, which the search keeps if it beats the
-/// current route.
+/// current route. It carries the swaps of the route and their net amount out.
 pub(super) struct CandidateRoute {
-    target: ReplacementTarget,
-    swap: Swap,
-    simulated: SimulatedRoute,
+    swaps: Vec<Swap>,
     net_amount_out: BigInt,
 }
 
@@ -331,27 +324,45 @@ impl RouteEvaluator<'_> {
         Some(self.pricing.net_amount_out(&simulated))
     }
 
-    /// Simulates the route with `replacement` in place of the target route_swaps.
-    /// `None` when a swap simulation fails.
+    /// Simulates the route with `replacement` in place of the target swaps. The candidate holds the
+    /// route after the replacement, with the amounts and gas of the simulation. `None` when a swap
+    /// simulation fails.
     pub(super) fn evaluate(
         &self,
-        route_swaps: &[Swap],
+        swaps: &[Swap],
         target: &ReplacementTarget,
-        swap: &Swap,
-    ) -> Option<(SimulatedRoute, BigInt)> {
-        let ordered = splice(route_swaps, &target.replaced, swap);
+        replacement: &Swap,
+    ) -> Option<CandidateRoute> {
+        let ordered = splice(swaps, &target.replaced, replacement);
         let simulated = self
             .simulate(&ordered)
             .inspect_err(|error| {
                 trace!(
-                    component = swap.component_id(),
+                    component = replacement.component_id(),
                     %error,
                     "dropped candidate: route simulation failed"
                 );
             })
             .ok()?;
         let net_amount_out = self.pricing.net_amount_out(&simulated);
-        Some((simulated, net_amount_out))
+        let mut route_swaps = Vec::with_capacity(ordered.len());
+        for (swap, simulated) in ordered.into_iter().zip(simulated.swaps) {
+            route_swaps.push(
+                Swap::new(
+                    swap.component_id().to_string(),
+                    swap.protocol().to_string(),
+                    swap.token_in().clone(),
+                    swap.token_out().clone(),
+                    simulated.amount_in,
+                    simulated.amount_out,
+                    simulated.gas,
+                    swap.protocol_component().clone(),
+                    swap.protocol_state().clone_box(),
+                )
+                .with_split(*swap.split()),
+            );
+        }
+        Some(CandidateRoute { swaps: route_swaps, net_amount_out })
     }
 
     /// Simulates the swaps in `ordered` in topological order, using the snapshot's tokens and each
@@ -428,8 +439,8 @@ impl<'a, F: ReplacementFinder> ReplacementSearcher<'a, F> {
             let Some(candidate) = self.best_route(&swaps, &net_amount_out) else {
                 break;
             };
-            net_amount_out = candidate.net_amount_out.clone();
-            swaps = self.apply(&swaps, candidate);
+            net_amount_out = candidate.net_amount_out;
+            swaps = candidate.swaps;
             changed = true;
         }
         if !changed || net_amount_out <= *original.net_amount_out() {
@@ -470,30 +481,6 @@ impl<'a, F: ReplacementFinder> ReplacementSearcher<'a, F> {
             }
         }
         best
-    }
-
-    /// The route_swaps after the replacement, with the amounts and gas of the simulation.
-    fn apply(&self, route_swaps: &[Swap], candidate: CandidateRoute) -> Vec<Swap> {
-        let CandidateRoute { target, swap, simulated, .. } = candidate;
-        let ordered = splice(route_swaps, &target.replaced, &swap);
-        let mut replaced = Vec::with_capacity(ordered.len());
-        for (route_swap, simulated) in ordered.into_iter().zip(simulated.swaps) {
-            replaced.push(
-                Swap::new(
-                    route_swap.component_id().to_string(),
-                    route_swap.protocol().to_string(),
-                    route_swap.token_in().clone(),
-                    route_swap.token_out().clone(),
-                    simulated.amount_in,
-                    simulated.amount_out,
-                    simulated.gas,
-                    route_swap.protocol_component().clone(),
-                    route_swap.protocol_state().clone_box(),
-                )
-                .with_split(*route_swap.split()),
-            );
-        }
-        replaced
     }
 }
 
