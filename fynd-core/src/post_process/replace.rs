@@ -196,7 +196,7 @@ impl ReplacementSnapshot {
 }
 
 /// The gas cost of the original route in the output token, and the gas it used.
-pub(super) struct GasPricing {
+struct GasPricing {
     gas_cost_out: BigInt,
     gas: BigInt,
 }
@@ -243,10 +243,10 @@ pub(super) struct CandidateRoute {
     net_amount_out: BigInt,
 }
 
-/// Searches one route for replacements that raise the net amount out.
-pub(super) struct ReplacementSearcher<'a> {
+/// Simulates replacements on the route under search: holds the original route, its gas pricing,
+/// the tokens and the deadline.
+struct RouteEvaluator<'a> {
     original: &'a RouteResult,
-    swaps: Vec<Swap>,
     deadline: Instant,
     pricing: GasPricing,
     tokens: FxHashMap<Address, Token>,
@@ -255,61 +255,13 @@ pub(super) struct ReplacementSearcher<'a> {
     total_in: BigUint,
 }
 
-impl<'a> ReplacementSearcher<'a> {
-    /// Prepares a search of `original` on `snapshot`. `None` when the route cannot be searched:
-    /// it has no swaps, it starts and ends on one token, or it uses no gas.
-    pub(super) fn new(
-        snapshot: ReplacementSnapshot,
-        request: &PostProcessRequest<'_>,
-        original: &'a RouteResult,
-    ) -> Option<Self> {
-        let route = original.route();
-        let (input_token, output_token) = (route.input_token()?, route.output_token()?);
-        if input_token == output_token {
-            return None;
-        }
-        let pricing = GasPricing::of(original, &output_token)?;
-        Some(Self {
-            original,
-            swaps: snapshot.swaps,
-            deadline: request.deadline(),
-            pricing,
-            tokens: snapshot.tokens,
-            input_token,
-            output_token,
-            total_in: request.order().amount().clone(),
-        })
+impl RouteEvaluator<'_> {
+    fn input_token(&self) -> &Address {
+        &self.input_token
     }
 
-    /// Applies the best replacement until none raises the net amount out, the search has run one
-    /// round per original swap, or the deadline passes. A candidate must beat the net amount out
-    /// of the current route; the first round simulates the original route again. `None` when the
-    /// route did not change, or when the final net amount out is not above the original one.
-    pub(super) fn run(mut self) -> Option<RouteResult> {
-        let mut swaps = self.original.route().swaps().to_vec();
-        let rounds = swaps.len();
-        let mut net_amount_out = self.simulate_baseline(&swaps)?;
-        let mut changed = false;
-        for _ in 0..rounds {
-            if self.deadline_passed() {
-                break;
-            }
-            let Some(candidate) = self.best_route(&swaps, &net_amount_out) else {
-                break;
-            };
-            net_amount_out = candidate.net_amount_out.clone();
-            swaps = self.apply(&swaps, candidate);
-            changed = true;
-        }
-        if !changed || net_amount_out <= *self.original.net_amount_out() {
-            return None;
-        }
-        let route = Route::new(swaps, self.tokens)
-            .inspect_err(|error| {
-                warn!(%error, "cannot build the replacement route; keeping the original route");
-            })
-            .ok()?;
-        Some(RouteResult::new(route, net_amount_out, self.original.gas_price().clone()))
+    fn deadline_passed(&self) -> bool {
+        Instant::now() >= self.deadline
     }
 
     /// The net amount out of `swaps`, simulated again with the pricing of the original route.
@@ -321,48 +273,6 @@ impl<'a> ReplacementSearcher<'a> {
             .inspect_err(|error| debug!(%error, "cannot simulate the original route"))
             .ok()?;
         Some(self.pricing.net_amount_out(&simulated))
-    }
-
-    fn deadline_passed(&self) -> bool {
-        Instant::now() >= self.deadline
-    }
-
-    /// The candidate with the highest net amount out, if it beats `current_net`. Stops at the
-    /// deadline with the best so far.
-    fn best_route(&mut self, route_swaps: &[Swap], current_net: &BigInt) -> Option<CandidateRoute> {
-        let mut best: Option<CandidateRoute> = None;
-        let mut best_net = current_net.clone();
-        for target in build_targets(route_swaps) {
-            for position in 0..self.swaps.len() {
-                if !super::rfq::fits(&self.swaps[position], &target, route_swaps, &self.input_token)
-                {
-                    continue;
-                }
-                if self.deadline_passed() {
-                    return best;
-                }
-                self.swaps[position].retarget(
-                    target.token_in.clone(),
-                    target.token_out.clone(),
-                    target.split,
-                );
-                let swap = &self.swaps[position];
-                let Some((simulated, net_amount_out)) = self.evaluate(route_swaps, &target, swap)
-                else {
-                    continue;
-                };
-                if net_amount_out > best_net {
-                    best_net = net_amount_out.clone();
-                    best = Some(CandidateRoute {
-                        target: target.clone(),
-                        swap: swap.clone(),
-                        simulated,
-                        net_amount_out,
-                    });
-                }
-            }
-        }
-        best
     }
 
     /// Simulates the route with `swap` in place of the target route_swaps.
@@ -402,6 +312,117 @@ impl<'a> ReplacementSearcher<'a> {
             |address| self.tokens.get(address),
             |swap| Some(swap.protocol_state()),
         )
+    }
+}
+
+/// Searches one route for replacements that raise the net amount out.
+pub(super) struct ReplacementSearcher<'a> {
+    evaluator: RouteEvaluator<'a>,
+    swaps: Vec<Swap>,
+}
+
+impl<'a> ReplacementSearcher<'a> {
+    /// Prepares a search of `original` on `snapshot`. `None` when the route cannot be searched:
+    /// it has no swaps, it starts and ends on one token, or it uses no gas.
+    pub(super) fn new(
+        snapshot: ReplacementSnapshot,
+        request: &PostProcessRequest<'_>,
+        original: &'a RouteResult,
+    ) -> Option<Self> {
+        let route = original.route();
+        let (input_token, output_token) = (route.input_token()?, route.output_token()?);
+        if input_token == output_token {
+            return None;
+        }
+        let pricing = GasPricing::of(original, &output_token)?;
+        let evaluator = RouteEvaluator {
+            original,
+            deadline: request.deadline(),
+            pricing,
+            tokens: snapshot.tokens,
+            input_token,
+            output_token,
+            total_in: request.order().amount().clone(),
+        };
+        Some(Self { evaluator, swaps: snapshot.swaps })
+    }
+
+    /// Applies the best replacement until none raises the net amount out, the search has run one
+    /// round per original swap, or the deadline passes. A candidate must beat the net amount out
+    /// of the current route; the first round simulates the original route again. `None` when the
+    /// route did not change, or when the final net amount out is not above the original one.
+    pub(super) fn run(mut self) -> Option<RouteResult> {
+        let original = self.evaluator.original;
+        let mut swaps = original.route().swaps().to_vec();
+        let rounds = swaps.len();
+        let mut net_amount_out = self
+            .evaluator
+            .simulate_baseline(&swaps)?;
+        let mut changed = false;
+        for _ in 0..rounds {
+            if self.evaluator.deadline_passed() {
+                break;
+            }
+            let Some(candidate) = self.best_route(&swaps, &net_amount_out) else {
+                break;
+            };
+            net_amount_out = candidate.net_amount_out.clone();
+            swaps = self.apply(&swaps, candidate);
+            changed = true;
+        }
+        if !changed || net_amount_out <= *original.net_amount_out() {
+            return None;
+        }
+        let route = Route::new(swaps, self.evaluator.tokens)
+            .inspect_err(|error| {
+                warn!(%error, "cannot build the replacement route; keeping the original route");
+            })
+            .ok()?;
+        Some(RouteResult::new(route, net_amount_out, original.gas_price().clone()))
+    }
+
+    /// The candidate with the highest net amount out, if it beats `current_net`. Stops at the
+    /// deadline with the best so far.
+    fn best_route(&mut self, route_swaps: &[Swap], current_net: &BigInt) -> Option<CandidateRoute> {
+        let mut best: Option<CandidateRoute> = None;
+        let mut best_net = current_net.clone();
+        for target in build_targets(route_swaps) {
+            for position in 0..self.swaps.len() {
+                if !super::rfq::fits(
+                    &self.swaps[position],
+                    &target,
+                    route_swaps,
+                    self.evaluator.input_token(),
+                ) {
+                    continue;
+                }
+                if self.evaluator.deadline_passed() {
+                    return best;
+                }
+                self.swaps[position].retarget(
+                    target.token_in.clone(),
+                    target.token_out.clone(),
+                    target.split,
+                );
+                let swap = &self.swaps[position];
+                let Some((simulated, net_amount_out)) =
+                    self.evaluator
+                        .evaluate(route_swaps, &target, swap)
+                else {
+                    continue;
+                };
+                if net_amount_out > best_net {
+                    best_net = net_amount_out.clone();
+                    best = Some(CandidateRoute {
+                        target: target.clone(),
+                        swap: swap.clone(),
+                        simulated,
+                        net_amount_out,
+                    });
+                }
+            }
+        }
+        best
     }
 
     /// The route_swaps after the replacement, with the amounts and gas of the simulation.
