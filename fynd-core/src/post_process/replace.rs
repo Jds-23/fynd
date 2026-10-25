@@ -102,6 +102,7 @@ pub(super) fn replace_with_swap(
 ) -> Option<CandidateRoute> {
     let mut replacement = swap.clone();
     replacement.retarget(target.token_in.clone(), target.token_out.clone(), target.split);
+    let replacement = [replacement];
     let candidate = evaluator.evaluate(route_swaps, target, &replacement)?;
     (candidate.net_amount_out > *min_net_amount_out).then_some(candidate)
 }
@@ -369,14 +370,14 @@ impl RouteEvaluator<'_> {
         &self,
         swaps: &[Swap],
         target: &ReplacementTarget,
-        replacement: &Swap,
+        replacement: &[Swap],
     ) -> Option<CandidateRoute> {
         let ordered = splice(swaps, &target.replaced, replacement);
         let simulated = self
             .simulate(&ordered)
             .inspect_err(|error| {
                 trace!(
-                    component = replacement.component_id(),
+                    component = replacement.first().map(Swap::component_id),
                     %error,
                     "dropped candidate: route simulation failed"
                 );
@@ -541,17 +542,17 @@ impl<'a, F: ReplacementFinder> ReplacementSearcher<'a, F> {
     }
 }
 
-/// Returns `swaps` with the positions in `replaced` removed and `replacement` inserted at the first
-/// removed position. The result keeps a topological order: `replacement` consumes only tokens that
-/// the swaps before it make.
-fn splice<'a>(swaps: &'a [Swap], replaced: &[usize], replacement: &'a Swap) -> Vec<&'a Swap> {
+/// Returns `swaps` with the positions in `replaced` removed and the swaps of `replacement`
+/// inserted at the first removed position. The result keeps a topological order: the
+/// replacement consumes only tokens that the swaps before it make.
+fn splice<'a>(swaps: &'a [Swap], replaced: &[usize], replacement: &'a [Swap]) -> Vec<&'a Swap> {
     let mut ordered = Vec::with_capacity(swaps.len());
-    for (position, route_swap) in swaps.iter().enumerate() {
+    for (position, swap) in swaps.iter().enumerate() {
         if replaced.first() == Some(&position) {
-            ordered.push(replacement);
+            ordered.extend(replacement);
         }
         if !replaced.contains(&position) {
-            ordered.push(route_swap);
+            ordered.push(swap);
         }
     }
     ordered
