@@ -1,4 +1,16 @@
 
+## [0.116.0](https://github.com/propeller-heads/fynd/compare/0.115.0...0.116.0) (2026-10-26)
+
+### Features
+
+* **router:** accept derived data in the worker pool router ([96cec24](https://github.com/propeller-heads/fynd/commit/96cec24b9d81e3fe5447668a722fe2c517ee8b0a))
+
+### Bug Fixes
+
+* **router:** price one request's metrics from one token price snapshot ([0c72631](https://github.com/propeller-heads/fynd/commit/0c72631e4e6f5c23e9bff39f5edfa83e6c865c36))
+* **router:** price gas-token metrics from token gas prices ([63189b4](https://github.com/propeller-heads/fynd/commit/63189b4e5468993e3b25f3b0e7bb0490ea6831e8))
+
+
 ## [0.115.0](https://github.com/propeller-heads/fynd/compare/0.114.5...0.115.0) (2026-10-23)
 
 ### Features
