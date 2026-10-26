@@ -1791,6 +1791,7 @@ mod tests {
     use super::*;
     use crate::{
         algorithm::test_utils::{component, component_with_protocol, MockProtocolSim},
+        derived::DerivedData,
         feed::exclusivity::mark_exclusive,
         solver::defaults,
         tests::metrics::recorded_metrics,
@@ -4370,6 +4371,35 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[rstest]
+    #[case::with_prices(true)]
+    #[case::without_derived_data(false)]
+    #[tokio::test]
+    async fn test_solve_snapshots_token_prices(#[case] has_derived_data: bool) {
+        let (pool, worker) = create_mock_worker_pool("pool", Ok(make_single_quote(950)), 0);
+        let mut worker_router =
+            WorkerPoolRouter::new(vec![pool], WorkerPoolRouterConfig::default(), default_encoder());
+        let prices = gas_prices(&[(0x02, 2_000_000, 1_000_000_000_000_000)]);
+        if has_derived_data {
+            let derived_data = DerivedData::new_shared();
+            derived_data
+                .write()
+                .await
+                .set_token_prices(prices.clone(), vec![], 1);
+            worker_router = worker_router.with_derived_data(derived_data);
+        }
+        let request = QuoteRequest::new(vec![make_order()], QuoteOptions::default());
+
+        let ranked = worker_router
+            .solve(&request, ExclusiveAccess::Denied)
+            .await
+            .expect("solve");
+
+        let expected = has_derived_data.then_some(prices);
+        assert_eq!(ranked.token_prices().as_deref(), expected.as_ref());
+        worker.abort();
     }
 
     /// 2_000_000 USDC units per 1e15 wei is 2000 USDC per ETH.
