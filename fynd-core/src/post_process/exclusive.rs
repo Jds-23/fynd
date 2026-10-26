@@ -331,6 +331,8 @@ impl<'a> SplitSearcher<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use num_bigint::{BigInt, BigUint};
     use rstest::rstest;
     use tycho_simulation::tycho_common::{
@@ -341,6 +343,7 @@ mod tests {
     use super::*;
     use crate::{
         algorithm::test_utils::{component_with_protocol, ConstantProductSim, MockProtocolSim},
+        derived::DerivedData,
         exclusive_route::is_exclusive_leg,
         feed::exclusivity::mark_exclusive,
         post_process::test_utils::{
@@ -348,7 +351,7 @@ mod tests {
             run_with_access, sell_order, sequential_route, swap, swap_on, swap_through_pool,
             tokens, with_net_amount_out,
         },
-        types::Order,
+        types::{Order, RouteExclusions},
     };
 
     async fn run_granted(
@@ -776,6 +779,138 @@ mod tests {
         let replacer = replacer(&market).await;
 
         let out = run_granted(&replacer, &market, &sell_order(&a, &b), deep_route(&a, &b)).await;
+
+        assert!(out.is_none());
+    }
+
+    /// A route from A to C through two parallel pools to B, where the second takes `second_split`,
+    /// then one pool to C. Every pool is deep, at a price of about 2.
+    fn parallel_segment_route(
+        (a, b, c): (&Token, &Token, &Token),
+        second_split: f64,
+    ) -> RouteResult {
+        result(
+            vec![
+                swap_on("p1", (a, b), (600, 1188), 0.6, pool(100_000, 200_000)),
+                swap_on("p2", (a, b), (400, 792), second_split, pool(100_000, 200_000)),
+                swap_on("bc", (b, c), (1980, 3883), 0.0, pool(100_000, 200_000)),
+            ],
+            &[a, b, c],
+        )
+    }
+
+    /// The exclusive pool trades A for C and holds 1000 A against `reserve_out` C. Selling all of
+    /// the order to it pays 0.5 * `reserve_out`, which is below the 3883 of the route, so only a
+    /// split can use it.
+    #[rstest]
+    #[case::remainder_entry(0.0, 0.0)]
+    #[case::fixed_entries(0.4, 0.4)]
+    #[tokio::test]
+    async fn test_exclusive_split_of_a_segment(
+        #[case] second_split: f64,
+        #[case] second_share: f64,
+    ) {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_exclusive(&market, "excl_ac", (&a, &c), pool(1000, 5000)).await;
+        let replacer = replacer(&market).await;
+        let original = parallel_segment_route((&a, &b, &c), second_split);
+        let original_net = original.net_amount_out().clone();
+
+        let out = replaced(run_granted(&replacer, &market, &sell_order(&a, &c), original).await);
+
+        assert_eq!(component_ids(&out), ["excl_ac", "p1", "p2", "bc"]);
+        let splits = splits_of(&out);
+        let exclusive = splits[0];
+        assert!(exclusive > 0.0 && exclusive < 1.0);
+        assert_eq!(splits[1..], [0.6 * (1.0 - exclusive), second_share * (1.0 - exclusive), 0.0]);
+        // Fixed splits floor each part, so they may leave one unit of the order unspent.
+        let amount_in = amount_in_of(&out, &a);
+        assert!(amount_in >= BigUint::from(999u64) && amount_in <= BigUint::from(1000u64));
+        assert!(out.net_amount_out() > &original_net);
+    }
+
+    /// The segment A to C is the two swaps in a row; the exclusive swap and the first swap split
+    /// the order, and the second swap routes what the first one pays.
+    #[tokio::test]
+    async fn test_exclusive_split_of_a_sequential_segment() {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_exclusive(&market, "excl_ac", (&a, &c), pool(1000, 5000)).await;
+        let replacer = replacer(&market).await;
+        let original = result(
+            vec![
+                swap_on("ab", (&a, &b), (1000, 1980), 0.0, pool(100_000, 200_000)),
+                swap_on("bc", (&b, &c), (1980, 3883), 0.0, pool(100_000, 200_000)),
+            ],
+            &[&a, &b, &c],
+        );
+        let original_net = original.net_amount_out().clone();
+
+        let out = replaced(run_granted(&replacer, &market, &sell_order(&a, &c), original).await);
+
+        assert_eq!(component_ids(&out), ["excl_ac", "ab", "bc"]);
+        let splits = splits_of(&out);
+        assert!(splits[0] > 0.0 && splits[0] < 1.0);
+        assert_eq!(splits[1..], [0.0, 0.0]);
+        assert_eq!(amount_in_of(&out, &a), BigUint::from(1000u64));
+        assert_eq!(
+            amount_in_of(&out, &b),
+            out.route().swaps()[1]
+                .amount_out()
+                .clone()
+        );
+        assert!(out.net_amount_out() > &original_net);
+    }
+
+    #[tokio::test]
+    async fn test_exclusive_split_of_a_segment_worse_price() {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_exclusive(&market, "excl_ac", (&a, &c), pool(1000, 3000)).await;
+        let replacer = replacer(&market).await;
+        let original = parallel_segment_route((&a, &b, &c), 0.0);
+
+        let out = run_granted(&replacer, &market, &sell_order(&a, &c), original).await;
+
+        assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_exclusive_split_of_a_segment_commits() {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_exclusive(&market, "excl_ac", (&a, &c), pool(1000, 5000)).await;
+        let replacer = replacer(&market).await;
+        let original = parallel_segment_route((&a, &b, &c), 0.0);
+        let original_amount_out = original.route().amount_out(&c.address);
+
+        let out = replaced(run_granted(&replacer, &market, &sell_order(&a, &c), original).await);
+
+        let commitment = out
+            .commitment()
+            .expect("the split commits");
+        assert_eq!(commitment.reference_amount_out(), &original_amount_out);
+        assert!(commitment.committed_amount_out() >= &original_amount_out);
+        assert!(commitment.committed_amount_out() <= &out.route().amount_out(&c.address));
+    }
+
+    #[tokio::test]
+    async fn test_exclusive_split_of_a_segment_deadline_passed() {
+        let (a, b, c) = tokens();
+        let market = market();
+        add_exclusive(&market, "excl_ac", (&a, &c), pool(1000, 5000)).await;
+        let replacer = replacer(&market).await;
+        let derived = DerivedData::new_shared();
+        let order = sell_order(&a, &c);
+        let exclusions = RouteExclusions::default();
+        let request =
+            PostProcessRequest::new(&order, &market, &derived, &exclusions, Instant::now())
+                .with_exclusive_access(ExclusiveAccess::Granted);
+
+        let out = replacer
+            .process(&request, &parallel_segment_route((&a, &b, &c), 0.0))
+            .await;
 
         assert!(out.is_none());
     }
