@@ -1,4 +1,11 @@
 
+## [0.116.1](https://github.com/propeller-heads/fynd/compare/0.116.0...0.116.1) (2026-10-26)
+
+### Bug Fixes
+
+* **deps:** move to zstd 0.14.3 for the zstd security advisories ([89dd5e9](https://github.com/propeller-heads/fynd/commit/89dd5e9d3abf9bbd438ada244d3fb3ce3a7579ec))
+
+
 ## [0.116.0](https://github.com/propeller-heads/fynd/compare/0.115.0...0.116.0) (2026-10-26)
 
 ### Features
