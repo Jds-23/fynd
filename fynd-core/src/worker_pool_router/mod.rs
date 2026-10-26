@@ -27,7 +27,7 @@ mod instrumentation;
 mod log_capture;
 
 use std::{
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
@@ -41,7 +41,6 @@ use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLockReadGuard;
 use tracing::{debug, warn};
 use tycho_execution::encoding::{
     evm::gas_estimator::estimate_gas_usage,
@@ -51,7 +50,7 @@ use tycho_simulation::tycho_common::Bytes;
 
 use crate::{
     bps,
-    derived::{DerivedData, SharedDerivedDataRef, TokenGasPrices},
+    derived::{SharedDerivedDataRef, TokenGasPrices},
     encoding::encoder::Encoder,
     feed::{exclusivity::is_exclusive, protocol_registry::is_rfq_protocol},
     price_guard::guard::PriceGuard,
@@ -274,6 +273,7 @@ pub struct WorkerPoolRouter {
 pub struct RankedQuotes {
     per_order: Vec<Vec<OrderQuote>>,
     started: Instant,
+    token_prices: Option<Arc<TokenGasPrices>>,
 }
 
 impl RankedQuotes {
@@ -281,13 +281,13 @@ impl RankedQuotes {
     ///
     /// Every inner list must be non-empty — an order without a route is represented by a
     /// non-`Success` `OrderQuote` (e.g. `QuoteStatus::NoRouteFound`), not by an empty list, per
-    /// the invariant documented on this struct.
+    /// the invariant documented on this struct. Carries no token gas prices.
     ///
     /// # Errors
     ///
     /// Returns `Err(SolveError::Internal)` if any inner list is empty.
     pub fn new(per_order: Vec<Vec<OrderQuote>>) -> Result<Self, SolveError> {
-        Self::started_at(per_order, Instant::now())
+        Self::started_at(per_order, Instant::now(), None)
     }
 
     /// Wraps already-ranked candidates with an explicit start time, rejecting empty inner lists.
@@ -296,7 +296,11 @@ impl RankedQuotes {
     /// and [`Self::into_best`] cannot hit an empty list. [`WorkerPoolRouter::solve`] feeds it
     /// `rank_quotes` output, which always yields at least a `NoRouteFound`/`Timeout` placeholder
     /// per order, so the error path is unreachable there but stays checked rather than assumed.
-    fn started_at(per_order: Vec<Vec<OrderQuote>>, started: Instant) -> Result<Self, SolveError> {
+    fn started_at(
+        per_order: Vec<Vec<OrderQuote>>,
+        started: Instant,
+        token_prices: Option<Arc<TokenGasPrices>>,
+    ) -> Result<Self, SolveError> {
         for (index, candidates) in per_order.iter().enumerate() {
             if candidates.is_empty() {
                 return Err(SolveError::Internal(format!(
@@ -306,7 +310,7 @@ impl RankedQuotes {
                 )));
             }
         }
-        Ok(Self { per_order, started })
+        Ok(Self { per_order, started, token_prices })
     }
 
     /// Ranked candidates per order, best first.
@@ -335,6 +339,12 @@ impl RankedQuotes {
     #[must_use]
     pub fn started(&self) -> Instant {
         self.started
+    }
+
+    /// The token gas prices the ranking used; pass them to [`finalize_quote`].
+    #[must_use]
+    pub fn token_prices(&self) -> Option<Arc<TokenGasPrices>> {
+        self.token_prices.clone()
     }
 }
 
@@ -540,12 +550,14 @@ impl WorkerPoolRouter {
         self
     }
 
-    /// Read access to the derived data, when the router was given it.
-    async fn read_derived_data(&self) -> Option<RwLockReadGuard<'_, DerivedData>> {
-        match &self.derived_data {
-            Some(derived_data) => Some(derived_data.read().await),
-            None => None,
-        }
+    /// The current token gas prices, when the router was given derived data. The read lock is
+    /// released before returning.
+    async fn snapshot_token_prices(&self) -> Option<Arc<TokenGasPrices>> {
+        let derived_data = self.derived_data.as_ref()?;
+        derived_data
+            .read()
+            .await
+            .token_prices_shared()
     }
 
     /// Returns the number of registered solver pools.
@@ -645,10 +657,7 @@ impl WorkerPoolRouter {
         // `combine_with_surplus`, so the fallbacks are preserved. If the public worker pools find
         // nothing, that ranking is the `NoRouteFound` placeholder. The exclusive candidate then
         // uses a default fee.
-        let derived_data = self.read_derived_data().await;
-        let token_prices = derived_data
-            .as_deref()
-            .and_then(DerivedData::token_prices);
+        let token_prices = self.snapshot_token_prices().await;
         let ranked_quotes: Vec<Vec<OrderQuote>> = order_responses
             .iter()
             .zip(&allocations)
@@ -664,14 +673,13 @@ impl WorkerPoolRouter {
                         request.options(),
                         public_ranked,
                         *USER_IMPROVEMENT_SHARE_BPS,
-                        token_prices,
+                        token_prices.as_deref(),
                     )
                 } else {
                     self.rank_quotes(responses, request.options())
                 }
             })
             .collect();
-        drop(derived_data);
 
         // `join_all` preserves input order, so orders and responses line up one to one
         for (order, responses) in request
@@ -705,7 +713,7 @@ impl WorkerPoolRouter {
             _ => ranked_quotes,
         };
 
-        RankedQuotes::started_at(ranked_per_order, start)
+        RankedQuotes::started_at(ranked_per_order, start, token_prices)
     }
 
     /// Returns a quote by fanning out to the worker pools that serve the request.
@@ -729,6 +737,7 @@ impl WorkerPoolRouter {
     ) -> Result<Quote, SolveError> {
         let ranked = self.solve(&request, access).await?;
         let started = ranked.started();
+        let token_prices = ranked.token_prices();
         let order_quotes = match request.options().encoding_options() {
             Some(encoding_options) => {
                 let encoded = encode_quotes(
@@ -743,11 +752,11 @@ impl WorkerPoolRouter {
             }
             None => ranked.into_best(),
         };
-        let derived_data = self.read_derived_data().await;
-        let token_prices = derived_data
-            .as_deref()
-            .and_then(DerivedData::token_prices);
-        Ok(finalize_quote(order_quotes, started.elapsed().as_millis() as u64, token_prices))
+        Ok(finalize_quote(
+            order_quotes,
+            started.elapsed().as_millis() as u64,
+            token_prices.as_deref(),
+        ))
     }
 
     /// The encoder this router uses for [`Self::quote`].
