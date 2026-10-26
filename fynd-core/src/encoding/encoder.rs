@@ -886,11 +886,14 @@ impl Encoder {
                 bytes_to_address(fee.receiver())?,
                 biguint_to_u256(fee.max_contribution()),
                 U256::from(fee.deadline()),
-                // Pad to 65 bytes so the ABI encoding always reserves room for
-                // the client to patch the real EIP-712 signature after signing.
+                // Pad a shorter signature to 65 bytes, so the calldata reserves room for the
+                // client to patch an ECDSA signature in after signing. A longer one is an ERC-1271
+                // contract signature and is kept whole.
                 {
                     let mut sig = fee.signature().to_vec();
-                    sig.resize(65, 0);
+                    if sig.len() < 65 {
+                        sig.resize(65, 0);
+                    }
                     sig
                 },
             )
@@ -2242,6 +2245,36 @@ mod tests {
             let mut calldata = tx.data().to_vec();
             calldata[offset..offset + 65].copy_from_slice(&real_sig);
             assert_eq!(&calldata[offset..offset + 65], &real_sig[..]);
+        }
+
+        #[tokio::test]
+        async fn test_encode_with_contract_signature() {
+            let encoder = real_encoder();
+            let contract_sig = vec![0xAB; 130];
+            let quote = make_order_quote(990)
+                .with_route(make_route_with_tokens(&[(make_address(0x01), make_address(0x02))]));
+            let client_fee = crate::ClientFeeParams::new(
+                100,
+                Bytes::from(make_address(0xBB).as_ref()),
+                BigUint::from(0u64),
+                1_893_456_000u64,
+                Bytes::from(contract_sig.clone()),
+            );
+            let opts = EncodingOptions::new(0.01).with_client_fee_params(client_fee);
+
+            let result = encoder
+                .encode(vec![quote], opts)
+                .await
+                .unwrap();
+
+            let tx = result[0].transaction().unwrap();
+            let offset = tx
+                .client_fee_signature_offset()
+                .unwrap();
+            let calldata = tx.data();
+            let length_word = U256::from_be_slice(&calldata[offset - 32..offset]);
+            assert_eq!(length_word, U256::from(contract_sig.len()));
+            assert_eq!(&calldata[offset..offset + contract_sig.len()], &contract_sig[..]);
         }
     }
 

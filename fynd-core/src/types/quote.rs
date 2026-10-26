@@ -468,7 +468,8 @@ pub struct ClientFeeParams {
     max_contribution: BigUint,
     /// Unix timestamp after which the signature is invalid.
     deadline: u64,
-    /// 65-byte EIP-712 ECDSA signature by `receiver`.
+    /// EIP-712 signature by `receiver`: a 65-byte ECDSA signature, or an ERC-1271 contract
+    /// signature of any length.
     signature: Bytes,
 }
 
