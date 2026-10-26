@@ -28,8 +28,8 @@ use crate::{
 };
 
 /// Replaces one swap or a segment of a sell order's route with one swap through an exclusive
-/// component, or splits one swap between its pool and the exclusive component. It keeps a
-/// replacement only when the net amount out rises and the route can commit to a price.
+/// component, or splits one swap or a segment between its swaps and the exclusive component. It
+/// keeps a replacement only when the net amount out rises and the route can commit to a price.
 ///
 /// The route gets at most one exclusive leg, and a route that already has one does not change. It
 /// acts only on a `public_only` pool, for a request with exclusive access: a pool that includes
@@ -90,8 +90,8 @@ impl RoutePostProcessor for ExclusiveSwapReplacer {
     }
 }
 
-/// Replaces a target with one swap through an exclusive component, or splits a swap between its
-/// pool and the exclusive component.
+/// Replaces a target with one swap through an exclusive component, or splits a target, one swap or
+/// a segment, between its swaps and the exclusive component.
 struct ExclusiveReplacementFinder;
 
 impl ReplacementFinder for ExclusiveReplacementFinder {
@@ -170,42 +170,60 @@ const SPLIT_SEARCH_STEPS: usize = 8;
 /// The ratio of the golden section: `1 / phi`.
 const GOLDEN_RATIO_INVERSE: f64 = 0.618_033_988_749_895;
 
-/// The part of the balance of the input token that the original swap of a split search holds.
-#[derive(Clone, Copy)]
-enum TargetSplit {
-    /// The original swap holds this split of the input token balance.
-    Fixed(f64),
-    /// The original swap takes what remains of the input token balance, worth this split.
-    Remainder(f64),
+/// A swap of the target that takes `token_in` of the target, with its split in the route.
+struct EntrySwap {
+    /// The position of the swap in `SplitSearcher::split_swaps`.
+    index: usize,
+    /// The split of the swap in the route; `0.0` takes what remains of the balance.
+    split: f64,
 }
 
-impl TargetSplit {
-    fn value(self) -> f64 {
-        match self {
-            Self::Fixed(split) | Self::Remainder(split) => split,
+/// The part of the balance of the target's input token that the entry swaps hold: the sum of their
+/// splits, or what the swaps outside the target leave when one of them takes the remainder.
+fn entries_share(entries: &[EntrySwap], target: &ReplacementTarget, route_swaps: &[Swap]) -> f64 {
+    if entries
+        .iter()
+        .all(|entry| entry.split > 0.0)
+    {
+        let mut share = 0.0;
+        for entry in entries {
+            share += entry.split;
+        }
+        return share;
+    }
+    let mut others = 0.0;
+    for (position, route_swap) in route_swaps.iter().enumerate() {
+        if !target.replaced.contains(&position) && *route_swap.token_in() == target.token_in {
+            others += *route_swap.split();
         }
     }
+    1.0 - others
 }
 
-/// Finds the share of a swap that the exclusive pool should take. It assumes the net amount out has
-/// one peak over the exclusive fraction, and it counts a fraction that the exclusive component
-/// cannot fill as the lowest value.
+/// Finds the share of a target that the exclusive pool should take. The target is one swap or a
+/// segment: the exclusive swap takes a fraction of the share of the input token that the target
+/// holds, and the swaps of the target keep the rest. It assumes the net amount out has one peak
+/// over the exclusive fraction, and it counts a fraction that the exclusive component cannot fill
+/// as the lowest value.
 struct SplitSearcher<'a> {
     target: &'a ReplacementTarget,
     swaps: &'a [Swap],
     evaluator: &'a RouteEvaluator<'a>,
-    /// The exclusive swap, then the original swap with the token pair of the target.
-    split_swaps: [Swap; 2],
-    target_split: TargetSplit,
+    /// The exclusive swap, then the swaps of the target in route order.
+    split_swaps: Vec<Swap>,
+    /// The swaps of the target that take the input token of the target.
+    entries: Vec<EntrySwap>,
+    /// The part of the input token balance that the target holds.
+    share: f64,
     /// The candidate with the best net amount out so far, above `floor`.
     best: Option<CandidateRoute>,
     floor: &'a BigInt,
 }
 
 impl<'a> SplitSearcher<'a> {
-    /// Prepares a split search for the route swap at the single position of `target`, with `swap`
-    /// as the exclusive swap. `None` when the target is a segment or the original swap holds no
-    /// part of the input token balance. A split must have a net amount out above `floor`.
+    /// Prepares a split search for `target`, with `swap` as the exclusive swap. `None` when the
+    /// target holds no part of the input token balance. A split must have a net amount out above
+    /// `floor`.
     fn new(
         swap: &Swap,
         target: &'a ReplacementTarget,
@@ -213,32 +231,26 @@ impl<'a> SplitSearcher<'a> {
         evaluator: &'a RouteEvaluator<'a>,
         floor: &'a BigInt,
     ) -> Option<Self> {
-        let [position] = target.replaced.as_slice() else {
-            return None;
-        };
-        let original = route_swaps.get(*position)?;
-        let target_split = if *original.split() <= 0.0 {
-            let others: f64 = route_swaps
-                .iter()
-                .enumerate()
-                .filter(|(other, route_swap)| {
-                    other != position && route_swap.token_in() == original.token_in()
-                })
-                .map(|(_, route_swap)| *route_swap.split())
-                .sum();
-            TargetSplit::Remainder(1.0 - others)
-        } else {
-            TargetSplit::Fixed(*original.split())
-        };
-        if target_split.value() <= 0.0 {
+        let mut split_swaps = vec![swap.clone()];
+        let mut entries = Vec::new();
+        for position in &target.replaced {
+            let original = route_swaps.get(*position)?;
+            if *original.token_in() == target.token_in {
+                entries.push(EntrySwap { index: split_swaps.len(), split: *original.split() });
+            }
+            split_swaps.push(original.clone());
+        }
+        let share = entries_share(&entries, target, route_swaps);
+        if share <= 0.0 {
             return None;
         }
         Some(Self {
             target,
             swaps: route_swaps,
             evaluator,
-            split_swaps: [swap.clone(), original.clone()],
-            target_split,
+            split_swaps,
+            entries,
+            share,
             best: None,
             floor,
         })
@@ -291,18 +303,29 @@ impl<'a> SplitSearcher<'a> {
         Some(net_amount_out)
     }
 
-    /// Gives the exclusive swap the fraction `exclusive_fraction` of the target split. The
-    /// original swap keeps the rest, or takes the remainder when it did before.
+    /// Gives the exclusive swap the fraction `exclusive_fraction` of the share of the target. Each
+    /// entry swap keeps the rest of its split, or takes the remainder when it did before. Swaps
+    /// after the entry swaps keep their splits: they route what reaches them.
     fn retarget_split_swaps(&mut self, exclusive_fraction: f64) {
         let (token_in, token_out) = (&self.target.token_in, &self.target.token_out);
-        let target_split = self.target_split.value();
-        let original_split = match self.target_split {
-            TargetSplit::Fixed(_) => target_split * (1.0 - exclusive_fraction),
-            TargetSplit::Remainder(_) => 0.0,
-        };
-        let [exclusive, original] = &mut self.split_swaps;
-        exclusive.retarget(token_in.clone(), token_out.clone(), target_split * exclusive_fraction);
-        original.retarget(token_in.clone(), token_out.clone(), original_split);
+        if let Some(exclusive) = self.split_swaps.first_mut() {
+            exclusive.retarget(
+                token_in.clone(),
+                token_out.clone(),
+                self.share * exclusive_fraction,
+            );
+        }
+        for entry in &self.entries {
+            if entry.split <= 0.0 {
+                continue;
+            }
+            let Some(original) = self.split_swaps.get_mut(entry.index) else {
+                continue;
+            };
+            let (original_in, original_out) =
+                (original.token_in().clone(), original.token_out().clone());
+            original.retarget(original_in, original_out, entry.split * (1.0 - exclusive_fraction));
+        }
     }
 }
 
