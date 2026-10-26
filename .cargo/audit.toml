@@ -11,9 +11,17 @@
 # script unpacks the pinned Swagger UI release with its own loop and never calls extract().
 # utoipa-swagger-ui 10.0.1 still requires zip ^8.6. Upstream moved to zip 9 in
 # https://github.com/juhaku/utoipa/pull/1645; drop these once that is released and we upgrade.
+#
+# RUSTSEC-2026-0387: crypto-bigint <0.7.6 may branch on secret values in subtraction, division
+# and Montgomery multiplication. Dep chain: alloy-signer <- elliptic-curve 0.13 / k256 0.13 <-
+# crypto-bigint ^0.5. k256's scalar arithmetic uses it, so signing with the controller key is in
+# scope; exploiting it needs fine-grained timing of the signing process. There is no patched 0.5
+# release, and alloy 2.5.0 still requires elliptic-curve 0.13. Drop this once alloy moves to
+# elliptic-curve 0.14.
 ignore = [
     "RUSTSEC-2025-0055",
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0387",
 ]
