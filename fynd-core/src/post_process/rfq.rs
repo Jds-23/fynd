@@ -171,7 +171,7 @@ mod tests {
         add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(3.0).with_gas(10)).await;
         let replacer = replacer(&market).await;
 
-        let out = replaced(
+        let replaced_route = replaced(
             run(
                 &replacer,
                 &market,
@@ -182,12 +182,12 @@ mod tests {
             .await,
         );
 
-        assert_eq!(component_ids(&out), ["rfq_ab", "bc"]);
-        let swaps = out.route().swaps();
+        assert_eq!(component_ids(&replaced_route), ["rfq_ab", "bc"]);
+        let swaps = replaced_route.route().swaps();
         assert_eq!(swaps[0].amount_out(), &BigUint::from(3000u64));
         assert_eq!(swaps[1].amount_in(), &BigUint::from(3000u64));
         assert_eq!(swaps[1].amount_out(), &BigUint::from(6000u64));
-        assert_eq!(out.net_amount_out(), &BigInt::from(5980));
+        assert_eq!(replaced_route.net_amount_out(), &BigInt::from(5980));
     }
 
     #[tokio::test]
@@ -197,7 +197,7 @@ mod tests {
         add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(1.5).with_gas(10)).await;
         let replacer = replacer(&market).await;
 
-        let out = run(
+        let replacement = run(
             &replacer,
             &market,
             &sell_order(&a, &c),
@@ -206,7 +206,7 @@ mod tests {
         )
         .await;
 
-        assert!(out.is_none());
+        assert!(replacement.is_none());
     }
 
     #[tokio::test]
@@ -216,7 +216,7 @@ mod tests {
         add_rfq(&market, "rfq_ac", &[&a, &c], MockProtocolSim::new(5.0).with_gas(5)).await;
         let replacer = replacer(&market).await;
 
-        let out = replaced(
+        let replaced_route = replaced(
             run(
                 &replacer,
                 &market,
@@ -227,9 +227,9 @@ mod tests {
             .await,
         );
 
-        assert_eq!(component_ids(&out), ["rfq_ac"]);
-        assert_eq!(out.route().swaps()[0].amount_out(), &BigUint::from(5000u64));
-        assert_eq!(out.net_amount_out(), &BigInt::from(4995));
+        assert_eq!(component_ids(&replaced_route), ["rfq_ac"]);
+        assert_eq!(replaced_route.route().swaps()[0].amount_out(), &BigUint::from(5000u64));
+        assert_eq!(replaced_route.net_amount_out(), &BigInt::from(4995));
     }
 
     fn split_route() -> RouteResult {
@@ -250,7 +250,7 @@ mod tests {
         add_rfq(&market, "rfq_ab", &[&a, &b], MockProtocolSim::new(3.0).with_gas(10)).await;
         let replacer = replacer(&market).await;
 
-        let out = replaced(
+        let replaced_route = replaced(
             run(
                 &replacer,
                 &market,
@@ -261,9 +261,9 @@ mod tests {
             .await,
         );
 
-        assert_eq!(component_ids(&out), ["rfq_ab"]);
-        assert_eq!(out.route().swaps()[0].amount_in(), &BigUint::from(1000u64));
-        assert_eq!(out.net_amount_out(), &BigInt::from(2990));
+        assert_eq!(component_ids(&replaced_route), ["rfq_ab"]);
+        assert_eq!(replaced_route.route().swaps()[0].amount_in(), &BigUint::from(1000u64));
+        assert_eq!(replaced_route.net_amount_out(), &BigInt::from(2990));
     }
 
     #[tokio::test]
@@ -276,7 +276,7 @@ mod tests {
         add_rfq(&market, "rfq_ab", &[&a, &b], limited).await;
         let replacer = replacer(&market).await;
 
-        let out = replaced(
+        let replaced_route = replaced(
             run(
                 &replacer,
                 &market,
@@ -287,12 +287,12 @@ mod tests {
             .await,
         );
 
-        assert_eq!(component_ids(&out), ["rfq_ab", "p2"]);
-        let swaps = out.route().swaps();
+        assert_eq!(component_ids(&replaced_route), ["rfq_ab", "p2"]);
+        let swaps = replaced_route.route().swaps();
         assert_eq!(*swaps[0].split(), 0.6);
         assert_eq!(swaps[0].amount_out(), &BigUint::from(1800u64));
         assert_eq!(swaps[1].amount_out(), &BigUint::from(800u64));
-        assert_eq!(out.net_amount_out(), &BigInt::from(2580));
+        assert_eq!(replaced_route.net_amount_out(), &BigInt::from(2580));
     }
 
     #[tokio::test]
@@ -303,10 +303,10 @@ mod tests {
         let replacer = replacer(&market).await;
         let exclusions = RouteExclusions::default().with_pools(["rfq_ab".to_string()]);
 
-        let out =
+        let replacement =
             run(&replacer, &market, &sell_order(&a, &c), &exclusions, sequential_route()).await;
 
-        assert!(out.is_none());
+        assert!(replacement.is_none());
     }
 
     #[tokio::test]
@@ -321,7 +321,7 @@ mod tests {
             .await
             .expect("adding an RFQ component");
 
-        let out = replaced(
+        let replaced_route = replaced(
             run(
                 &replacer,
                 &market,
@@ -331,7 +331,7 @@ mod tests {
             )
             .await,
         );
-        assert_eq!(component_ids(&out), ["rfq_ab", "bc"]);
+        assert_eq!(component_ids(&replaced_route), ["rfq_ab", "bc"]);
     }
 
     #[tokio::test]
@@ -351,7 +351,7 @@ mod tests {
             .await
             .expect("removing an RFQ component");
 
-        let out = run(
+        let replacement = run(
             &replacer,
             &market,
             &sell_order(&a, &c),
@@ -359,7 +359,7 @@ mod tests {
             sequential_route(),
         )
         .await;
-        assert!(out.is_none());
+        assert!(replacement.is_none());
     }
 
     #[tokio::test]
@@ -381,7 +381,7 @@ mod tests {
             .await
             .expect("adding a non-RFQ component");
 
-        let out = run(
+        let replacement = run(
             &replacer,
             &market,
             &sell_order(&a, &c),
@@ -389,7 +389,7 @@ mod tests {
             sequential_route(),
         )
         .await;
-        assert!(out.is_none());
+        assert!(replacement.is_none());
     }
 
     #[tokio::test]
@@ -404,7 +404,7 @@ mod tests {
             .await
             .expect("an event before initialize");
 
-        let out = run(
+        let replacement = run(
             &replacer,
             &market,
             &sell_order(&a, &c),
@@ -412,7 +412,7 @@ mod tests {
             sequential_route(),
         )
         .await;
-        assert!(out.is_none());
+        assert!(replacement.is_none());
     }
 
     #[rstest]
@@ -426,16 +426,16 @@ mod tests {
         let replacer = replacer(&market).await;
         let route = result(vec![swap("ab", (&a, &b), (1000, 2000), 0.0, 2.0)], &[&a, &b]);
 
-        let out =
+        let replacement =
             run(&replacer, &market, &sell_order(&a, &b), &RouteExclusions::default(), route).await;
 
         match expected_net {
             Some(net) => {
-                let out = replaced(out);
-                assert_eq!(component_ids(&out), ["rfq_ab"]);
-                assert_eq!(out.net_amount_out(), &BigInt::from(net));
+                let replaced_route = replaced(replacement);
+                assert_eq!(component_ids(&replaced_route), ["rfq_ab"]);
+                assert_eq!(replaced_route.net_amount_out(), &BigInt::from(net));
             }
-            None => assert!(out.is_none()),
+            None => assert!(replacement.is_none()),
         }
     }
 
@@ -447,7 +447,7 @@ mod tests {
         add_rfq(&market, "rfq_bc", &[&b, &c], MockProtocolSim::new(3.0).with_gas(10)).await;
         let replacer = replacer(&market).await;
 
-        let out = replaced(
+        let replaced_route = replaced(
             run(
                 &replacer,
                 &market,
@@ -458,12 +458,12 @@ mod tests {
             .await,
         );
 
-        assert_eq!(component_ids(&out), ["rfq_ab", "rfq_bc"]);
-        let swaps = out.route().swaps();
+        assert_eq!(component_ids(&replaced_route), ["rfq_ab", "rfq_bc"]);
+        let swaps = replaced_route.route().swaps();
         assert_eq!(swaps[0].amount_out(), &BigUint::from(3000u64));
         assert_eq!(swaps[1].amount_in(), &BigUint::from(3000u64));
         assert_eq!(swaps[1].amount_out(), &BigUint::from(9000u64));
-        assert_eq!(out.net_amount_out(), &BigInt::from(8980));
+        assert_eq!(replaced_route.net_amount_out(), &BigInt::from(8980));
     }
 
     #[tokio::test]
@@ -473,7 +473,7 @@ mod tests {
         add_rfq(&market, "rfq_abc", &[&a, &b, &c], MockProtocolSim::new(3.0).with_gas(10)).await;
         let replacer = replacer(&market).await;
 
-        let out = replaced(
+        let replaced_route = replaced(
             run(
                 &replacer,
                 &market,
@@ -484,7 +484,7 @@ mod tests {
             .await,
         );
 
-        assert_eq!(component_ids(&out), ["rfq_abc", "bc"]);
+        assert_eq!(component_ids(&replaced_route), ["rfq_abc", "bc"]);
     }
 
     #[tokio::test]
@@ -499,11 +499,11 @@ mod tests {
         let request =
             PostProcessRequest::new(&order, &market, &derived, &exclusions, Instant::now());
 
-        let out = replacer
+        let replacement = replacer
             .process(&request, &sequential_route())
             .await;
 
-        assert!(out.is_none());
+        assert!(replacement.is_none());
     }
 
     #[tokio::test]
@@ -520,11 +520,11 @@ mod tests {
             PostProcessRequest::new(&order, &market, &derived, &exclusions, far_deadline())
                 .with_label(Some(&label));
 
-        let out = replacer
+        let replacement = replacer
             .process(&request, &sequential_route())
             .await;
 
-        assert!(out.is_none());
+        assert!(replacement.is_none());
     }
 
     #[tokio::test]
@@ -547,10 +547,10 @@ mod tests {
         let route = Route::new(vec![free], [(a.address.clone(), a.clone())]).expect("one swap");
         let route = RouteResult::new(route, BigInt::from(2000), BigUint::from(1u64));
 
-        let out =
+        let replacement =
             run(&replacer, &market, &sell_order(&a, &b), &RouteExclusions::default(), route).await;
 
-        assert!(out.is_none());
+        assert!(replacement.is_none());
     }
 
     /// Only a protocol that fills partially replaces a swap after the sell token.
@@ -575,7 +575,7 @@ mod tests {
             .await;
         let replacer = replacer(&market).await;
 
-        let out = run(
+        let replacement = run(
             &replacer,
             &market,
             &sell_order(&a, &c),
@@ -584,7 +584,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(replaced_ids(&out), expected);
+        assert_eq!(replaced_ids(&replacement), expected);
     }
 
     #[tokio::test]
@@ -595,7 +595,7 @@ mod tests {
         add_rfq(&market, "rfq_2", &[&a, &b], MockProtocolSim::new(2.5).with_gas(10)).await;
         let replacer = replacer(&market).await;
 
-        let out = replaced(
+        let replaced_route = replaced(
             run(
                 &replacer,
                 &market,
@@ -606,7 +606,7 @@ mod tests {
             .await,
         );
 
-        assert_eq!(component_ids(&out), ["rfq_1", "bc"]);
+        assert_eq!(component_ids(&replaced_route), ["rfq_1", "bc"]);
     }
 
     #[tokio::test]
@@ -623,11 +623,11 @@ mod tests {
             PostProcessRequest::new(&order, &market, &derived, &exclusions, far_deadline())
                 .with_pool_drops(&drops);
 
-        let out = replacer
+        let replacement = replacer
             .process(&request, &sequential_route())
             .await;
 
-        assert!(out.is_none());
+        assert!(replacement.is_none());
     }
 
     #[tokio::test]
@@ -638,10 +638,10 @@ mod tests {
         let replacer = replacer(&market).await;
         let stale = result(vec![swap("ab", (&a, &b), (1000, 1500), 0.0, 2.0)], &[&a, &b]);
 
-        let out =
+        let replacement =
             run(&replacer, &market, &sell_order(&a, &b), &RouteExclusions::default(), stale).await;
 
-        assert!(out.is_none());
+        assert!(replacement.is_none());
     }
 
     /// The original route claims a net above what a new simulation gives, so a replacement that
@@ -654,10 +654,10 @@ mod tests {
         let replacer = replacer(&market).await;
         let optimistic = result(vec![swap("ab", (&a, &b), (1000, 2500), 0.0, 2.0)], &[&a, &b]);
 
-        let out =
+        let replacement =
             run(&replacer, &market, &sell_order(&a, &b), &RouteExclusions::default(), optimistic)
                 .await;
 
-        assert!(out.is_none());
+        assert!(replacement.is_none());
     }
 }
