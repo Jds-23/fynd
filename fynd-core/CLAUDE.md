@@ -302,7 +302,7 @@ not counted.
 
 Two gauges report what the overlay is worth, in whole gas tokens: `exclusive_fee_amount` (LP fee
 capture) and `exclusive_user_savings_amount` (user improvement over the public reference).
-`to_gas_token_amount` converts without a price lookup — the quote states its gas cost both in wei
+`to_gas_token_wei` converts without a price lookup — the quote states its gas cost both in wei
 (`gas_estimate * gas_price`) and in output-token units (`amount_out - amount_out_net_gas`), so that
 pair is the rate. An unpriced output token increments `exclusive_unpriced_output_total` instead.
 

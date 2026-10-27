@@ -81,7 +81,7 @@ pub(crate) fn leg_route_output(
     if leg.token_out() == output_token {
         return Some((leg.amount_out().clone(), BigUint::from(1u8)));
     }
-    let consumed = consumed_amount(swaps, leg.token_out());
+    let consumed = total_amount_in_for_token(swaps, leg.token_out());
     if consumed == BigUint::ZERO {
         return Some((BigUint::ZERO, BigUint::from(1u8)));
     }
@@ -112,7 +112,7 @@ fn token_route_output(
         let (swap_numerator, swap_denominator) = if swap.token_out() == output_token {
             (swap.amount_out().clone(), BigUint::from(1u8))
         } else {
-            let consumed = consumed_amount(swaps, swap.token_out());
+            let consumed = total_amount_in_for_token(swaps, swap.token_out());
             let (next_numerator, next_denominator) =
                 token_route_output(swaps, swap.token_out(), output_token, path)?;
             (swap.amount_out() * next_numerator, next_denominator * consumed)
@@ -129,7 +129,7 @@ fn token_route_output(
 }
 
 /// Returns how much of `token` the route's swaps take in.
-fn consumed_amount(swaps: &[Swap], token: &Address) -> BigUint {
+fn total_amount_in_for_token(swaps: &[Swap], token: &Address) -> BigUint {
     swaps
         .iter()
         .filter(|swap| swap.token_in() == token)
@@ -187,7 +187,7 @@ fn parse_user_improvement_share_bps(raw: &str) -> Option<u32> {
 /// Rounded up, so a share that would otherwise round away still moves the price in the user's
 /// favour. Never exceeds `improvement`, so the commitment it feeds stays within what the route
 /// produces.
-fn user_margin(improvement: &BigUint, user_share_bps: u32) -> BigUint {
+fn user_improvement_amount(improvement: &BigUint, user_share_bps: u32) -> BigUint {
     let denominator = BigUint::from(bps::DENOMINATOR);
     (improvement * BigUint::from(user_share_bps) + (&denominator - 1u32)) / denominator
 }
@@ -217,13 +217,14 @@ pub(crate) fn matched_commitment(
     user_share_bps: u32,
 ) -> Option<BigUint> {
     // The candidate route must match the public reference net-of-gas; anything it produces on
-    // top is the improvement, of which the user keeps a share (the margin).
+    // top is the improvement, of which the user keeps a share (the user improvement amount).
     let public_net_amount_out = public_reference.amount_out_net_gas;
     if exclusive_candidate.amount_out_net_gas < public_net_amount_out {
         return None;
     }
     let improvement = exclusive_candidate.amount_out_net_gas - public_net_amount_out;
-    let required_net_amount_out = public_net_amount_out + user_margin(&improvement, user_share_bps);
+    let required_net_amount_out =
+        public_net_amount_out + user_improvement_amount(&improvement, user_share_bps);
 
     // Exact-in assumption: everything below compares and commits output amounts. For exact-out
     // orders this comparison would have to run on amount_in instead (see function docs).
@@ -301,15 +302,16 @@ pub(crate) fn pin_commitment(
                 // user gets at least the committed amount when those pools give less per unit
                 // as their input grows. A leg that outputs the route's output token converts at
                 // a price of exactly 1.
-                let captured_leg = &captured * swap.amount_out() * denominator / numerator;
+                let captured_swap_amount_out =
+                    &captured * swap.amount_out() * denominator / numerator;
                 debug_assert!(
-                    captured_leg <= *swap.amount_out(),
-                    "captured amount ({captured_leg}) must not exceed the leg's output ({})",
+                    captured_swap_amount_out <= *swap.amount_out(),
+                    "captured amount ({captured_swap_amount_out}) must not exceed the leg's output ({})",
                     swap.amount_out(),
                 );
-                let committed_leg = swap.amount_out() - &captured_leg;
+                let committed_swap_amount_out = swap.amount_out() - &captured_swap_amount_out;
                 surplus -= captured;
-                swap.set_committed_amount_out(committed_leg);
+                swap.set_committed_amount_out(committed_swap_amount_out);
             }
         }
     }
@@ -351,7 +353,7 @@ pub(crate) fn pin_route_commitment(
 /// The rate is the derived gas price of the quote's output token, so it does not depend on how the
 /// algorithm netted gas off the quote. `None` when there are no prices, the output token has none,
 /// or either side of its price is zero.
-pub(crate) fn to_gas_token_amount(
+pub(crate) fn to_gas_token_wei(
     quote: &OrderQuote,
     amount: &BigUint,
     token_prices: Option<&TokenGasPrices>,
@@ -375,11 +377,11 @@ pub(crate) fn record_gas_token_amount(
     amount: &BigUint,
     token_prices: Option<&TokenGasPrices>,
 ) {
-    let Some(gas_token_amount) = to_gas_token_amount(quote, amount, token_prices) else {
+    let Some(gas_token_wei) = to_gas_token_wei(quote, amount, token_prices) else {
         counter!("exclusive_unpriced_output_total").increment(1);
         return;
     };
-    gauge!(metric).increment(gas_token_amount.to_f64().unwrap_or(0.0) / WEI_PER_GAS_TOKEN);
+    gauge!(metric).increment(gas_token_wei.to_f64().unwrap_or(0.0) / WEI_PER_GAS_TOKEN);
 }
 
 #[cfg(test)]

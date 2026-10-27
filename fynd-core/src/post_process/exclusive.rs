@@ -661,7 +661,7 @@ mod tests {
     }
 
     /// The total amount in of the swaps that start at `token`.
-    fn amount_in_of(result: &RouteResult, token: &Token) -> BigUint {
+    fn total_amount_in_for_token(result: &RouteResult, token: &Token) -> BigUint {
         result
             .route()
             .swaps()
@@ -698,7 +698,7 @@ mod tests {
 
         assert_eq!(component_ids(&out), ["excl_ab", "ab"]);
         assert_eq!(splits_of(&out), [0.14589803375031532, 0.0]);
-        assert_eq!(amount_in_of(&out, &a), BigUint::from(1000u64));
+        assert_eq!(total_amount_in_for_token(&out, &a), BigUint::from(1000u64));
         // The original route's net amount out is 1970. The exclusive pool alone gives 1250 minus
         // 10 gas.
         assert_eq!(out.net_amount_out(), &BigInt::from(1991));
@@ -719,7 +719,7 @@ mod tests {
 
         assert_eq!(component_ids(&out), ["excl_ab", "ab"]);
         assert_eq!(splits_of(&out), [0.4984471899924292, 0.0]);
-        assert_eq!(amount_in_of(&out, &a), BigUint::from(1000u64));
+        assert_eq!(total_amount_in_for_token(&out, &a), BigUint::from(1000u64));
         // The original route's net amount out is 1990. The split gives about 2500 minus 20 gas.
         assert_eq!(out.net_amount_out(), &BigInt::from(2478));
     }
@@ -743,7 +743,7 @@ mod tests {
 
         assert_eq!(component_ids(&out), ["excl_ab", "p1", "p2"]);
         assert_eq!(splits_of(&out), [0.1209756742506939, 0.4790243257493061, 0.0]);
-        assert_eq!(amount_in_of(&out, &a), BigUint::from(1000u64));
+        assert_eq!(total_amount_in_for_token(&out, &a), BigUint::from(1000u64));
         assert_eq!(out.net_amount_out(), &BigInt::from(1988));
         assert!(out.net_amount_out() > &original_net);
     }
@@ -767,7 +767,7 @@ mod tests {
 
         assert_eq!(component_ids(&out), ["p1", "excl_ab", "p2"]);
         assert_eq!(splits_of(&out), [0.6, 0.11671842700025233, 0.0]);
-        assert_eq!(amount_in_of(&out, &a), BigUint::from(1000u64));
+        assert_eq!(total_amount_in_for_token(&out, &a), BigUint::from(1000u64));
         assert_eq!(out.net_amount_out(), &BigInt::from(2595));
         assert!(out.net_amount_out() > &original_net);
     }
@@ -847,7 +847,7 @@ mod tests {
         assert!(exclusive > 0.0 && exclusive < 1.0);
         assert_eq!(splits[1..], [0.6 * (1.0 - exclusive), second_share * (1.0 - exclusive), 0.0]);
         // Fixed splits floor each part, so they may leave one unit of the order unspent.
-        let amount_in = amount_in_of(&out, &a);
+        let amount_in = total_amount_in_for_token(&out, &a);
         assert!(amount_in >= BigUint::from(999u64) && amount_in <= BigUint::from(1000u64));
         assert!(out.net_amount_out() > &original_net);
     }
@@ -875,9 +875,9 @@ mod tests {
         let splits = splits_of(&out);
         assert!(splits[0] > 0.0 && splits[0] < 1.0);
         assert_eq!(splits[1..], [0.0, 0.0]);
-        assert_eq!(amount_in_of(&out, &a), BigUint::from(1000u64));
+        assert_eq!(total_amount_in_for_token(&out, &a), BigUint::from(1000u64));
         assert_eq!(
-            amount_in_of(&out, &b),
+            total_amount_in_for_token(&out, &b),
             out.route().swaps()[1]
                 .amount_out()
                 .clone()

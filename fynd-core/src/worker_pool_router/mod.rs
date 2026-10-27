@@ -54,8 +54,8 @@ use crate::{
     encoding::encoder::Encoder,
     exclusive_route::{
         exclusive_route_shape, leg_route_output, matched_commitment, pin_commitment,
-        record_gas_token_amount, routes_through_exclusive, to_gas_token_amount,
-        ExclusiveRouteShape, RouteOutput, USER_IMPROVEMENT_SHARE_BPS, WEI_PER_GAS_TOKEN,
+        record_gas_token_amount, routes_through_exclusive, to_gas_token_wei, ExclusiveRouteShape,
+        RouteOutput, USER_IMPROVEMENT_SHARE_BPS, WEI_PER_GAS_TOKEN,
     },
     feed::{exclusivity::is_exclusive, protocol_registry::is_rfq_protocol},
     price_guard::guard::PriceGuard,
@@ -1266,7 +1266,7 @@ fn record_win(quote: &OrderQuote, token_prices: Option<&TokenGasPrices>) {
     )
     .increment(1);
 
-    let volume = to_gas_token_amount(quote, quote.amount_out(), token_prices)
+    let volume = to_gas_token_wei(quote, quote.amount_out(), token_prices)
         .and_then(|amount| amount.to_f64());
     let Some(volume) = volume else {
         counter!(
@@ -3397,6 +3397,7 @@ mod tests {
             &QuoteOptions::default(),
             public_ranked,
             1_000,
+            None,
         );
 
         let amounts: Vec<BigUint> = combined
@@ -4197,7 +4198,7 @@ mod tests {
     #[case::token_missing(Some(vec![(0x03, 2_000_000, 1_000_000_000_000_000)]), 100_000_000, None)]
     #[case::zero_numerator(Some(vec![(0x02, 0, 1_000_000_000_000_000)]), 100_000_000, None)]
     #[case::zero_denominator(Some(vec![(0x02, 2_000_000, 0)]), 100_000_000, None)]
-    fn test_to_gas_token_amount(
+    fn test_to_gas_token_wei(
         #[case] entries: Option<Vec<(u8, u64, u64)>>,
         #[case] amount: u64,
         #[case] expected: Option<u64>,
@@ -4207,17 +4208,17 @@ mod tests {
         // Gas netted at weight 0: the quote itself carries no rate.
         assert_eq!(quote.amount_out_net_gas(), quote.amount_out());
 
-        let wei = to_gas_token_amount(&quote, &BigUint::from(amount), prices.as_ref());
+        let wei = to_gas_token_wei(&quote, &BigUint::from(amount), prices.as_ref());
 
         assert_eq!(wei, expected.map(BigUint::from));
     }
 
     #[test]
-    fn test_to_gas_token_amount_without_route() {
+    fn test_to_gas_token_wei_without_route() {
         let quote = make_rate_quote(1_000, 1_000, 0);
         let prices = gas_prices(&[(0x02, 1, 1)]);
 
-        assert_eq!(to_gas_token_amount(&quote, &BigUint::from(1_000u64), Some(&prices)), None);
+        assert_eq!(to_gas_token_wei(&quote, &BigUint::from(1_000u64), Some(&prices)), None);
     }
 
     /// Runs `record_winning_protocols` and returns the payload of each line it wrote.
