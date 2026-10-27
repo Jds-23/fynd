@@ -189,7 +189,9 @@ fn slippage_bps(slippage: f64) -> u32 {
 }
 
 /// Fields of the tycho `Solution` a solution hook may change.
-const HOOK_MUTABLE_FIELDS: &[&str] = &["expected_amount_out"];
+/// `subsidy` carries signed subsidy terms the embedder attaches; tycho validates them when it
+/// encodes the solution.
+const HOOK_MUTABLE_FIELDS: &[&str] = &["expected_amount_out", "subsidy"];
 
 /// Returns the name of the first field outside `HOOK_MUTABLE_FIELDS` where `hooked` differs from
 /// `original`.
@@ -533,8 +535,8 @@ impl Encoder {
         Ok(PreparedSolution { solution, fee_breakdown, fee_rates })
     }
 
-    /// Runs `hook` and checks the `Solution` it returns: only `expected_amount_out` may change, and
-    /// it must stay at or above `min_amount_out`.
+    /// Runs `hook` and checks the `Solution` it returns: only the fields in `HOOK_MUTABLE_FIELDS`
+    /// may change, and `expected_amount_out` must stay at or above `min_amount_out`.
     fn apply_solution_hook(
         hook: &dyn SolutionHook,
         quote: &OrderQuote,
@@ -1222,13 +1224,13 @@ impl From<EncodingError> for SolveError {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address as EvmAddress, Bytes as EvmBytes, Signature};
+    use alloy::primitives::{Address as EvmAddress, Bytes as EvmBytes, Signature, B256};
     use num_bigint::BigUint;
     use rstest::rstest;
     use rustc_hash::FxHashMap;
     use tycho_execution::encoding::{
         errors::EncodingError,
-        models::{EncodedSolution, Solution},
+        models::{EncodedSolution, Solution, SubsidyTerms},
         tycho_encoder::TychoEncoder,
     };
     use tycho_simulation::tycho_core::{
@@ -3061,6 +3063,60 @@ mod tests {
             assert_eq!(result[0].status(), QuoteStatus::EncodingFailed);
             assert!(result[0].transaction().is_none());
             assert_eq!(*result[0].amount_out(), BigUint::from(990u64));
+        }
+
+        /// Attaches subsidy terms and raises the expected amount out by the subsidy.
+        #[derive(Debug)]
+        struct AttachSubsidy;
+
+        impl SolutionHook for AttachSubsidy {
+            fn apply(
+                &self,
+                _quote: &OrderQuote,
+                solution: Solution,
+            ) -> Result<Solution, SolveError> {
+                let amount = BigUint::from(5u64);
+                let raised = rebuilt_solution(
+                    &solution,
+                    solution.receiver().clone(),
+                    solution.expected_amount_out() + &amount,
+                    solution.min_amount_out().clone(),
+                );
+                Ok(raised.with_subsidy(SubsidyTerms {
+                    amount,
+                    min_amount_in: BigUint::from(1u64),
+                    nonce: B256::repeat_byte(0x11),
+                    deadline: 1_000,
+                    subsidized_swap_index: 0,
+                }))
+            }
+        }
+
+        #[test]
+        fn test_solution_hook_may_attach_subsidy() {
+            let address = |byte| Bytes::from(make_address(byte).as_ref());
+            let solution = Solution::new(
+                address(0xAA),
+                address(0xAA),
+                address(0x01),
+                address(0x02),
+                BigUint::from(1_000u64),
+                BigUint::from(990u64),
+                BigUint::from(980u64),
+                vec![],
+            );
+
+            let hooked =
+                Encoder::apply_solution_hook(&AttachSubsidy, &make_order_quote(990), solution)
+                    .expect("a hook may attach subsidy terms");
+
+            assert_eq!(
+                hooked
+                    .subsidy()
+                    .map(|terms| terms.amount.clone()),
+                Some(5u64.into())
+            );
+            assert_eq!(*hooked.expected_amount_out(), BigUint::from(995u64));
         }
 
         #[tokio::test]
