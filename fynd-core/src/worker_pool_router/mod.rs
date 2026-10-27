@@ -27,7 +27,7 @@ mod instrumentation;
 mod log_capture;
 
 use std::{
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
@@ -38,7 +38,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use instrumentation::record_quote_comparison;
 use metrics::{counter, gauge, histogram};
 use num_bigint::BigUint;
-use num_traits::{CheckedSub, ToPrimitive};
+use num_traits::ToPrimitive;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -50,6 +50,7 @@ use tycho_simulation::tycho_common::Bytes;
 
 use crate::{
     bps,
+    derived::{SharedDerivedDataRef, TokenGasPrices},
     encoding::encoder::Encoder,
     feed::{exclusivity::is_exclusive, protocol_registry::is_rfq_protocol},
     price_guard::guard::PriceGuard,
@@ -256,6 +257,8 @@ pub struct WorkerPoolRouter {
     price_guard: Option<PriceGuard>,
     /// Simulates encoded quotes when a request explicitly asks for it.
     simulator: Option<QuoteSimulator>,
+    /// Token gas prices that restate output-token amounts in the gas token for metrics.
+    derived_data: Option<SharedDerivedDataRef>,
 }
 
 /// Ranked, unencoded candidates for every order of a request — the output of
@@ -270,6 +273,7 @@ pub struct WorkerPoolRouter {
 pub struct RankedQuotes {
     per_order: Vec<Vec<OrderQuote>>,
     started: Instant,
+    token_prices: Option<Arc<TokenGasPrices>>,
 }
 
 impl RankedQuotes {
@@ -277,13 +281,13 @@ impl RankedQuotes {
     ///
     /// Every inner list must be non-empty — an order without a route is represented by a
     /// non-`Success` `OrderQuote` (e.g. `QuoteStatus::NoRouteFound`), not by an empty list, per
-    /// the invariant documented on this struct.
+    /// the invariant documented on this struct. Carries no token gas prices.
     ///
     /// # Errors
     ///
     /// Returns `Err(SolveError::Internal)` if any inner list is empty.
     pub fn new(per_order: Vec<Vec<OrderQuote>>) -> Result<Self, SolveError> {
-        Self::started_at(per_order, Instant::now())
+        Self::started_at(per_order, Instant::now(), None)
     }
 
     /// Wraps already-ranked candidates with an explicit start time, rejecting empty inner lists.
@@ -292,7 +296,11 @@ impl RankedQuotes {
     /// and [`Self::into_best`] cannot hit an empty list. [`WorkerPoolRouter::solve`] feeds it
     /// `rank_quotes` output, which always yields at least a `NoRouteFound`/`Timeout` placeholder
     /// per order, so the error path is unreachable there but stays checked rather than assumed.
-    fn started_at(per_order: Vec<Vec<OrderQuote>>, started: Instant) -> Result<Self, SolveError> {
+    fn started_at(
+        per_order: Vec<Vec<OrderQuote>>,
+        started: Instant,
+        token_prices: Option<Arc<TokenGasPrices>>,
+    ) -> Result<Self, SolveError> {
         for (index, candidates) in per_order.iter().enumerate() {
             if candidates.is_empty() {
                 return Err(SolveError::Internal(format!(
@@ -302,7 +310,7 @@ impl RankedQuotes {
                 )));
             }
         }
-        Ok(Self { per_order, started })
+        Ok(Self { per_order, started, token_prices })
     }
 
     /// Ranked candidates per order, best first.
@@ -331,6 +339,12 @@ impl RankedQuotes {
     #[must_use]
     pub fn started(&self) -> Instant {
         self.started
+    }
+
+    /// The token gas prices the ranking used; pass them to [`finalize_quote`].
+    #[must_use]
+    pub fn token_prices(&self) -> Option<Arc<TokenGasPrices>> {
+        self.token_prices.clone()
     }
 }
 
@@ -478,9 +492,16 @@ fn record_encoding_failures(quotes: &[OrderQuote], cut_off_orders: &[usize]) {
 /// ranking: the price guard can pick a lower-ranked fallback, the exclusive overlay replaces the
 /// head of the list, and a failed encoding moves to the next candidate without an RFQ leg. These
 /// are the quotes the caller receives.
-pub fn finalize_quote(order_quotes: Vec<OrderQuote>, solve_time_ms: u64) -> Quote {
+///
+/// `token_prices` are the derived token gas prices that restate each win's volume in the gas
+/// token; without them the wins count as unpriced.
+pub fn finalize_quote(
+    order_quotes: Vec<OrderQuote>,
+    solve_time_ms: u64,
+    token_prices: Option<&TokenGasPrices>,
+) -> Quote {
     for quote in &order_quotes {
-        record_win(quote);
+        record_win(quote, token_prices);
         instrumentation::record_winning_protocols(quote);
     }
 
@@ -498,7 +519,14 @@ impl WorkerPoolRouter {
         config: WorkerPoolRouterConfig,
         encoder: Encoder,
     ) -> Self {
-        Self { solver_pools, config, encoder, price_guard: None, simulator: None }
+        Self {
+            solver_pools,
+            config,
+            encoder,
+            price_guard: None,
+            simulator: None,
+            derived_data: None,
+        }
     }
 
     /// Makes price guard validation available for this router.
@@ -514,6 +542,22 @@ impl WorkerPoolRouter {
     pub fn with_simulator(mut self, simulator: QuoteSimulator) -> Self {
         self.simulator = Some(simulator);
         self
+    }
+
+    /// Makes the derived token gas prices available for this router's gas-token metrics.
+    pub fn with_derived_data(mut self, derived_data: SharedDerivedDataRef) -> Self {
+        self.derived_data = Some(derived_data);
+        self
+    }
+
+    /// The current token gas prices, when the router was given derived data. The read lock is
+    /// released before returning.
+    async fn snapshot_token_prices(&self) -> Option<Arc<TokenGasPrices>> {
+        let derived_data = self.derived_data.as_ref()?;
+        derived_data
+            .read()
+            .await
+            .token_prices_shared()
     }
 
     /// Returns the number of registered solver pools.
@@ -613,6 +657,7 @@ impl WorkerPoolRouter {
         // `combine_with_surplus`, so the fallbacks are preserved. If the public worker pools find
         // nothing, that ranking is the `NoRouteFound` placeholder. The exclusive candidate then
         // uses a default fee.
+        let token_prices = self.snapshot_token_prices().await;
         let ranked_quotes: Vec<Vec<OrderQuote>> = order_responses
             .iter()
             .zip(&allocations)
@@ -628,6 +673,7 @@ impl WorkerPoolRouter {
                         request.options(),
                         public_ranked,
                         *USER_IMPROVEMENT_SHARE_BPS,
+                        token_prices.as_deref(),
                     )
                 } else {
                     self.rank_quotes(responses, request.options())
@@ -667,7 +713,7 @@ impl WorkerPoolRouter {
             _ => ranked_quotes,
         };
 
-        RankedQuotes::started_at(ranked_per_order, start)
+        RankedQuotes::started_at(ranked_per_order, start, token_prices)
     }
 
     /// Returns a quote by fanning out to the worker pools that serve the request.
@@ -691,6 +737,7 @@ impl WorkerPoolRouter {
     ) -> Result<Quote, SolveError> {
         let ranked = self.solve(&request, access).await?;
         let started = ranked.started();
+        let token_prices = ranked.token_prices();
         let order_quotes = match request.options().encoding_options() {
             Some(encoding_options) => {
                 let encoded = encode_quotes(
@@ -705,7 +752,11 @@ impl WorkerPoolRouter {
             }
             None => ranked.into_best(),
         };
-        Ok(finalize_quote(order_quotes, started.elapsed().as_millis() as u64))
+        Ok(finalize_quote(
+            order_quotes,
+            started.elapsed().as_millis() as u64,
+            token_prices.as_deref(),
+        ))
     }
 
     /// The encoder this router uses for [`Self::quote`].
@@ -1162,6 +1213,7 @@ fn combine_with_surplus(
     options: &QuoteOptions,
     public_ranked: Vec<OrderQuote>,
     user_share_bps: u32,
+    token_prices: Option<&TokenGasPrices>,
 ) -> Vec<OrderQuote> {
     let Some(exclusive_candidate) = best_exclusive_candidate(responses, pool_scopes, options)
     else {
@@ -1191,28 +1243,32 @@ fn combine_with_surplus(
             "exclusive_user_savings_amount",
             exclusive_candidate,
             &user_savings,
+            token_prices,
         );
     }
 
     let mut result = Vec::with_capacity(public_ranked.len() + 1);
-    result.push(pin_commitment(exclusive_candidate, committed_amount_out));
+    result.push(pin_commitment(exclusive_candidate, committed_amount_out, token_prices));
     result.extend(public_ranked);
     result
 }
 
 /// Restates an output-token `amount` of `quote` in wei.
 ///
-/// The quote states its gas cost in both units, so that pair is the rate. `None` when either side
-/// is zero, which is how an unpriced output token shows up.
-fn to_gas_token_amount(quote: &OrderQuote, amount: &BigUint) -> Option<BigUint> {
-    let gas_cost_out = quote
-        .amount_out()
-        .checked_sub(quote.amount_out_net_gas())?;
-    let gas_cost_wei = quote.gas_estimate() * quote.gas_price()?;
-    if gas_cost_out == BigUint::ZERO || gas_cost_wei == BigUint::ZERO {
+/// The rate is the derived gas price of the quote's output token, so it does not depend on how the
+/// algorithm netted gas off the quote. `None` when there are no prices, the output token has none,
+/// or either side of its price is zero.
+fn to_gas_token_amount(
+    quote: &OrderQuote,
+    amount: &BigUint,
+    token_prices: Option<&TokenGasPrices>,
+) -> Option<BigUint> {
+    let output_token = quote.route()?.output_token()?;
+    let price = token_prices?.get(&output_token)?;
+    if price.numerator == BigUint::ZERO || price.denominator == BigUint::ZERO {
         return None;
     }
-    Some(amount * gas_cost_wei / gas_cost_out)
+    Some(amount * &price.denominator / &price.numerator)
 }
 
 /// Records the win and the settled volume of one quote the router returns, by pool, algorithm and
@@ -1220,16 +1276,17 @@ fn to_gas_token_amount(quote: &OrderQuote, amount: &BigUint) -> Option<BigUint> 
 ///
 /// Counting wins alone hides size: a solver can win few orders and still settle most of the flow,
 /// or the reverse. Output-token base units do not add up across tokens, so the amount is converted
-/// to the gas token first, the same way `record_gas_token_amount` does it. A quote the conversion
-/// cannot price counts under `worker_router_unpriced_won_quotes_total` rather than recording zero
-/// volume, which would read as a solver that won nothing.
+/// to the gas token first at the derived gas price of the output token, the same way
+/// `record_gas_token_amount` does it. A quote the conversion cannot price counts under
+/// `worker_router_unpriced_won_quotes_total` rather than recording zero volume, which would read
+/// as a solver that won nothing.
 ///
 /// The `post_processed_by` label joins the names of the post-processors that replaced the route
 /// with `+`, in config order. It is `none` when no post-processor replaced the route.
 ///
 /// A quote that found no route has no winner to credit. So has a quote the router built itself,
 /// which is why an empty worker pool is skipped rather than counted under a placeholder label.
-fn record_win(quote: &OrderQuote) {
+fn record_win(quote: &OrderQuote, token_prices: Option<&TokenGasPrices>) {
     if quote.status() != QuoteStatus::Success || quote.worker_pool().is_empty() {
         return;
     }
@@ -1247,7 +1304,8 @@ fn record_win(quote: &OrderQuote) {
     )
     .increment(1);
 
-    let volume = to_gas_token_amount(quote, quote.amount_out()).and_then(|amount| amount.to_f64());
+    let volume = to_gas_token_amount(quote, quote.amount_out(), token_prices)
+        .and_then(|amount| amount.to_f64());
     let Some(volume) = volume else {
         counter!(
             "worker_router_unpriced_won_quotes_total",
@@ -1269,11 +1327,16 @@ fn record_win(quote: &OrderQuote) {
 
 /// Records an output-token `amount` under `metric`, in whole gas tokens.
 ///
-/// Output-token base units are not summable across tokens, so a total over them means nothing. An
-/// amount with no rate increments `exclusive_unpriced_output_total`; a zero would read as "captured
-/// nothing".
-fn record_gas_token_amount(metric: &'static str, quote: &OrderQuote, amount: &BigUint) {
-    let Some(gas_token_amount) = to_gas_token_amount(quote, amount) else {
+/// Output-token base units are not summable across tokens, so a total over them means nothing. The
+/// rate is the derived gas price of the quote's output token. An amount with no rate increments
+/// `exclusive_unpriced_output_total`; a zero would read as "captured nothing".
+fn record_gas_token_amount(
+    metric: &'static str,
+    quote: &OrderQuote,
+    amount: &BigUint,
+    token_prices: Option<&TokenGasPrices>,
+) {
+    let Some(gas_token_amount) = to_gas_token_amount(quote, amount, token_prices) else {
         counter!("exclusive_unpriced_output_total").increment(1);
         return;
     };
@@ -1382,12 +1445,21 @@ fn default_fee_commitment(exclusive_candidate: &OrderQuote) -> Option<BigUint> {
 /// leg, sets `amount_out` and `amount_out_net_gas`, and attaches the `SurplusInfo`.
 ///
 /// The exclusive components capture all output above the commitment.
-fn pin_commitment(exclusive_candidate: &OrderQuote, committed_amount_out: BigUint) -> OrderQuote {
+fn pin_commitment(
+    exclusive_candidate: &OrderQuote,
+    committed_amount_out: BigUint,
+    token_prices: Option<&TokenGasPrices>,
+) -> OrderQuote {
     let exclusive_route_amount_out = exclusive_candidate.amount_out();
     let exclusive_gas_cost = exclusive_route_amount_out - exclusive_candidate.amount_out_net_gas();
     let surplus_amount = exclusive_route_amount_out - &committed_amount_out;
 
-    record_gas_token_amount("exclusive_fee_amount", exclusive_candidate, &surplus_amount);
+    record_gas_token_amount(
+        "exclusive_fee_amount",
+        exclusive_candidate,
+        &surplus_amount,
+        token_prices,
+    );
 
     let mut surplus_quote = exclusive_candidate.clone();
 
@@ -1711,6 +1783,7 @@ mod tests {
         tycho_common::models::Chain,
         tycho_core::{
             models::{token::Token, Address, Chain as SimChain},
+            simulation::protocol_sim::Price,
             Bytes,
         },
     };
@@ -1718,6 +1791,7 @@ mod tests {
     use super::*;
     use crate::{
         algorithm::test_utils::{component, component_with_protocol, MockProtocolSim},
+        derived::DerivedData,
         feed::exclusivity::mark_exclusive,
         solver::defaults,
         tests::metrics::recorded_metrics,
@@ -2331,7 +2405,7 @@ mod tests {
         assert_eq!(*ranked.per_order()[0][0].amount_out_net_gas(), BigUint::from(950u64));
         assert_eq!(*ranked.per_order()[0][1].amount_out_net_gas(), BigUint::from(800u64));
 
-        let staged = finalize_quote(ranked.into_best(), 7);
+        let staged = finalize_quote(ranked.into_best(), 7, None);
         let direct = worker_router
             .quote(request, ExclusiveAccess::Denied)
             .await
@@ -2962,6 +3036,7 @@ mod tests {
             &QuoteOptions::default(),
             vec![public_ranked],
             1_000,
+            None,
         );
 
         // The head is what the caller receives, so it is what attribution must credit. The public
@@ -3520,6 +3595,7 @@ mod tests {
             &QuoteOptions::default(),
             public_ranked,
             user_share_bps,
+            None,
         );
 
         let expected_surplus = expected_surplus.map(BigUint::from);
@@ -3574,6 +3650,7 @@ mod tests {
             &options,
             public_ranked,
             1_000,
+            None,
         );
 
         assert_eq!(combined.len(), 1);
@@ -3626,6 +3703,7 @@ mod tests {
             &QuoteOptions::default(),
             vec![no_route_quote()],
             1_000,
+            None,
         );
 
         assert_eq!(combined.len(), 2);
@@ -3666,6 +3744,7 @@ mod tests {
             &QuoteOptions::default(),
             vec![no_route_quote()],
             1_000,
+            None,
         );
 
         assert_eq!(*combined[0].amount_out(), BigUint::from(1_099_750u64));
@@ -3704,6 +3783,7 @@ mod tests {
             &QuoteOptions::default(),
             vec![no_route_quote()],
             1_000,
+            None,
         );
 
         assert_eq!(combined.len(), 1);
@@ -3722,6 +3802,7 @@ mod tests {
             &QuoteOptions::default(),
             public_ranked,
             1_000,
+            None,
         );
 
         let surplus_quote = &combined[0];
@@ -3770,6 +3851,7 @@ mod tests {
             &QuoteOptions::default(),
             public_ranked,
             1_000,
+            None,
         );
 
         let route = combined[0]
@@ -3827,6 +3909,7 @@ mod tests {
             &QuoteOptions::default(),
             public_ranked,
             1_000,
+            None,
         );
 
         assert_eq!(*combined[0].amount_out(), BigUint::from(1010u64));
@@ -3923,6 +4006,7 @@ mod tests {
             &QuoteOptions::default(),
             public_ranked,
             0,
+            None,
         );
 
         assert_eq!(*combined[0].amount_out(), BigUint::from(public_amount_out));
@@ -3962,7 +4046,7 @@ mod tests {
         );
         let committed_amount_out = BigUint::from(route_amount_out - route_amount_out / 100);
 
-        let pinned = pin_commitment(&quote, committed_amount_out.clone());
+        let pinned = pin_commitment(&quote, committed_amount_out.clone(), None);
 
         let committed_leg = exclusive_leg_commitment(&pinned).expect("leg should be committed");
         let user_amount_out = thin_pool
@@ -3992,6 +4076,7 @@ mod tests {
             &QuoteOptions::default(),
             vec![no_route_quote()],
             1_000,
+            None,
         );
 
         assert_eq!(*combined[0].amount_out(), BigUint::from(899_550u64));
@@ -4268,55 +4353,84 @@ mod tests {
         )
     }
 
-    /// 300k gas at 5 gwei is 0.0015 ETH, charged as 3 USDC: 2000 USDC per ETH.
-    fn usdc_quote() -> OrderQuote {
-        make_rate_quote(100_000_000, 97_000_000, 300_000)
-            .with_gas_price(BigUint::from(5_000_000_000u64))
+    /// A quote that settles into token `0x02`, with gas netted as `make_priced_route_quote` does.
+    fn quote_out_of_token_two() -> OrderQuote {
+        make_route_quote(&[("uniswap_v2", 0x01, 0x02)])
+    }
+
+    fn gas_prices(entries: &[(u8, u64, u64)]) -> TokenGasPrices {
+        entries
+            .iter()
+            .map(|(token, numerator, denominator)| {
+                (
+                    make_address(*token),
+                    Price {
+                        numerator: BigUint::from(*numerator),
+                        denominator: BigUint::from(*denominator),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[rstest]
+    #[case::with_prices(true)]
+    #[case::without_derived_data(false)]
+    #[tokio::test]
+    async fn test_solve_snapshots_token_prices(#[case] has_derived_data: bool) {
+        let (pool, worker) = create_mock_worker_pool("pool", Ok(make_single_quote(950)), 0);
+        let mut worker_router =
+            WorkerPoolRouter::new(vec![pool], WorkerPoolRouterConfig::default(), default_encoder());
+        let prices = gas_prices(&[(0x02, 2_000_000, 1_000_000_000_000_000)]);
+        if has_derived_data {
+            let derived_data = DerivedData::new_shared();
+            derived_data
+                .write()
+                .await
+                .set_token_prices(prices.clone(), vec![], 1);
+            worker_router = worker_router.with_derived_data(derived_data);
+        }
+        let request = QuoteRequest::new(vec![make_order()], QuoteOptions::default());
+
+        let ranked = worker_router
+            .solve(&request, ExclusiveAccess::Denied)
+            .await
+            .expect("solve");
+
+        let expected = has_derived_data.then_some(prices);
+        assert_eq!(ranked.token_prices().as_deref(), expected.as_ref());
+        worker.abort();
+    }
+
+    /// 2_000_000 USDC units per 1e15 wei is 2000 USDC per ETH.
+    #[rstest]
+    #[case::priced(Some(vec![(0x02, 2_000_000, 1_000_000_000_000_000)]), 100_000_000, Some(50_000_000_000_000_000))]
+    #[case::zero_amount(Some(vec![(0x02, 2_000_000, 1_000_000_000_000_000)]), 0, Some(0))]
+    #[case::no_prices(None, 100_000_000, None)]
+    #[case::token_missing(Some(vec![(0x03, 2_000_000, 1_000_000_000_000_000)]), 100_000_000, None)]
+    #[case::zero_numerator(Some(vec![(0x02, 0, 1_000_000_000_000_000)]), 100_000_000, None)]
+    #[case::zero_denominator(Some(vec![(0x02, 2_000_000, 0)]), 100_000_000, None)]
+    fn test_to_gas_token_amount(
+        #[case] entries: Option<Vec<(u8, u64, u64)>>,
+        #[case] amount: u64,
+        #[case] expected: Option<u64>,
+    ) {
+        let prices = entries.map(|entries| gas_prices(&entries));
+        let quote = quote_out_of_token_two();
+        // Gas netted at weight 0: the quote itself carries no rate.
+        assert_eq!(quote.amount_out_net_gas(), quote.amount_out());
+
+        let wei = to_gas_token_amount(&quote, &BigUint::from(amount), prices.as_ref());
+
+        assert_eq!(wei, expected.map(BigUint::from));
     }
 
     #[test]
-    fn test_to_gas_token_amount() {
-        // 100 USDC at 2000 USDC per ETH is 0.05 ETH.
-        let wei = to_gas_token_amount(&usdc_quote(), &BigUint::from(100_000_000u64));
+    fn test_to_gas_token_amount_without_route() {
+        let quote = make_rate_quote(1_000, 1_000, 0);
+        let prices = gas_prices(&[(0x02, 1, 1)]);
 
-        assert_eq!(wei, Some(BigUint::from(50_000_000_000_000_000u64)));
-    }
-
-    #[test]
-    fn test_to_gas_token_amount_of_zero() {
-        assert_eq!(to_gas_token_amount(&usdc_quote(), &BigUint::ZERO), Some(BigUint::ZERO));
-    }
-
-    #[test]
-    fn test_to_gas_token_amount_unpriced_output() {
-        // Derived data has not priced the output token, so the algorithm netted no gas off it.
-        let quote = make_rate_quote(100_000_000, 100_000_000, 300_000)
-            .with_gas_price(BigUint::from(5_000_000_000u64));
-
-        assert_eq!(to_gas_token_amount(&quote, &BigUint::from(100_000_000u64)), None);
-    }
-
-    #[test]
-    fn test_to_gas_token_amount_without_gas_price() {
-        let quote = make_rate_quote(100_000_000, 97_000_000, 300_000);
-
-        assert_eq!(to_gas_token_amount(&quote, &BigUint::from(100_000_000u64)), None);
-    }
-
-    #[test]
-    fn test_to_gas_token_amount_without_gas_estimate() {
-        let quote = make_rate_quote(100_000_000, 97_000_000, 0).with_gas_price(BigUint::from(5u64));
-
-        assert_eq!(to_gas_token_amount(&quote, &BigUint::from(100_000_000u64)), None);
-    }
-
-    #[test]
-    fn test_to_gas_token_amount_net_gas_above_output() {
-        // Gas refinement can overwrite the net output. Subtracting it must not panic.
-        let quote = make_rate_quote(97_000_000, 100_000_000, 300_000)
-            .with_gas_price(BigUint::from(5_000_000_000u64));
-
-        assert_eq!(to_gas_token_amount(&quote, &BigUint::from(100_000_000u64)), None);
+        assert_eq!(to_gas_token_amount(&quote, &BigUint::from(1_000u64), Some(&prices)), None);
     }
 
     /// Runs `record_winning_protocols` and returns the payload of each line it wrote.
@@ -4602,10 +4716,8 @@ mod tests {
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let _guard = metrics::set_default_local_recorder(&recorder);
-        let mut quote = success_quote(1_000);
-        if priced {
-            quote = quote.with_gas_price(BigUint::from(1u64));
-        }
+        let mut quote = quote_out_of_token_two();
+        let prices = priced.then(|| gas_prices(&[(0x02, 1, 1)]));
         quote.set_worker_pool("pool".to_string());
         quote.set_post_processed_by(
             names
@@ -4614,7 +4726,7 @@ mod tests {
                 .collect(),
         );
 
-        record_win(&quote);
+        record_win(&quote, prices.as_ref());
 
         let recorded = crate::tests::metrics::recorded_metrics(&snapshotter);
         let labels_of = |metric: &str| -> Vec<Vec<String>> {
@@ -4634,7 +4746,7 @@ mod tests {
             ("worker_router_unpriced_won_quotes_total", "worker_router_won_volume_gas_token")
         };
         let expected_labels =
-            vec![vec!["algorithm=algo".to_string(), "pool=pool".to_string(), expected.to_string()]];
+            vec![vec!["algorithm=test".to_string(), "pool=pool".to_string(), expected.to_string()]];
         assert_eq!(labels_of("worker_router_best_quote_pool"), expected_labels);
         assert_eq!(labels_of(volume_metric), expected_labels);
         assert!(labels_of(absent_metric).is_empty());
