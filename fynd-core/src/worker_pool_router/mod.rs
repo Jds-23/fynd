@@ -3351,6 +3351,65 @@ mod tests {
         }
     }
 
+    /// A quote from a public-only pool that already routes through exclusive liquidity is not a
+    /// public reference. Each case gives the plain public output (if any), the replaced quote's
+    /// output and the exclusive candidate's output; expected is the amounts of the combined list.
+    #[rstest]
+    // Commitment 1_000_000 + 10% of 200_000, not 1_010_000 + 10% of 190_000.
+    #[case::plain_quote_is_the_reference(
+        Some(1_000_000), 1_010_000, 1_200_000, vec![1_020_000, 1_010_000, 1_000_000]
+    )]
+    // Default fee: 1_200_000 minus 5 bps of the leg output.
+    #[case::only_replaced_quote_uses_the_default_fee(
+        None, 1_010_000, 1_200_000, vec![1_199_400, 1_010_000]
+    )]
+    // The replaced quote nets more than the commitment, so it stays ahead of the pinned quote.
+    #[case::replaced_quote_ahead_of_the_commitment(
+        Some(1_000_000), 1_300_000, 1_200_000, vec![1_300_000, 1_020_000, 1_000_000]
+    )]
+    fn test_combine_ignores_replaced_quote_as_reference(
+        #[case] plain_out: Option<u64>,
+        #[case] replaced_out: u64,
+        #[case] exclusive_out: u64,
+        #[case] expected_amounts: Vec<u64>,
+    ) {
+        let responses = exclusive_access_responses(1_000_000, exclusive_out);
+        let mut public_ranked = vec![
+            worker_quote((
+                "replaced_pool".to_string(),
+                make_exclusive_quote(replaced_out)
+                    .order()
+                    .clone(),
+            ))
+            .quote,
+        ];
+        if let Some(plain_out) = plain_out {
+            public_ranked.push(
+                make_public_quote_zero_gas(plain_out)
+                    .order()
+                    .clone(),
+            );
+        }
+
+        let combined = combine_with_surplus(
+            &responses,
+            &exclusive_access_pool_scopes(),
+            &QuoteOptions::default(),
+            public_ranked,
+            1_000,
+        );
+
+        let amounts: Vec<BigUint> = combined
+            .iter()
+            .map(|q| q.amount_out().clone())
+            .collect();
+        let expected: Vec<BigUint> = expected_amounts
+            .into_iter()
+            .map(BigUint::from)
+            .collect();
+        assert_eq!(amounts, expected);
+    }
+
     #[rstest]
     #[case::over_max_gas(
         make_exclusive_quote(1100).order().clone(),
