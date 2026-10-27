@@ -54,8 +54,8 @@ use crate::{
     encoding::encoder::Encoder,
     exclusive_route::{
         exclusive_route_shape, leg_route_output, matched_commitment, pin_commitment,
-        record_gas_token_amount, to_gas_token_amount, ExclusiveRouteShape, RouteOutput,
-        USER_IMPROVEMENT_SHARE_BPS, WEI_PER_GAS_TOKEN,
+        record_gas_token_amount, routes_through_exclusive, to_gas_token_amount,
+        ExclusiveRouteShape, RouteOutput, USER_IMPROVEMENT_SHARE_BPS, WEI_PER_GAS_TOKEN,
     },
     feed::{exclusivity::is_exclusive, protocol_registry::is_rfq_protocol},
     price_guard::guard::PriceGuard,
@@ -174,8 +174,10 @@ pub(crate) struct OrderResponses {
 impl OrderResponses {
     /// Returns a copy keeping only candidates from public-scoped worker pools.
     ///
-    /// These form the committed reference and the ranked fallback chain (ranked by `rank_quotes`,
-    /// consumed by the price guard); exclusive-access candidates are overlaid separately by
+    /// These form the ranked fallback chain (ranked by `rank_quotes`, consumed by the price
+    /// guard) and, through the quotes whose routes avoid exclusive swaps, the committed reference.
+    /// A public-scoped pool can return a route through exclusive liquidity, so the scope alone
+    /// does not make a quote a reference. Exclusive-access candidates are overlaid separately by
     /// `combine_with_surplus`. `failed_solvers` is retained so placeholder construction is
     /// unchanged.
     fn public_only(&self, pool_scopes: &FxHashMap<String, LiquidityScope>) -> OrderResponses {
@@ -603,12 +605,12 @@ impl WorkerPoolRouter {
         }
 
         // Rank quotes for each order (sorted by refined amount_out_net_gas descending).
-        // `rank_quotes` produces the public ranking — the committed reference AND the price-guard
-        // fallback chain. When the allocation holds an exclusive-scope worker pool, the winning
-        // exclusive-access candidate is overlaid onto that ranked list (prepended) by
-        // `combine_with_surplus`, so the fallbacks are preserved. If the public worker pools find
-        // nothing, that ranking is the `NoRouteFound` placeholder. The exclusive candidate then
-        // uses a default fee.
+        // `rank_quotes` produces the public ranking — the price-guard fallback chain, and the
+        // source of the committed reference (its best quote without exclusive swaps). When the
+        // allocation holds an exclusive-scope worker pool, the winning exclusive-access candidate
+        // is inserted into that ranked list by net amount by `combine_with_surplus`, so the
+        // fallbacks are preserved. If no public quote avoids exclusive swaps, the exclusive
+        // candidate uses a default fee.
         let token_prices = self.snapshot_token_prices().await;
         let ranked_quotes: Vec<Vec<OrderQuote>> = order_responses
             .iter()
@@ -1101,15 +1103,16 @@ impl WorkerPoolRouter {
 /// route should execute instead of the best public route.
 ///
 /// Inputs: `public_ranked` is the ranking of public-worker-pool quotes from `rank_quotes`; its
-/// head is the public reference from which the committed amount is derived. `responses`
+/// best successful quote whose route has no exclusive swap (see `find_public_reference`) is the
+/// public reference from which the committed amount is derived. `responses`
 /// additionally holds the candidates from `ExclusiveAccess`-scoped worker pools (routes that may
 /// use exclusive components).
 ///
 /// There are two ways to set the commitment:
-/// - **Matched**: `public_ranked` starts with a successful public quote, and the commitment follows
-///   that quote, as shown below.
-/// - **Default fee**: no public quote succeeded in the solve timeout, so `public_ranked` holds only
-///   the `NoRouteFound` placeholder. The commitment is the route output minus
+/// - **Matched**: `public_ranked` holds a public reference, and the commitment follows that quote,
+///   as shown below.
+/// - **Default fee**: no public reference exists: no public quote succeeded in the solve timeout,
+///   or every one routes through exclusive liquidity. The commitment is the route output minus
 ///   `NO_PUBLIC_ROUTE_FEE_BPS` of the exclusive leg. The candidate is skipped if the fee leaves the
 ///   user with nothing after gas.
 ///
@@ -1135,9 +1138,11 @@ impl WorkerPoolRouter {
 ///   more, but it is below `public_amount_out` — quoting less than the public market is ruled out,
 ///   so the gas difference stays with the user.
 ///
-/// If there is a commitment, this returns a new list. The head is the pinned surplus quote, and the
-/// entries of `public_ranked` follow it as price-guard fallbacks. The pinned quote is the winning
-/// candidate with:
+/// If there is a commitment, this returns a new list holding the pinned surplus quote and the
+/// entries of `public_ranked` as price-guard fallbacks, ordered by `amount_out_net_gas`. The pinned
+/// quote goes before the first entry with an equal or lower net, so it is the head unless a
+/// public-pool quote on exclusive liquidity already commits more to the user. The pinned quote is
+/// the winning candidate with:
 /// - `amount_out` set to the committed amount,
 /// - `Swap::committed_amount_out` set on each exclusive leg, and
 /// - an order-level `SurplusInfo`.
@@ -1172,9 +1177,7 @@ fn combine_with_surplus(
         return public_ranked;
     };
 
-    let public_reference = public_ranked
-        .first()
-        .filter(|q| q.status() == QuoteStatus::Success);
+    let public_reference = find_public_reference(&public_ranked);
 
     let commitment = match public_reference {
         Some(public_reference) => matched_commitment(
@@ -1201,10 +1204,33 @@ fn combine_with_surplus(
         );
     }
 
-    let mut result = Vec::with_capacity(public_ranked.len() + 1);
-    result.push(pin_commitment(exclusive_candidate, committed_amount_out, token_prices));
-    result.extend(public_ranked);
+    let pinned = pin_commitment(exclusive_candidate, committed_amount_out, token_prices);
+    let position = public_ranked
+        .iter()
+        .position(|q| q.amount_out_net_gas() <= pinned.amount_out_net_gas())
+        .unwrap_or(public_ranked.len());
+    let mut result = public_ranked;
+    result.insert(position, pinned);
     result
+}
+
+/// Returns the best-ranked successful quote whose route has no exclusive swap.
+///
+/// A quote from a public-scoped pool can already use exclusive liquidity, with amounts pinned to
+/// its own commitment, so it is not a public price.
+fn find_public_reference(ranked: &[OrderQuote]) -> Option<&OrderQuote> {
+    for quote in ranked {
+        if quote.status() != QuoteStatus::Success {
+            continue;
+        }
+        let Some(route) = quote.route() else {
+            continue;
+        };
+        if !routes_through_exclusive(route.swaps()) {
+            return Some(quote);
+        }
+    }
+    None
 }
 
 /// Records the win and the settled volume of one quote the router returns, by pool, algorithm and
