@@ -14,7 +14,7 @@ use crate::{
     post_process::{
         replace::{
             build_index, can_replace, replace_with_swap, update_index, CandidateRoute,
-            ComponentIndex, ReplacementFinder, ReplacementSnapshot, ReplacementSolver,
+            ReplacementComponentIndex, ReplacementFinder, ReplacementLiquidity, ReplacementSolver,
             ReplacementTarget, RouteEvaluator,
         },
         PostProcessRequest, RoutePostProcessor,
@@ -33,7 +33,7 @@ use crate::{
 #[derive(Default)]
 pub(crate) struct RfqSwapReplacer {
     market: Option<MarketData>,
-    index: ComponentIndex,
+    index: ReplacementComponentIndex,
 }
 
 impl RfqSwapReplacer {
@@ -71,14 +71,19 @@ impl RoutePostProcessor for RfqSwapReplacer {
         if self.index.is_empty() || !request.order().is_sell() {
             return None;
         }
-        let snapshot = match read_market(request.market(), request.label().cloned()).await {
-            Ok(view) => ReplacementSnapshot::take(&self.index, &view, request, route.route()),
+        let liquidity = match read_market(request.market(), request.label().cloned()).await {
+            Ok(view) => ReplacementLiquidity::from_market_for_route(
+                &self.index,
+                &view,
+                request,
+                route.route(),
+            ),
             Err(error) => {
                 debug!(%error, "cannot read the market; keeping the route");
                 return None;
             }
         };
-        ReplacementSolver::new(snapshot, request, route, RfqReplacementFinder)
+        ReplacementSolver::new(liquidity, request, route, RfqReplacementFinder)
             .and_then(ReplacementSolver::run)
     }
 }

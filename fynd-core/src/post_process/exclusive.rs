@@ -18,7 +18,7 @@ use crate::{
     post_process::{
         replace::{
             build_index, can_replace, replace_with_swap, update_index, CandidateRoute,
-            ComponentIndex, ReplacementFinder, ReplacementSnapshot, ReplacementSolver,
+            ReplacementComponentIndex, ReplacementFinder, ReplacementLiquidity, ReplacementSolver,
             ReplacementTarget, RouteEvaluator,
         },
         PostProcessRequest, RoutePostProcessor,
@@ -40,7 +40,7 @@ use crate::{
 #[derive(Default)]
 pub(crate) struct ExclusiveSwapReplacer {
     market: Option<MarketData>,
-    index: ComponentIndex,
+    index: ReplacementComponentIndex,
 }
 
 impl ExclusiveSwapReplacer {
@@ -78,14 +78,19 @@ impl RoutePostProcessor for ExclusiveSwapReplacer {
         {
             return None;
         }
-        let snapshot = match read_market(request.market(), request.label().cloned()).await {
-            Ok(view) => ReplacementSnapshot::take(&self.index, &view, request, route.route()),
+        let liquidity = match read_market(request.market(), request.label().cloned()).await {
+            Ok(view) => ReplacementLiquidity::from_market_for_route(
+                &self.index,
+                &view,
+                request,
+                route.route(),
+            ),
             Err(error) => {
                 debug!(%error, "cannot read the market; keeping the route");
                 return None;
             }
         };
-        ReplacementSolver::new(snapshot, request, route, ExclusiveReplacementFinder)
+        ReplacementSolver::new(liquidity, request, route, ExclusiveReplacementFinder)
             .and_then(ReplacementSolver::run)
     }
 }
@@ -173,23 +178,27 @@ const SPLIT_SEARCH_STEPS: usize = 8;
 const GOLDEN_RATIO_INVERSE: f64 = 0.618_033_988_749_895;
 
 /// A swap of the target that takes `token_in` of the target, with its split in the route.
-struct EntrySwap {
+struct EntrySwapSplit {
     /// The position of the swap in `SplitSearcher::split_swaps`.
     index: usize,
     /// The split of the swap in the route; `0.0` takes what remains of the balance.
-    split: f64,
+    original_split: f64,
 }
 
 /// The part of the balance of the target's input token that the entry swaps hold: the sum of their
 /// splits, or what the swaps outside the target leave when one of them takes the remainder.
-fn entries_share(entries: &[EntrySwap], target: &ReplacementTarget, route_swaps: &[Swap]) -> f64 {
+fn entries_share(
+    entries: &[EntrySwapSplit],
+    target: &ReplacementTarget,
+    route_swaps: &[Swap],
+) -> f64 {
     if entries
         .iter()
-        .all(|entry| entry.split > 0.0)
+        .all(|entry| entry.original_split > 0.0)
     {
         let mut share = 0.0;
         for entry in entries {
-            share += entry.split;
+            share += entry.original_split;
         }
         return share;
     }
@@ -214,7 +223,7 @@ struct SplitSearcher<'a> {
     /// The exclusive swap, then the swaps of the target in route order.
     split_swaps: Vec<Swap>,
     /// The swaps of the target that take the input token of the target.
-    entries: Vec<EntrySwap>,
+    entries: Vec<EntrySwapSplit>,
     /// The part of the input token balance that the target holds.
     share: f64,
     /// The candidate with the best net amount out so far, above `min_split_net_amount_out`.
@@ -238,7 +247,10 @@ impl<'a> SplitSearcher<'a> {
         for position in &target.replaced {
             let original = route_swaps.get(*position)?;
             if *original.token_in() == target.token_in {
-                entries.push(EntrySwap { index: split_swaps.len(), split: *original.split() });
+                entries.push(EntrySwapSplit {
+                    index: split_swaps.len(),
+                    original_split: *original.split(),
+                });
             }
             split_swaps.push(original.clone());
         }
@@ -318,7 +330,7 @@ impl<'a> SplitSearcher<'a> {
             );
         }
         for entry in &self.entries {
-            if entry.split <= 0.0 {
+            if entry.original_split <= 0.0 {
                 continue;
             }
             let Some(original) = self.split_swaps.get_mut(entry.index) else {
@@ -326,7 +338,11 @@ impl<'a> SplitSearcher<'a> {
             };
             let (original_in, original_out) =
                 (original.token_in().clone(), original.token_out().clone());
-            original.retarget(original_in, original_out, entry.split * (1.0 - exclusive_fraction));
+            original.retarget(
+                original_in,
+                original_out,
+                entry.original_split * (1.0 - exclusive_fraction),
+            );
         }
     }
 }

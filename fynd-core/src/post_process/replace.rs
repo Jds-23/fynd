@@ -23,12 +23,12 @@ use crate::{
 
 /// The components of the market that a replacer may use, by token.
 #[derive(Default)]
-pub(super) struct ComponentIndex {
+pub(super) struct ReplacementComponentIndex {
     by_token: FxHashMap<Address, BTreeSet<ComponentId>>,
     tokens_of: FxHashMap<ComponentId, Vec<Address>>,
 }
 
-impl ComponentIndex {
+impl ReplacementComponentIndex {
     pub(super) fn is_empty(&self) -> bool {
         self.tokens_of.is_empty()
     }
@@ -111,8 +111,8 @@ pub(super) fn replace_with_swap(
 pub(super) async fn build_index(
     market: &MarketData,
     is_member: impl Fn(&ProtocolComponent) -> bool,
-) -> ComponentIndex {
-    let mut index = ComponentIndex::default();
+) -> ReplacementComponentIndex {
+    let mut index = ReplacementComponentIndex::default();
     let view = market.read().await;
     let state = view.base_market_state();
     for system in state
@@ -134,7 +134,7 @@ pub(super) async fn build_index(
 /// Removes the components `event` removes from `index`, and indexes the components it adds that
 /// pass `is_member`.
 pub(super) async fn update_index(
-    index: &mut ComponentIndex,
+    index: &mut ReplacementComponentIndex,
     market: &MarketData,
     event: &MarketEvent,
     is_member: impl Fn(&ProtocolComponent) -> bool,
@@ -160,7 +160,7 @@ pub(super) async fn update_index(
 
 /// The swaps the search may use as replacements for one route, and the route's tokens. Copied
 /// from the market so the search holds no lock.
-pub(super) struct ReplacementSnapshot {
+pub(super) struct ReplacementLiquidity {
     /// One swap with zero amounts for each component the search may use, in id order. Its token
     /// pair is a placeholder: the replacement finder sets the pair and the split before it
     /// simulates.
@@ -169,11 +169,11 @@ pub(super) struct ReplacementSnapshot {
     tokens: FxHashMap<Address, Token>,
 }
 
-impl ReplacementSnapshot {
+impl ReplacementLiquidity {
     /// Copies the tokens of `route` and the components of `index` containing at least two of those
     /// tokens. Omits components the request excludes or the pool drops.
-    pub(super) fn take(
-        index: &ComponentIndex,
+    pub(super) fn from_market_for_route(
+        index: &ReplacementComponentIndex,
         view: &MarketDataView<'_>,
         request: &PostProcessRequest<'_>,
         route: &Route,
@@ -223,15 +223,15 @@ impl ReplacementSnapshot {
 }
 
 /// The gas cost of the original route in the output token, and the gas it used.
-struct GasPricing {
+struct OriginalRouteGasCost {
     gas_cost_out: BigInt,
     gas: BigInt,
 }
 
-impl GasPricing {
+impl OriginalRouteGasCost {
     /// Prices the gas of `result` in `output_token`. `None` when the route uses no gas, so the
     /// cost has no price per unit.
-    fn of(result: &RouteResult, output_token: &Address) -> Option<Self> {
+    fn from_route_result(result: &RouteResult, output_token: &Address) -> Option<Self> {
         let gas = BigInt::from(result.route().total_gas());
         if gas == BigInt::ZERO {
             return None;
@@ -316,12 +316,12 @@ pub(super) trait ReplacementFinder {
     ) -> Option<CandidateRoute>;
 }
 
-/// Simulates replacements on the route under search: holds the original route, its gas pricing,
+/// Simulates replacements on the route under search: holds the original route, its gas cost,
 /// the tokens and the deadline.
 pub(super) struct RouteEvaluator<'a> {
     original: &'a RouteResult,
     deadline: Instant,
-    pricing: GasPricing,
+    gas_cost: OriginalRouteGasCost,
     tokens: FxHashMap<Address, Token>,
     input_token: Address,
     output_token: Address,
@@ -352,7 +352,7 @@ impl RouteEvaluator<'_> {
         Instant::now() >= self.deadline
     }
 
-    /// The net amount out of `swaps`, simulated again with the pricing of the original route.
+    /// The net amount out of `swaps`, simulated again with the gas cost of the original route.
     /// `None` when a swap simulation fails.
     fn simulate_baseline(&self, swaps: &[Swap]) -> Option<BigInt> {
         let ordered: Vec<&Swap> = swaps.iter().collect();
@@ -360,7 +360,7 @@ impl RouteEvaluator<'_> {
             .simulate(&ordered)
             .inspect_err(|error| debug!(%error, "cannot simulate the original route"))
             .ok()?;
-        Some(self.pricing.net_amount_out(&simulated))
+        Some(self.gas_cost.net_amount_out(&simulated))
     }
 
     /// Simulates the route with `replacement` in place of the target swaps. The candidate holds the
@@ -383,7 +383,7 @@ impl RouteEvaluator<'_> {
                 );
             })
             .ok()?;
-        let net_amount_out = self.pricing.net_amount_out(&simulated);
+        let net_amount_out = self.gas_cost.net_amount_out(&simulated);
         let mut route_swaps = Vec::with_capacity(ordered.len());
         for (swap, simulated) in ordered.into_iter().zip(simulated.swaps) {
             route_swaps.push(
@@ -409,7 +409,7 @@ impl RouteEvaluator<'_> {
         })
     }
 
-    /// Simulates the swaps in `ordered` in topological order, using the snapshot's tokens and each
+    /// Simulates the swaps in `ordered` in topological order, using the liquidity's tokens and each
     /// swap's state.
     fn simulate<'s>(&'s self, ordered: &[&'s Swap]) -> Result<SimulatedRoute, ReplayError> {
         let ends = SimulationEnds {
@@ -434,16 +434,16 @@ pub(super) struct ReplacementSolver<'a, F> {
 }
 
 impl<'a, F: ReplacementFinder> ReplacementSolver<'a, F> {
-    /// Prepares a search of `original` on `snapshot`. `None` when the route cannot be searched:
+    /// Prepares a search of `original` on `liquidity`. `None` when the route cannot be searched:
     /// there are no replacement swaps, the route has no swaps, it starts and ends on one token, or
     /// it uses no gas.
     pub(super) fn new(
-        snapshot: ReplacementSnapshot,
+        liquidity: ReplacementLiquidity,
         request: &PostProcessRequest<'_>,
         original: &'a RouteResult,
         finder: F,
     ) -> Option<Self> {
-        if snapshot.swaps.is_empty() {
+        if liquidity.swaps.is_empty() {
             return None;
         }
         let route = original.route();
@@ -451,19 +451,19 @@ impl<'a, F: ReplacementFinder> ReplacementSolver<'a, F> {
         if input_token == output_token {
             return None;
         }
-        let pricing = GasPricing::of(original, &output_token)?;
+        let gas_cost = OriginalRouteGasCost::from_route_result(original, &output_token)?;
         let original_amount_out = route.amount_out(&output_token);
         let evaluator = RouteEvaluator {
             original,
             deadline: request.deadline(),
-            pricing,
-            tokens: snapshot.tokens,
+            gas_cost,
+            tokens: liquidity.tokens,
             input_token,
             output_token,
             total_in: request.order().amount().clone(),
             original_amount_out,
         };
-        Some(Self { evaluator, swaps: snapshot.swaps, finder })
+        Some(Self { evaluator, swaps: liquidity.swaps, finder })
     }
 
     /// Applies the best replacement until none raises the net amount out, the search has run one

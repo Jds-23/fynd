@@ -1181,8 +1181,8 @@ fn combine_with_surplus(
 
     let commitment = match public_reference {
         Some(public_reference) => matched_commitment(
-            RouteOutput::of(public_reference),
-            RouteOutput::of(exclusive_candidate),
+            RouteOutput::from_quote(public_reference),
+            RouteOutput::from_quote(exclusive_candidate),
             user_share_bps,
         ),
         None => default_fee_commitment(exclusive_candidate),

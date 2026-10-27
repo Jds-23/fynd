@@ -200,7 +200,7 @@ pub(crate) struct RouteOutput<'a> {
 }
 
 impl<'a> RouteOutput<'a> {
-    pub(crate) fn of(quote: &'a OrderQuote) -> Self {
+    pub(crate) fn from_quote(quote: &'a OrderQuote) -> Self {
         Self { amount_out: quote.amount_out(), amount_out_net_gas: quote.amount_out_net_gas() }
     }
 }
