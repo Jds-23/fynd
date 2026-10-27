@@ -91,7 +91,7 @@ impl RoutePostProcessor for ExclusiveSwapReplacer {
             }
         };
         ReplacementSolver::new(liquidity, request, route, ExclusiveReplacementFinder)
-            .and_then(ReplacementSolver::run)
+            .and_then(ReplacementSolver::apply_best_replacements)
     }
 }
 
@@ -128,7 +128,7 @@ impl ReplacementFinder for ExclusiveReplacementFinder {
             .map_or(min_net_amount_out, CandidateRoute::net_amount_out);
         let split_replacement =
             SplitSearcher::new(swap, target, route_swaps, evaluator, min_split_net_amount_out)
-                .and_then(SplitSearcher::run);
+                .and_then(SplitSearcher::find_best_split_route);
         split_replacement.or(full_replacement)
     }
 }
@@ -271,25 +271,29 @@ impl<'a> SplitSearcher<'a> {
     }
 
     /// Returns the split with the highest net amount out above `min_split_net_amount_out`, if any.
-    fn run(mut self) -> Option<CandidateRoute> {
-        let (mut low, mut high) = (0.0_f64, 1.0_f64);
-        let mut left = high - GOLDEN_RATIO_INVERSE * (high - low);
-        let mut right = low + GOLDEN_RATIO_INVERSE * (high - low);
-        let mut left_net = self.evaluate(left);
-        let mut right_net = self.evaluate(right);
+    fn find_best_split_route(mut self) -> Option<CandidateRoute> {
+        let (mut min_fraction, mut max_fraction) = (0.0_f64, 1.0_f64);
+        let mut lower_fraction =
+            max_fraction - GOLDEN_RATIO_INVERSE * (max_fraction - min_fraction);
+        let mut upper_fraction =
+            min_fraction + GOLDEN_RATIO_INVERSE * (max_fraction - min_fraction);
+        let mut lower_net = self.simulate_split(lower_fraction);
+        let mut upper_net = self.simulate_split(upper_fraction);
         for _ in 0..SPLIT_SEARCH_STEPS {
             // A fraction that cannot be filled has no net amount out: `None` orders below every
             // `Some`, so the search moves away from it.
-            if left_net >= right_net {
-                high = right;
-                (right, right_net) = (left, left_net);
-                left = high - GOLDEN_RATIO_INVERSE * (high - low);
-                left_net = self.evaluate(left);
+            if lower_net >= upper_net {
+                max_fraction = upper_fraction;
+                (upper_fraction, upper_net) = (lower_fraction, lower_net);
+                lower_fraction =
+                    max_fraction - GOLDEN_RATIO_INVERSE * (max_fraction - min_fraction);
+                lower_net = self.simulate_split(lower_fraction);
             } else {
-                low = left;
-                (left, left_net) = (right, right_net);
-                right = low + GOLDEN_RATIO_INVERSE * (high - low);
-                right_net = self.evaluate(right);
+                min_fraction = lower_fraction;
+                (lower_fraction, lower_net) = (upper_fraction, upper_net);
+                upper_fraction =
+                    min_fraction + GOLDEN_RATIO_INVERSE * (max_fraction - min_fraction);
+                upper_net = self.simulate_split(upper_fraction);
             }
         }
         let candidate = self.best.take()?;
@@ -298,14 +302,14 @@ impl<'a> SplitSearcher<'a> {
 
     /// Simulates the split at `exclusive_fraction` and records it if it is the best so far.
     /// Returns its net amount out, or `None` when the simulation fails or the deadline has passed.
-    fn evaluate(&mut self, exclusive_fraction: f64) -> Option<BigInt> {
+    fn simulate_split(&mut self, exclusive_fraction: f64) -> Option<BigInt> {
         if self.evaluator.deadline_passed() {
             return None;
         }
         self.retarget_split_swaps(exclusive_fraction);
-        let candidate = self
-            .evaluator
-            .evaluate(self.swaps, self.target, &self.split_swaps)?;
+        let candidate =
+            self.evaluator
+                .simulate_replacement(self.swaps, self.target, &self.split_swaps)?;
         let net_amount_out = candidate.net_amount_out().clone();
         let best_net = self
             .best

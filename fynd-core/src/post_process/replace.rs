@@ -103,7 +103,7 @@ pub(super) fn replace_with_swap(
     let mut replacement = swap.clone();
     replacement.retarget(target.token_in.clone(), target.token_out.clone(), target.split);
     let replacement = [replacement];
-    let candidate = evaluator.evaluate(route_swaps, target, &replacement)?;
+    let candidate = evaluator.simulate_replacement(route_swaps, target, &replacement)?;
     (candidate.net_amount_out > *min_net_amount_out).then_some(candidate)
 }
 
@@ -366,13 +366,13 @@ impl RouteEvaluator<'_> {
     /// Simulates the route with `replacement` in place of the target swaps. The candidate holds the
     /// route after the replacement, with the amounts and gas of the simulation. `None` when a swap
     /// simulation fails.
-    pub(super) fn evaluate(
+    pub(super) fn simulate_replacement(
         &self,
         swaps: &[Swap],
         target: &ReplacementTarget,
         replacement: &[Swap],
     ) -> Option<CandidateRoute> {
-        let ordered = splice(swaps, &target.replaced, replacement);
+        let ordered = replace_target_swaps(swaps, &target.replaced, replacement);
         let simulated = self
             .simulate(&ordered)
             .inspect_err(|error| {
@@ -471,7 +471,7 @@ impl<'a, F: ReplacementFinder> ReplacementSolver<'a, F> {
     /// of the current route; the first round simulates the original route again. `None` when the
     /// route did not change, or when the final net amount out is not above the original one. The
     /// result carries the commitment of the last candidate.
-    pub(super) fn run(self) -> Option<RouteResult> {
+    pub(super) fn apply_best_replacements(self) -> Option<RouteResult> {
         let original = self.evaluator.original;
         let mut swaps = original.route().swaps().to_vec();
         let rounds = swaps.len();
@@ -548,7 +548,11 @@ impl<'a, F: ReplacementFinder> ReplacementSolver<'a, F> {
 /// Returns `swaps` with the positions in `replaced` removed and the swaps of `replacement`
 /// inserted at the first removed position. The result keeps a topological order: the
 /// replacement consumes only tokens that the swaps before it make.
-fn splice<'a>(swaps: &'a [Swap], replaced: &[usize], replacement: &'a [Swap]) -> Vec<&'a Swap> {
+fn replace_target_swaps<'a>(
+    swaps: &'a [Swap],
+    replaced: &[usize],
+    replacement: &'a [Swap],
+) -> Vec<&'a Swap> {
     let mut ordered = Vec::with_capacity(swaps.len());
     for (position, swap) in swaps.iter().enumerate() {
         if replaced.first() == Some(&position) {
@@ -579,23 +583,28 @@ fn build_targets(swaps: &[Swap]) -> Vec<ReplacementTarget> {
 /// One target for each pair of cut tokens with more than one swap in the segment between them.
 /// The pair of the order's input and output token covers the whole route.
 fn build_segment_targets(swaps: &[Swap]) -> Vec<ReplacementTarget> {
-    let cuts = find_cut_tokens(swaps);
-    let forward: Vec<FxHashSet<Address>> = cuts
+    let cut_tokens = find_cut_tokens(swaps);
+    let downstream_tokens_by_cut: Vec<FxHashSet<Address>> = cut_tokens
         .iter()
-        .map(|cut| find_reachable(swaps, cut, Direction::Forward))
+        .map(|cut_token| find_reachable(swaps, cut_token, Direction::Forward))
         .collect();
-    let backward: Vec<FxHashSet<Address>> = cuts
+    let upstream_tokens_by_cut: Vec<FxHashSet<Address>> = cut_tokens
         .iter()
-        .map(|cut| find_reachable(swaps, cut, Direction::Backward))
+        .map(|cut_token| find_reachable(swaps, cut_token, Direction::Backward))
         .collect();
     let mut targets = Vec::new();
-    for (i, token_in) in cuts.iter().enumerate() {
-        for (j, token_out) in cuts.iter().enumerate().skip(i + 1) {
+    for (i, token_in) in cut_tokens.iter().enumerate() {
+        for (j, token_out) in cut_tokens
+            .iter()
+            .enumerate()
+            .skip(i + 1)
+        {
             let replaced: Vec<usize> = swaps
                 .iter()
                 .enumerate()
                 .filter(|(_, swap)| {
-                    forward[i].contains(swap.token_in()) && backward[j].contains(swap.token_out())
+                    downstream_tokens_by_cut[i].contains(swap.token_in()) &&
+                        upstream_tokens_by_cut[j].contains(swap.token_out())
                 })
                 .map(|(position, _)| position)
                 .collect();
@@ -624,7 +633,10 @@ fn find_cut_tokens(swaps: &[Swap]) -> Vec<Address> {
     for swap in swaps {
         let token = swap.token_out();
         let is_end = token == output;
-        if !is_end && seen.insert(token) && !connects(swaps, input, output, token) {
+        if !is_end &&
+            seen.insert(token) &&
+            !can_reach_output_without_token(swaps, input, output, token)
+        {
             cuts.push(token.clone());
         }
     }
@@ -632,17 +644,23 @@ fn find_cut_tokens(swaps: &[Swap]) -> Vec<Address> {
     cuts
 }
 
-/// Whether swaps lead from `from` to `to` without a swap that ends on `skip`.
-fn connects(swaps: &[Swap], from: &Address, to: &Address, skip: &Address) -> bool {
+/// Whether swaps lead from `input_token` to `output_token` without a swap that ends on
+/// `excluded_token`.
+fn can_reach_output_without_token(
+    swaps: &[Swap],
+    input_token: &Address,
+    output_token: &Address,
+    excluded_token: &Address,
+) -> bool {
     let mut reached = FxHashSet::default();
-    reached.insert(from);
+    reached.insert(input_token);
     for swap in swaps {
         let (token_in, token_out) = (swap.token_in(), swap.token_out());
-        if token_out != skip && reached.contains(token_in) {
+        if token_out != excluded_token && reached.contains(token_in) {
             reached.insert(token_out);
         }
     }
-    reached.contains(to)
+    reached.contains(output_token)
 }
 
 enum Direction {

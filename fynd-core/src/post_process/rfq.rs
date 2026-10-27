@@ -84,7 +84,7 @@ impl RoutePostProcessor for RfqSwapReplacer {
             }
         };
         ReplacementSolver::new(liquidity, request, route, RfqReplacementFinder)
-            .and_then(ReplacementSolver::run)
+            .and_then(ReplacementSolver::apply_best_replacements)
     }
 }
 
