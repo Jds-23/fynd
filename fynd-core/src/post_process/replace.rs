@@ -254,7 +254,7 @@ impl OriginalRouteGasCost {
 #[derive(Clone)]
 pub(super) struct ReplacementTarget {
     /// Positions of the swaps to replace, in ascending order.
-    pub(super) replaced: Vec<usize>,
+    pub(super) replaced_indices: Vec<usize>,
     pub(super) token_in: Address,
     pub(super) token_out: Address,
     /// The split of the replacement swap; `0.0` takes what remains of `token_in`.
@@ -372,7 +372,7 @@ impl RouteEvaluator<'_> {
         target: &ReplacementTarget,
         replacement: &[Swap],
     ) -> Option<CandidateRoute> {
-        let ordered = replace_target_swaps(swaps, &target.replaced, replacement);
+        let ordered = replace_target_swaps(swaps, &target.replaced_indices, replacement);
         let simulated = self
             .simulate(&ordered)
             .inspect_err(|error| {
@@ -545,20 +545,20 @@ impl<'a, F: ReplacementFinder> ReplacementSolver<'a, F> {
     }
 }
 
-/// Returns `swaps` with the positions in `replaced` removed and the swaps of `replacement`
-/// inserted at the first removed position. The result keeps a topological order: the
+/// Returns `swaps` with the indices in `replaced_indices` removed and the swaps of `replacement`
+/// inserted at the first removed index. The result keeps a topological order: the
 /// replacement consumes only tokens that the swaps before it make.
 fn replace_target_swaps<'a>(
     swaps: &'a [Swap],
-    replaced: &[usize],
+    replaced_indices: &[usize],
     replacement: &'a [Swap],
 ) -> Vec<&'a Swap> {
     let mut ordered = Vec::with_capacity(swaps.len());
-    for (position, swap) in swaps.iter().enumerate() {
-        if replaced.first() == Some(&position) {
+    for (index, swap) in swaps.iter().enumerate() {
+        if replaced_indices.first() == Some(&index) {
             ordered.extend(replacement);
         }
-        if !replaced.contains(&position) {
+        if !replaced_indices.contains(&index) {
             ordered.push(swap);
         }
     }
@@ -568,9 +568,9 @@ fn replace_target_swaps<'a>(
 /// Returns replacement targets for individual swaps, followed by targets for segments.
 fn build_targets(swaps: &[Swap]) -> Vec<ReplacementTarget> {
     let mut targets = Vec::new();
-    for (position, swap) in swaps.iter().enumerate() {
+    for (index, swap) in swaps.iter().enumerate() {
         targets.push(ReplacementTarget {
-            replaced: vec![position],
+            replaced_indices: vec![index],
             token_in: swap.token_in().clone(),
             token_out: swap.token_out().clone(),
             split: *swap.split(),
@@ -599,18 +599,18 @@ fn build_segment_targets(swaps: &[Swap]) -> Vec<ReplacementTarget> {
             .enumerate()
             .skip(i + 1)
         {
-            let replaced: Vec<usize> = swaps
+            let replaced_indices: Vec<usize> = swaps
                 .iter()
                 .enumerate()
                 .filter(|(_, swap)| {
                     downstream_tokens_by_cut[i].contains(swap.token_in()) &&
                         upstream_tokens_by_cut[j].contains(swap.token_out())
                 })
-                .map(|(position, _)| position)
+                .map(|(index, _)| index)
                 .collect();
-            if replaced.len() > 1 {
+            if replaced_indices.len() > 1 {
                 targets.push(ReplacementTarget {
-                    replaced,
+                    replaced_indices,
                     token_in: token_in.clone(),
                     token_out: token_out.clone(),
                     split: 0.0,
@@ -702,9 +702,9 @@ mod tests {
 
     fn legs(spec: &[(char, char)]) -> Vec<Swap> {
         let mut swaps = Vec::new();
-        for (position, (from, to)) in spec.iter().enumerate() {
+        for (index, (from, to)) in spec.iter().enumerate() {
             swaps.push(swap(
-                &format!("s{position}"),
+                &format!("s{index}"),
                 (&letter(*from), &letter(*to)),
                 (1, 1),
                 0.0,
@@ -743,7 +743,7 @@ mod tests {
         assert_eq!(cuts, expected);
         let replaced: Vec<&[usize]> = targets
             .iter()
-            .map(|target| target.replaced.as_slice())
+            .map(|target| target.replaced_indices.as_slice())
             .collect();
         assert_eq!(replaced, expected_replaced);
     }
