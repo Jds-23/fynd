@@ -18,7 +18,7 @@ use crate::{
     post_process::{
         replace::{
             build_index, can_replace, replace_with_swap, update_index, CandidateRoute,
-            ComponentIndex, ReplacementFinder, ReplacementSearcher, ReplacementSnapshot,
+            ComponentIndex, ReplacementFinder, ReplacementSnapshot, ReplacementSolver,
             ReplacementTarget, RouteEvaluator,
         },
         PostProcessRequest, RoutePostProcessor,
@@ -85,8 +85,8 @@ impl RoutePostProcessor for ExclusiveSwapReplacer {
                 return None;
             }
         };
-        ReplacementSearcher::new(snapshot, request, route, ExclusiveReplacementFinder)
-            .and_then(ReplacementSearcher::run)
+        ReplacementSolver::new(snapshot, request, route, ExclusiveReplacementFinder)
+            .and_then(ReplacementSolver::run)
     }
 }
 
@@ -97,7 +97,7 @@ struct ExclusiveReplacementFinder;
 impl ReplacementFinder for ExclusiveReplacementFinder {
     /// An exclusive component fills partially, so it accepts a target at any position. It does not
     /// accept a route that already has an exclusive leg.
-    fn accepts(
+    fn can_replace_target(
         &self,
         swap: &Swap,
         target: &ReplacementTarget,
@@ -107,7 +107,7 @@ impl ReplacementFinder for ExclusiveReplacementFinder {
         !routes_through_exclusive(route_swaps) && can_replace(swap, target, route_swaps)
     }
 
-    fn find(
+    fn find_best_replacement_route(
         &self,
         swap: &Swap,
         target: &ReplacementTarget,
@@ -115,14 +115,16 @@ impl ReplacementFinder for ExclusiveReplacementFinder {
         evaluator: &RouteEvaluator<'_>,
         min_net_amount_out: &BigInt,
     ) -> Option<CandidateRoute> {
-        let whole = replace_with_swap(swap, target, route_swaps, evaluator, min_net_amount_out)
-            .and_then(|whole| ExclusiveReplacementFinder.commit(whole, evaluator));
-        let split_floor = whole
+        let full_replacement =
+            replace_with_swap(swap, target, route_swaps, evaluator, min_net_amount_out)
+                .and_then(|route| ExclusiveReplacementFinder.commit(route, evaluator));
+        let min_split_net_amount_out = full_replacement
             .as_ref()
             .map_or(min_net_amount_out, CandidateRoute::net_amount_out);
-        let split = SplitSearcher::new(swap, target, route_swaps, evaluator, split_floor)
-            .and_then(SplitSearcher::run);
-        split.or(whole)
+        let split_replacement =
+            SplitSearcher::new(swap, target, route_swaps, evaluator, min_split_net_amount_out)
+                .and_then(SplitSearcher::run);
+        split_replacement.or(full_replacement)
     }
 }
 
@@ -215,21 +217,21 @@ struct SplitSearcher<'a> {
     entries: Vec<EntrySwap>,
     /// The part of the input token balance that the target holds.
     share: f64,
-    /// The candidate with the best net amount out so far, above `floor`.
+    /// The candidate with the best net amount out so far, above `min_split_net_amount_out`.
     best: Option<CandidateRoute>,
-    floor: &'a BigInt,
+    min_split_net_amount_out: &'a BigInt,
 }
 
 impl<'a> SplitSearcher<'a> {
     /// Prepares a split search for `target`, with `swap` as the exclusive swap. `None` when the
     /// target holds no part of the input token balance. A split must have a net amount out above
-    /// `floor`.
+    /// `min_split_net_amount_out`.
     fn new(
         swap: &Swap,
         target: &'a ReplacementTarget,
         route_swaps: &'a [Swap],
         evaluator: &'a RouteEvaluator<'a>,
-        floor: &'a BigInt,
+        min_split_net_amount_out: &'a BigInt,
     ) -> Option<Self> {
         let mut split_swaps = vec![swap.clone()];
         let mut entries = Vec::new();
@@ -252,11 +254,11 @@ impl<'a> SplitSearcher<'a> {
             entries,
             share,
             best: None,
-            floor,
+            min_split_net_amount_out,
         })
     }
 
-    /// Returns the split with the highest net amount out above `floor`, if any.
+    /// Returns the split with the highest net amount out above `min_split_net_amount_out`, if any.
     fn run(mut self) -> Option<CandidateRoute> {
         let (mut low, mut high) = (0.0_f64, 1.0_f64);
         let mut left = high - GOLDEN_RATIO_INVERSE * (high - low);
@@ -296,7 +298,7 @@ impl<'a> SplitSearcher<'a> {
         let best_net = self
             .best
             .as_ref()
-            .map_or(self.floor, CandidateRoute::net_amount_out);
+            .map_or(self.min_split_net_amount_out, CandidateRoute::net_amount_out);
         if net_amount_out > *best_net {
             self.best = Some(candidate);
         }

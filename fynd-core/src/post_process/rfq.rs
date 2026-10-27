@@ -14,7 +14,7 @@ use crate::{
     post_process::{
         replace::{
             build_index, can_replace, replace_with_swap, update_index, CandidateRoute,
-            ComponentIndex, ReplacementFinder, ReplacementSearcher, ReplacementSnapshot,
+            ComponentIndex, ReplacementFinder, ReplacementSnapshot, ReplacementSolver,
             ReplacementTarget, RouteEvaluator,
         },
         PostProcessRequest, RoutePostProcessor,
@@ -78,8 +78,8 @@ impl RoutePostProcessor for RfqSwapReplacer {
                 return None;
             }
         };
-        ReplacementSearcher::new(snapshot, request, route, RfqReplacementFinder)
-            .and_then(ReplacementSearcher::run)
+        ReplacementSolver::new(snapshot, request, route, RfqReplacementFinder)
+            .and_then(ReplacementSolver::run)
     }
 }
 
@@ -100,7 +100,7 @@ struct RfqReplacementFinder;
 impl ReplacementFinder for RfqReplacementFinder {
     /// A swap whose protocol cannot fill partially accepts only a target that starts at the input
     /// token of the order.
-    fn accepts(
+    fn can_replace_target(
         &self,
         swap: &Swap,
         target: &ReplacementTarget,
@@ -112,7 +112,7 @@ impl ReplacementFinder for RfqReplacementFinder {
     }
 
     /// Replaces the target with `swap` alone.
-    fn find(
+    fn find_best_replacement_route(
         &self,
         swap: &Swap,
         target: &ReplacementTarget,

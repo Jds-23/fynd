@@ -292,10 +292,10 @@ impl CandidateRoute {
 }
 
 /// Decides which swaps may replace a target, and finds the best replacement through one swap.
-/// [`ReplacementSearcher`] runs it.
+/// [`ReplacementSolver`] runs it.
 pub(super) trait ReplacementFinder {
     /// Whether `swap` may replace `target` of `route_swaps`.
-    fn accepts(
+    fn can_replace_target(
         &self,
         swap: &Swap,
         target: &ReplacementTarget,
@@ -306,7 +306,7 @@ pub(super) trait ReplacementFinder {
     /// Returns the replacement of `target` through `swap` that has the highest net amount out, if
     /// that amount is above `min_net_amount_out`. Evaluates each replacement with `evaluator`. A
     /// rule that restricts the routes it returns, or commits them to an amount, does so here.
-    fn find(
+    fn find_best_replacement_route(
         &self,
         swap: &Swap,
         target: &ReplacementTarget,
@@ -427,13 +427,13 @@ impl RouteEvaluator<'_> {
 }
 
 /// Searches one route for replacements that raise the net amount out.
-pub(super) struct ReplacementSearcher<'a, F> {
+pub(super) struct ReplacementSolver<'a, F> {
     evaluator: RouteEvaluator<'a>,
     swaps: Vec<Swap>,
     finder: F,
 }
 
-impl<'a, F: ReplacementFinder> ReplacementSearcher<'a, F> {
+impl<'a, F: ReplacementFinder> ReplacementSolver<'a, F> {
     /// Prepares a search of `original` on `snapshot`. `None` when the route cannot be searched:
     /// there are no replacement swaps, the route has no swaps, it starts and ends on one token, or
     /// it uses no gas.
@@ -521,17 +521,20 @@ impl<'a, F: ReplacementFinder> ReplacementSearcher<'a, F> {
             for swap in &self.swaps {
                 if !self
                     .finder
-                    .accepts(swap, &target, route_swaps, &self.evaluator)
+                    .can_replace_target(swap, &target, route_swaps, &self.evaluator)
                 {
                     continue;
                 }
                 if self.evaluator.deadline_passed() {
                     return best;
                 }
-                let Some(candidate) =
-                    self.finder
-                        .find(swap, &target, route_swaps, &self.evaluator, &best_net)
-                else {
+                let Some(candidate) = self.finder.find_best_replacement_route(
+                    swap,
+                    &target,
+                    route_swaps,
+                    &self.evaluator,
+                    &best_net,
+                ) else {
                     continue;
                 };
                 best_net = candidate.net_amount_out.clone();
