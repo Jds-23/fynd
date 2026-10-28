@@ -20,8 +20,8 @@ use crate::{
 ///
 /// A route has exactly one exclusive leg, at any hop, on any branch of a split route. The output
 /// of the leg must reach the route's output token, and the swaps after the leg must not loop back
-/// to a token already on their path. The route has a single leg so that the attribution of the
-/// surplus to each leg stays unambiguous.
+/// to a token already on their path. With one exclusive leg, the surplus has one leg to come
+/// from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExclusiveRouteShape {
     /// One exclusive leg that reaches the route's output token.
@@ -137,8 +137,7 @@ fn total_amount_in_for_token(swaps: &[Swap], token: &Address) -> BigUint {
         .sum()
 }
 
-/// Environment variable overriding [`DEFAULT_USER_IMPROVEMENT_SHARE_BPS`]. Read once, on the
-/// first quote that overlays an exclusive-access candidate.
+/// Environment variable overriding [`DEFAULT_USER_IMPROVEMENT_SHARE_BPS`].
 const ENV_USER_IMPROVEMENT_SHARE_BPS: &str = "EXCLUSIVE_ROUTE_USER_SHARE_BPS";
 
 /// Share of an exclusive route's improvement over the public market that is handed to the user,
