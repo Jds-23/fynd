@@ -220,10 +220,7 @@ async fn test_simulate_attempt_client_fee_receiver(
     let SimulationAttempt::Reverted { replay, .. } = attempt else {
         panic!("the mocked call reverts");
     };
-    let overrides = replay.payload.block_state_calls[0]
-        .state_overrides
-        .as_ref()
-        .expect("state overrides");
+    let overrides = &replay.payload.block_state_calls[0].state_overrides;
     let code = Bytes::from_static(&ACCEPT_ANY_ERC1271_SIGNATURE_CODE);
     let accounts_with_code: Vec<Address> = overrides
         .iter()
@@ -266,7 +263,14 @@ async fn test_simulate_attempt_unusable_client_fee_receiver(
 
 /// An envelope for the tests that drive the call directly, without a quote to derive one from.
 fn empty_replay() -> Box<Replay> {
-    Box::new(Replay { parent_block: 0, payload: SimulatePayload::default() })
+    Box::new(Replay {
+        parent_block: 0,
+        payload: SimulationRequest::single_call(
+            TransactionRequest::default(),
+            StateOverride::default(),
+            SimulationBlockEnvironment::default(),
+        ),
+    })
 }
 
 fn test_envelope() -> SimulationEnvelope {
@@ -301,11 +305,11 @@ fn test_envelope_prices_a_quote_that_carries_no_gas_price() {
 
 #[test]
 fn test_block_overrides_leave_nothing_a_pool_reads_at_zero() {
-    let overrides = block_overrides();
-    assert_eq!(overrides.coinbase, Some(SIMULATION_COINBASE));
-    assert_eq!(overrides.gas_limit, Some(SIMULATION_BLOCK_GAS_LIMIT));
-    assert_ne!(overrides.random, Some(B256::ZERO));
-    assert!(overrides.random.is_some());
+    let environment = block_environment();
+    assert_eq!(environment.fee_recipient, Some(SIMULATION_COINBASE));
+    assert_eq!(environment.gas_limit, Some(SIMULATION_BLOCK_GAS_LIMIT));
+    assert_ne!(environment.prev_randao, Some(B256::ZERO));
+    assert!(environment.prev_randao.is_some());
 }
 
 /// `eth_simulateV1` numbers its own block, and `debug_traceCall` at latest runs one below it, so
@@ -313,24 +317,63 @@ fn test_block_overrides_leave_nothing_a_pool_reads_at_zero() {
 /// makes the node refuse the call outright once a block lands mid-quote.
 #[test]
 fn test_executed_in_pins_the_block_without_touching_the_rest() {
-    let base = block_overrides();
+    let base = block_environment();
     let pinned = executed_in(base.clone(), 25_903_761, 1_788_531_000);
 
     assert_eq!(pinned.number, Some(U256::from(25_903_761_u64)));
     assert_eq!(pinned.time, Some(1_788_531_000));
-    assert_eq!(pinned.coinbase, base.coinbase);
+    assert_eq!(pinned.fee_recipient, base.fee_recipient);
     assert_eq!(pinned.gas_limit, base.gas_limit);
-    assert_eq!(pinned.random, base.random);
+    assert_eq!(pinned.prev_randao, base.prev_randao);
 }
 
 /// The simulation itself must leave the number unset, or the node rejects a block that does not
 /// sit above the head.
 #[test]
 fn test_block_overrides_leave_the_block_for_the_node_to_number() {
-    let overrides = block_overrides();
+    let environment = block_environment();
 
-    assert_eq!(overrides.number, None);
-    assert_eq!(overrides.time, None);
+    assert_eq!(environment.number, None);
+    assert_eq!(environment.time, None);
+}
+
+/// Geth decodes block overrides strictly and knows the fee recipient and `prevrandao` only by the
+/// spec names, so neither request may carry alloy's `coinbase` or `random`.
+#[test]
+fn test_requests_name_block_fields_as_the_spec_does() {
+    let environment = SimulationBlockEnvironment {
+        number: Some(U256::from(101)),
+        time: Some(1_700_000_000),
+        gas_limit: Some(SIMULATION_BLOCK_GAS_LIMIT),
+        fee_recipient: Some(SIMULATION_COINBASE),
+        prev_randao: Some(B256::repeat_byte(0x11)),
+    };
+    let request = SimulationRequest::single_call(
+        TransactionRequest::default(),
+        StateOverride::default(),
+        environment.clone(),
+    );
+    let trace_options = TraceCallOptions {
+        tracing_options: GethDebugTracingOptions::default(),
+        state_overrides: StateOverride::default(),
+        block_overrides: environment,
+    };
+    let expected = serde_json::json!({
+        "number": "0x65",
+        "time": "0x6553f100",
+        "gasLimit": "0x2aea540",
+        "feeRecipient": SIMULATION_COINBASE,
+        "prevRandao": B256::repeat_byte(0x11),
+    });
+
+    let simulate_json = serde_json::to_value(&request).expect("request serializes");
+    let trace_json = serde_json::to_value(&trace_options).expect("options serialize");
+
+    assert_eq!(simulate_json["blockStateCalls"][0]["blockOverrides"], expected);
+    assert_eq!(trace_json["blockOverrides"], expected);
+    assert_eq!(simulate_json["traceTransfers"], false);
+    assert_eq!(simulate_json["validation"], false);
+    assert_eq!(simulate_json["returnFullTransactions"], false);
 }
 
 /// The funding value is what makes a simulated sender solvent, and it is bounded on both sides:
@@ -918,17 +961,13 @@ async fn test_reverted_simulation_carries_a_replay_pinned_to_its_block() {
     };
     assert_eq!(replay.parent_block, 100);
     let block = &replay.payload.block_state_calls[0];
-    let environment = block
-        .block_overrides
-        .as_ref()
-        .expect("block overrides");
+    let environment = &block.block_overrides;
     assert_eq!(environment.number, Some(U256::from(101)));
     assert_eq!(environment.time, Some(1_700_000_000));
-    assert!(environment.random.is_some(), "prevrandao is pinned");
+    assert!(environment.prev_randao.is_some(), "prevrandao is pinned");
     assert!(block
         .state_overrides
-        .as_ref()
-        .is_some_and(|overrides| overrides.contains_key(&sender)));
+        .contains_key(&sender));
     assert_eq!(block.calls[0].input.input(), Some(&Bytes::from_static(&[0x12])));
     assert!(replay
         .payload_json()

@@ -9,6 +9,7 @@
 * [Quickstart](get-started/quickstart/README.md)
 * [Hosted Fynd API](get-started/hosted-api.md)
 * [Fynd In-Block Solver](get-started/fynd-in-block-solver.md)
+* [Fynd AMM](get-started/fynd-amm.md)
 
 ## Guides
 

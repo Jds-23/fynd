@@ -1,4 +1,37 @@
 
+## [0.116.3](https://github.com/propeller-heads/fynd/compare/0.116.2...0.116.3) (2026-10-28)
+
+### Bug Fixes
+
+* **simulation:** send block overrides under the spec's field names ([056baf9](https://github.com/propeller-heads/fynd/commit/056baf95da9702af741f7f2b254726568c4710d2))
+
+
+## [0.116.2](https://github.com/propeller-heads/fynd/compare/0.116.1...0.116.2) (2026-10-28)
+
+### Features
+
+* **core:** split a segment between its swaps and the exclusive pool ([01362ec](https://github.com/propeller-heads/fynd/commit/01362ec53800ada5f5c8966f6ea1e1a2cd3f8d93))
+* **core:** reject exclusive_swap_replacer anywhere but last in a pool ([eddc14c](https://github.com/propeller-heads/fynd/commit/eddc14c31d119a34f237a9ee239fdd66806a8530))
+* **core:** register exclusive_swap_replacer as a built-in ([b7cf795](https://github.com/propeller-heads/fynd/commit/b7cf7953f4af7d684359ff250ba55223c7b7faa2))
+* **core:** split a swap between its pool and the exclusive pool ([36901cb](https://github.com/propeller-heads/fynd/commit/36901cb22d8fdf2673b74a32f8cd1eecc26c8e48))
+* **core:** add exclusive_swap_replacer for whole replacements ([fbc331e](https://github.com/propeller-heads/fynd/commit/fbc331ee666f3b0db27bb96571ddd42ecf4bbf3c))
+* **core:** pin the commitment of a post-processed route in the quote ([5a21606](https://github.com/propeller-heads/fynd/commit/5a216064680b3bf4e29a7ff9e3bca69354fc9d40))
+* **core:** let public-only post-processors use exclusive components ([8b8f7c8](https://github.com/propeller-heads/fynd/commit/8b8f7c8f76f88f5155445582d9ab1c8dfcfa0349))
+* **core:** give a PostProcessRequest the exclusive access ([edcf455](https://github.com/propeller-heads/fynd/commit/edcf4559104e937f1fbae0631ce8b4e5b4697d7d))
+* **core:** carry the exclusive access in SolveParams ([ee06a00](https://github.com/propeller-heads/fynd/commit/ee06a00e40cdb0641da874c065b6389a4e5109c3))
+* **core:** let a RouteResult carry a commitment ([6d953c0](https://github.com/propeller-heads/fynd/commit/6d953c0f32bbc1f1240cb60fbad9a5309e276662))
+* **core:** let a solution hook attach subsidy terms ([5ee0ffa](https://github.com/propeller-heads/fynd/commit/5ee0ffa8a22efeef4ce1a7e470c41d32cdd0d344))
+
+### Bug Fixes
+
+* **core:** take the public reference from routes without exclusive swaps ([070b5f4](https://github.com/propeller-heads/fynd/commit/070b5f400c9fcc534f119052f712fa45d3917dbb))
+* **encoding:** keep client fee signatures longer than 65 bytes ([864eb8a](https://github.com/propeller-heads/fynd/commit/864eb8a78c7e5906cb17ea9175d09dbdc2713ef0))
+
+### Performance Improvements
+
+* **core:** skip the baseline simulation when no component fits ([43be5cc](https://github.com/propeller-heads/fynd/commit/43be5cc205f86cb4236a2a081c386da70893db86))
+
+
 ## [0.116.1](https://github.com/propeller-heads/fynd/compare/0.116.0...0.116.1) (2026-10-26)
 
 ### Bug Fixes

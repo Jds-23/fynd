@@ -8,3 +8,5 @@ mod revert;
 pub mod simulator;
 /// Trace-guided discovery of the storage slots a token keys its balances and allowances on.
 pub mod token_layout;
+/// Request bodies for the simulation RPCs, with the field names of the execution-apis spec.
+pub(crate) mod wire;
