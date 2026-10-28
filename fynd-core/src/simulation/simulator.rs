@@ -6,18 +6,18 @@ use std::{
 };
 
 use alloy::{
-    eips::BlockNumberOrTag,
+    eips::{BlockId, BlockNumberOrTag},
     network::Ethereum,
     primitives::{address, map::B256HashMap, uint, Address, Bytes, TxKind, B256, U256},
-    providers::{ext::DebugApi, Provider, ProviderBuilder, RootProvider},
+    providers::{Provider, ProviderBuilder, RootProvider},
     rpc::types::{
-        simulate::{SimBlock, SimulatePayload},
+        simulate::SimulatedBlock,
         state::{AccountOverride, StateOverride},
         trace::geth::{
-            CallConfig, GethDebugBuiltInTracerType, GethDebugTracerType,
-            GethDebugTracingCallOptions, GethDebugTracingOptions,
+            CallConfig, CallFrame, GethDebugBuiltInTracerType, GethDebugTracerType,
+            GethDebugTracingOptions,
         },
-        BlockOverrides, TransactionRequest,
+        Block, TransactionRequest,
     },
 };
 use metrics::{counter, histogram};
@@ -37,6 +37,7 @@ use crate::{
         deviation::deviation_bps,
         revert,
         token_layout::{discover_layout, DiscoveryError, TokenLayout},
+        wire::{SimulationBlockEnvironment, SimulationRequest, TraceCallOptions},
     },
     solver::defaults::SIMULATION_LAYOUT_DISCOVERY_TIMEOUT,
     ClientFeeParams, EventLog, OrderQuote, SimulationResult,
@@ -658,12 +659,12 @@ fn failure_with(reason: String) -> SimulationAttempt {
 /// Returns the block fields that the simulation sets itself.
 ///
 /// `eth_simulateV1` takes the other block fields from the block that it runs on. It leaves the
-/// coinbase and `prevrandao` at zero, and a pool can read these to detect a simulation. This sets
-/// them, and the block gas limit, to realistic values.
-fn block_overrides() -> BlockOverrides {
-    BlockOverrides {
-        coinbase: Some(SIMULATION_COINBASE),
-        random: Some(B256::from(rand::random::<[u8; 32]>())),
+/// fee recipient and `prevrandao` at zero, and a pool can read these to detect a simulation. This
+/// sets them, and the block gas limit, to realistic values.
+fn block_environment() -> SimulationBlockEnvironment {
+    SimulationBlockEnvironment {
+        fee_recipient: Some(SIMULATION_COINBASE),
+        prev_randao: Some(B256::from(rand::random::<[u8; 32]>())),
         gas_limit: Some(SIMULATION_BLOCK_GAS_LIMIT),
         ..Default::default()
     }
@@ -674,8 +675,16 @@ fn block_overrides() -> BlockOverrides {
 /// The trace of a revert must run in the same block environment as the simulation.
 /// `eth_simulateV1` picks the number of its block itself, so the caller takes `number` and
 /// `timestamp` from its response.
-fn executed_in(environment: BlockOverrides, number: u64, timestamp: u64) -> BlockOverrides {
-    BlockOverrides { number: Some(U256::from(number)), time: Some(timestamp), ..environment }
+fn executed_in(
+    environment: SimulationBlockEnvironment,
+    number: u64,
+    timestamp: u64,
+) -> SimulationBlockEnvironment {
+    SimulationBlockEnvironment {
+        number: Some(U256::from(number)),
+        time: Some(timestamp),
+        ..environment
+    }
 }
 
 /// Runs the simulated call, and names the revert when the call reverted without saying why.
@@ -702,13 +711,15 @@ async fn simulate_with_overrides(
     // The trace has to observe the same environment as `eth_simulateV1` to reproduce the same
     // revert. `prevrandao` is drawn at random per call, so it is built once and reused rather
     // than regenerated.
-    let environment = block_overrides();
-    let payload = simulate_payload(call.clone(), overrides.clone(), environment.clone());
+    let environment = block_environment();
+    let payload =
+        SimulationRequest::single_call(call.clone(), overrides.clone(), environment.clone());
     let response = match timeout(
         request_timeout,
-        provider
-            .simulate(&payload)
-            .block_id(simulated.block.into()),
+        provider.raw_request::<_, Vec<SimulatedBlock<Block>>>(
+            "eth_simulateV1".into(),
+            (&payload, BlockId::from(simulated.block)),
+        ),
     )
     .await
     {
@@ -739,7 +750,11 @@ async fn simulate_with_overrides(
         let executed = executed_in(environment, number, block.inner.header.timestamp);
         let replay = Box::new(Replay {
             parent_block: number.saturating_sub(1),
-            payload: simulate_payload(call.clone(), overrides.clone(), executed.clone()),
+            payload: SimulationRequest::single_call(
+                call.clone(),
+                overrides.clone(),
+                executed.clone(),
+            ),
         });
         if let Some(decoded) = revert::decode_error(&result.return_data) {
             return CallOutcome::Reverted { reason: decoded, replay };
@@ -775,20 +790,6 @@ async fn simulate_with_overrides(
     }
 }
 
-/// The `eth_simulateV1` request for one call: a single block holding the call alone.
-fn simulate_payload(
-    call: TransactionRequest,
-    overrides: StateOverride,
-    environment: BlockOverrides,
-) -> SimulatePayload {
-    SimulatePayload::default().extend(
-        SimBlock::default()
-            .with_state_overrides(overrides)
-            .with_block_overrides(environment)
-            .call(call),
-    )
-}
-
 /// What it takes to rerun a reverted simulation exactly.
 ///
 /// The payload carries the call, the funding overrides and the block environment, with the number,
@@ -798,7 +799,7 @@ fn simulate_payload(
 #[derive(Debug)]
 pub(crate) struct Replay {
     parent_block: u64,
-    payload: SimulatePayload,
+    payload: SimulationRequest,
 }
 
 impl Replay {
@@ -960,21 +961,21 @@ async fn traced_revert_reason(
     call: TransactionRequest,
     block: BlockNumberOrTag,
     overrides: StateOverride,
-    environment: BlockOverrides,
+    environment: SimulationBlockEnvironment,
 ) -> Option<String> {
-    let options = GethDebugTracingCallOptions::default()
-        .with_tracing_options(
-            GethDebugTracingOptions::default()
-                .with_tracer(GethDebugTracerType::BuiltInTracer(
-                    GethDebugBuiltInTracerType::CallTracer,
-                ))
-                .with_call_config(CallConfig { only_top_call: Some(false), with_log: Some(false) }),
-        )
-        .with_state_overrides(overrides)
-        .with_block_overrides(environment);
+    let options = TraceCallOptions {
+        tracing_options: GethDebugTracingOptions::default()
+            .with_tracer(GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::CallTracer))
+            .with_call_config(CallConfig { only_top_call: Some(false), with_log: Some(false) }),
+        state_overrides: overrides,
+        block_overrides: environment,
+    };
 
     match provider
-        .debug_trace_call_callframe(call, block.into(), options)
+        .raw_request::<_, CallFrame>(
+            "debug_traceCall".into(),
+            (call, BlockId::from(block), options),
+        )
         .await
     {
         Ok(frame) => revert::reason_from_frame(&frame),
