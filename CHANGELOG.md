@@ -1,4 +1,11 @@
 
+## [0.116.3](https://github.com/propeller-heads/fynd/compare/0.116.2...0.116.3) (2026-10-28)
+
+### Bug Fixes
+
+* **simulation:** send block overrides under the spec's field names ([056baf9](https://github.com/propeller-heads/fynd/commit/056baf95da9702af741f7f2b254726568c4710d2))
+
+
 ## [0.116.2](https://github.com/propeller-heads/fynd/compare/0.116.1...0.116.2) (2026-10-28)
 
 ### Features
