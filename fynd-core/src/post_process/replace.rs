@@ -291,8 +291,8 @@ impl CandidateRoute {
     }
 }
 
-/// Decides which swaps may replace a target, and finds the best replacement through one swap.
-/// [`ReplacementSolver`] runs it.
+/// Decides which swaps may replace a target, and finds the best route that puts one of them in
+/// its place: alone, or splitting the target with its own swaps. [`ReplacementSolver`] runs it.
 pub(super) trait ReplacementFinder {
     /// Whether `swap` may replace `target` of `route_swaps`.
     fn can_replace_target(
